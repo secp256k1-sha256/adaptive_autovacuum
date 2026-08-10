@@ -248,6 +248,28 @@ unaffected).
 - Evidence: adaptive_autovacuum_pgbench_report_run2/
   linux_retest_v12_evidence.txt.
 
+## Validation performed 2026-08-10 (first real CI run - GitHub Actions)
+
+The included CI workflow ran for the first time after the project was
+uploaded to GitHub and failed in the Regression tests step with
+`FATAL: cannot create PGC_POSTMASTER variables after startup`.
+Root cause: `adaptive_autovacuum.control_database` was defined with
+PGC_POSTMASTER context in `_PG_init()`, which also runs when the
+library is loaded ON DEMAND by `CREATE EXTENSION` on a cluster without
+`shared_preload_libraries` - exactly what the CI cluster (and any
+user who skips the preload step) does; the backend dies. All previous
+validation environments had the library preloaded, which masked this.
+
+Fix: context changed to PGC_SIGHUP (the launcher reads the value when
+it starts). Reproduced and verified on a fresh no-preload cluster
+(initdb --no-locale, CREATE DATABASE contrib_regression, full test
+file): before the fix the exact CI FATAL reproduced; after rebuilding,
+the run is byte-identical to the expected file.
+
+The CI workflow now runs installcheck twice: once with on-demand
+loading (catches this class of bug) and once with the library
+preloaded and the launcher registered (the real deployment shape).
+
 ## Required release gate
 
 For each supported PostgreSQL major version:

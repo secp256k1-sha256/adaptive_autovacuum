@@ -149,12 +149,17 @@ _PG_init(void)
                              NULL,
                              NULL);
 
+    /* PGC_SIGHUP, not PGC_POSTMASTER: _PG_init also runs when the library is
+       loaded on demand (CREATE EXTENSION without shared_preload_libraries),
+       and defining a PGC_POSTMASTER custom variable after startup is FATAL.
+       The launcher reads this at startup; changes take effect when it
+       restarts. */
     DefineCustomStringVariable("adaptive_autovacuum.control_database",
                                "Database used by the cluster launcher.",
                                "The launcher reads pg_database here and starts one database worker at a time.",
                                &aav_control_database,
                                "postgres",
-                               PGC_POSTMASTER,
+                               PGC_SIGHUP,
                                0,
                                NULL,
                                NULL,
