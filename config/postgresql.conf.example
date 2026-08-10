@@ -1,0 +1,16 @@
+# Required at startup
+shared_preload_libraries = 'adaptive_autovacuum'
+
+# Start disabled, then enable after CREATE EXTENSION and dry-run review.
+adaptive_autovacuum.enabled = off
+adaptive_autovacuum.control_database = 'postgres'
+adaptive_autovacuum.naptime_seconds = 60
+adaptive_autovacuum.database_worker_timeout_seconds = 3600
+adaptive_autovacuum.log_cycle_summary = on
+
+# Required to interpret pg_stat_progress_vacuum.delay_time.
+track_cost_delay_timing = on
+
+# Reserve enough general background-worker capacity for the launcher plus one
+# dynamic database worker, in addition to other extensions and parallel work.
+# max_worker_processes = 16

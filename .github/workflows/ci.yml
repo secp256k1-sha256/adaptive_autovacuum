@@ -1,0 +1,32 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  postgres-18:
+    runs-on: ubuntu-latest
+    container: postgres:18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and server headers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-18
+      - name: Build and install
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+      - name: Regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/postgresql/18/bin:$PATH
+          chown -R postgres:postgres "$GITHUB_WORKSPACE"
+          rm -rf /tmp/aav-pgdata
+          su postgres -c "initdb -D /tmp/aav-pgdata --no-locale --encoding=UTF8"
+          trap 'su postgres -c "pg_ctl -D /tmp/aav-pgdata -m immediate stop" || true' EXIT
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -o '-p 55432' -w start"
+          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config"

@@ -1,0 +1,6 @@
+comment = 'Adaptive autovacuum policy controller with background workers'
+default_version = '1.0.0'
+module_pathname = '$libdir/adaptive_autovacuum'
+relocatable = false
+superuser = true
+requires = 'plpgsql'
