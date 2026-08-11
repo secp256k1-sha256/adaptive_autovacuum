@@ -40,6 +40,12 @@ CREATE TABLE adaptive_autovacuum.policy
     lock_timeout_ms                 integer NOT NULL DEFAULT 250 CHECK (lock_timeout_ms >= 1),
     max_changes_per_cycle           integer NOT NULL DEFAULT 5 CHECK (max_changes_per_cycle >= 0),
 
+    /* A table with live rows that was never analyzed (neither manually nor by
+       autoanalyze) leaves the planner estimating from hardcoded defaults;
+       each cycle the largest few such tables are analyzed one at a time. */
+    analyze_missing_stats           boolean NOT NULL DEFAULT true,
+    analyze_missing_stats_per_cycle integer NOT NULL DEFAULT 3 CHECK (analyze_missing_stats_per_cycle >= 0),
+
     manage_table_costs              boolean NOT NULL DEFAULT false,
     max_boosted_relations           integer NOT NULL DEFAULT 2 CHECK (max_boosted_relations >= 0),
     elevated_cost_limit             integer NOT NULL DEFAULT 1000 CHECK (elevated_cost_limit >= 200),
@@ -1634,6 +1640,69 @@ BEGIN
         error = 'Expired before a worker applied it.'
     WHERE status = 'pending'
       AND requested_at < clock_timestamp() - interval '1 hour';
+
+    /*
+     * Missing planner statistics: a table that has live rows but was never
+     * analyzed in its whole life (no manual ANALYZE, no autoanalyze) leaves
+     * the planner estimating from hardcoded defaults.  Analyze the largest
+     * offenders directly, one at a time — unlike VACUUM, ANALYZE is legal
+     * inside a function's transaction.  Deliberately NOT gated on
+     * min_table_bytes: missing statistics mislead the planner regardless of
+     * table size, and n_live_tup > 0 already proves there is something to
+     * sample.  Once a table has been analyzed its last_analyze timestamp is
+     * set and it never qualifies again, so the feature self-limits to new or
+     * freshly stats-reset tables; a failed attempt (lock timeout) is simply
+     * retried on a later cycle.  This runs LAST among the cycle's actions
+     * because each ANALYZE holds a ShareUpdateExclusive lock until the cycle
+     * transaction commits.  Skipped under host pressure: sampling large
+     * tables is real I/O.
+     */
+    IF p.analyze_missing_stats
+       AND p.analyze_missing_stats_per_cycle > 0
+       AND NOT host_pressure THEN
+        FOR r IN
+            SELECT c.oid AS relid,
+                   format('%I.%I', n.nspname, c.relname) AS fqname,
+                   pg_stat_get_live_tuples(c.oid)::bigint AS live_tuples
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN adaptive_autovacuum.table_policy tp ON tp.relid = c.oid
+            WHERE c.relkind = 'r'
+              AND c.relpersistence <> 't'
+              AND NOT (n.nspname = ANY (p.excluded_schemas))
+              AND COALESCE(tp.enabled, true)
+              AND pg_stat_get_live_tuples(c.oid) > 0
+              AND pg_stat_get_last_analyze_time(c.oid) IS NULL
+              AND pg_stat_get_last_autoanalyze_time(c.oid) IS NULL
+            ORDER BY pg_stat_get_live_tuples(c.oid) DESC
+            LIMIT p.analyze_missing_stats_per_cycle
+        LOOP
+            applied := false;
+            action_error := NULL;
+            action_name := CASE WHEN p.dry_run THEN 'propose_analyze' ELSE 'analyze' END;
+            reason := format('Table has %s live rows but has never been analyzed (manually or by autoanalyze); the planner is working from default estimates.',
+                             r.live_tuples);
+
+            IF NOT p.dry_run THEN
+                BEGIN
+                    PERFORM set_config('lock_timeout', p.lock_timeout_ms::text || 'ms', true);
+                    EXECUTE format('ANALYZE %s', r.fqname);
+                    applied := true;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        GET STACKED DIAGNOSTICS action_error = MESSAGE_TEXT;
+                END;
+            END IF;
+
+            INSERT INTO adaptive_autovacuum.decisions
+                (relid, relation_name, state, action, reason, host_metrics,
+                 relation_metrics, proposed_reloptions, applied, error)
+            VALUES
+                (r.relid, r.fqname, 'statistics_missing', action_name, reason,
+                 host_json, jsonb_build_object('live_tuples', r.live_tuples),
+                 NULL, applied, action_error);
+        END LOOP;
+    END IF;
 
     DELETE FROM adaptive_autovacuum.relation_state state
     WHERE state.last_seen_at < clock_timestamp() - interval '7 days'

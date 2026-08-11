@@ -68,7 +68,13 @@ And the part hand-tuning always skips: **it undoes them.** Before the first chan
 
 If *you* change one of the settings it manages, it notices, backs off, and stops touching that table until you hand it back.
 
-### 3. Last-resort wraparound protection
+### 3. Analyzes tables the planner knows nothing about
+
+A table that has never been analyzed — not once, manually or by autoanalyze — leaves the query planner estimating its row counts from hardcoded defaults, which is how five-millisecond queries become five-minute ones. Freshly loaded or migrated tables sit in exactly this state until enough activity accumulates to trip autoanalyze.
+
+Each cycle the extension finds tables that have live rows but no analyze in their entire history (system schemas and opted-out tables excluded), takes the three largest, and runs a plain `ANALYZE` on them one at a time. Once a table has statistics it never qualifies again, so on a healthy cluster this settles to a no-op. It respects dry-run, gives up quickly on locks rather than wait, and is skipped while the server is overloaded. Tune or disable it with `analyze_missing_stats` / `analyze_missing_stats_per_cycle`.
+
+### 4. Last-resort wraparound protection
 
 For tables getting dangerously close to transaction-ID wraparound (the failure mode that stops the whole database), it can run a targeted emergency vacuum — see [below](#emergency-wraparound-protection). Off by default.
 
@@ -256,7 +262,9 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 | `manage_table_costs` | `false` | allow per-table vacuum speed boosts |
 | `target_dead_tuple_ratio` | `0.01` | aim: vacuum a table when ~1% of it is dead rows |
 | `target_insert_ratio` | `0.10` | aim: vacuum after ~10% of a table is newly inserted |
-| `min_table_bytes` | 64 MB | ignore tables smaller than this |
+| `min_table_bytes` | 64 MB | ignore tables smaller than this (does not apply to the never-analyzed check) |
+| `analyze_missing_stats` | `true` | analyze tables that have live rows but were never analyzed at all |
+| `analyze_missing_stats_per_cycle` | `3` | how many never-analyzed tables to analyze per cycle, largest first |
 | `global_change_cooldown_seconds` | `600` | minimum gap between changes to the same cluster setting |
 | `change_cooldown_seconds` | `1800` | minimum gap between changes to the same table |
 | `healthy_cycles_before_restore` | `6` | healthy checks required before a table's original settings return |

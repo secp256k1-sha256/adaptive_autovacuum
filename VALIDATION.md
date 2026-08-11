@@ -270,6 +270,51 @@ The CI workflow now runs installcheck twice: once with on-demand
 loading (catches this class of bug) and once with the library
 preloaded and the launcher registered (the real deployment shape).
 
+## Validation performed 2026-08-11 (never-analyzed tables feature)
+
+New feature: each cycle, tables with live rows but no analyze in their entire
+history (no manual ANALYZE, no autoanalyze; system schemas, the extension's
+own schema, and `table_policy.enabled = false` opt-outs excluded) are found
+and the largest `analyze_missing_stats_per_cycle` of them (default 3, ordered
+by `n_live_tup` descending) are analyzed one at a time. SQL-only change; the
+C module is untouched.
+
+Validated on Windows 11 against the EDB PostgreSQL 18.4 x64 binaries using a
+scratch `initdb` cluster (port 5499) with the updated script served via the
+PG18 `extension_control_path` GUC (note: entries are separated by `;` on
+Windows, and the installed `$system` copy wins if listed first):
+
+- Full `pg_regress`-equivalent run of `test/sql/adaptive_autovacuum.sql`
+  (psql -X -a -q) is byte-identical to the expected file, including the new
+  assertions: dry-run records `propose_analyze` without touching the table;
+  live run records `analyze` with `applied = true`, `pg_class.reltuples`
+  becomes accurate; a further cycle does not re-analyze (self-limiting via
+  `last_analyze`).
+- Top-3/ordering semantics with five never-analyzed tables (100/5000/300/
+  20000/1000 rows): cycle 1 analyzed exactly t4, t2, t5 in that order
+  (decision ids 1..3) while t1/t3 kept `reltuples = -1`; cycle 2 analyzed
+  t3 then t1; cycle 3 was a no-op (decision count stayed 5).
+
+Linux parity (same day, Rocky Linux 9.6 appliance agord-13l-vbr, scratch
+PGDG PostgreSQL 18.4 on port 55432, product PG 17 untouched, environment
+fully removed afterwards):
+
+- Extension compiled from the same source (`make install with_llvm=no`).
+- The full regression run is byte-identical to the expected file (after
+  CRLF normalization).
+- Top-3/ordering/drain semantics reproduced exactly (t4/t2/t5 then t3/t1,
+  then no-op).
+- Autonomous end-to-end with `shared_preload_libraries` set: after
+  `ALTER SYSTEM SET adaptive_autovacuum.enabled = on` + reload, the launcher
+  and database worker found and analyzed a never-analyzed 50,000-row table
+  (`autovacuum_enabled = off` reloption) with no manual `_run_cycle` call;
+  `reltuples` and `last_analyze` confirmed.
+
+Not yet exercised for this feature: lock-timeout failure path (a concurrent
+long transaction holding a conflicting lock) and behavior under real host
+pressure; both paths are shared with existing code (`GET STACKED DIAGNOSTICS`
+guard, `host_pressure` gate) but have not been provoked live.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:
