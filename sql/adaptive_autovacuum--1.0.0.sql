@@ -16,7 +16,6 @@ CREATE TABLE adaptive_autovacuum.policy
     enabled                         boolean NOT NULL DEFAULT false,
     dry_run                         boolean NOT NULL DEFAULT true,
     manage_global_settings          boolean NOT NULL DEFAULT true,
-    global_change_cooldown_seconds  integer NOT NULL DEFAULT 600 CHECK (global_change_cooldown_seconds >= 60),
 
     min_table_bytes                 bigint NOT NULL DEFAULT 67108864 CHECK (min_table_bytes >= 0),
     excluded_schemas                text[] NOT NULL DEFAULT ARRAY['pg_catalog', 'information_schema', 'pg_toast', 'adaptive_autovacuum'],
@@ -91,7 +90,7 @@ CREATE TABLE adaptive_autovacuum.policy
     work_mem_available_fraction     double precision NOT NULL DEFAULT 0.10 CHECK (work_mem_available_fraction > 0 AND work_mem_available_fraction <= 0.50),
     recommendation_workers_max      integer NOT NULL DEFAULT 8 CHECK (recommendation_workers_max BETWEEN 1 AND 64),
 
-    emergency_vacuum_enabled        boolean NOT NULL DEFAULT false,
+    emergency_vacuum_enabled        boolean NOT NULL DEFAULT true,
     emergency_work_mem_min_mb       integer NOT NULL DEFAULT 128 CHECK (emergency_work_mem_min_mb >= 64),
     emergency_work_mem_max_mb       integer NOT NULL DEFAULT 2048 CHECK (emergency_work_mem_max_mb >= emergency_work_mem_min_mb),
     emergency_cost_limit            integer NOT NULL DEFAULT 10000 CHECK (emergency_cost_limit >= 200),
@@ -389,6 +388,9 @@ DECLARE
     r record;
     previous adaptive_autovacuum.relation_state%ROWTYPE;
 
+    /* PG17 compatibility switch; PG18-only surface is skipped below it. */
+    server_vnum integer := current_setting('server_version_num')::integer;
+
     host_memory_percent double precision;
     host_load_per_cpu double precision;
     host_metrics_available boolean;
@@ -607,7 +609,10 @@ BEGIN
         count(*) FILTER (
             WHERE clock_timestamp() - a.query_start
                   >= make_interval(secs => p.long_vacuum_seconds)
-              AND pv.delay_time >=
+              /* delay_time exists only on PG18+; the jsonb detour keeps this
+                 parseable on PG17, where the filter is simply never true and
+                 delay-bound detection stays inactive. */
+              AND ((to_jsonb(pv) ->> 'delay_time'))::double precision >=
                   extract(epoch FROM clock_timestamp() - a.query_start) * 1000.0
                   * p.high_delay_fraction
         ),
@@ -701,7 +706,8 @@ BEGIN
                 pv.index_vacuum_count,
                 pv.max_dead_tuple_bytes,
                 pv.dead_tuple_bytes,
-                pv.delay_time,
+                /* PG18+ column; NULL on PG17 (see the jsonb note above). */
+                ((to_jsonb(pv) ->> 'delay_time'))::double precision AS delay_time,
                 clock_timestamp() - a.query_start AS vacuum_elapsed,
                 a.query LIKE '%(to prevent wraparound)' AS antiwraparound,
                 a.backend_type = 'autovacuum worker' AS is_autovacuum
@@ -833,6 +839,9 @@ BEGIN
                 END
             ) DESC
     LOOP
+        /* On PG17 vacuum_max_threshold is NULL (the GUC and reloption do not
+           exist): NULL < 0 is not true and LEAST ignores NULLs, so this
+           degrades exactly to the uncapped PG17 trigger formula. */
         IF r.vacuum_max_threshold < 0 THEN
             vacuum_trigger := r.vacuum_threshold
                               + r.vacuum_scale_factor * GREATEST(r.reltuples, 0);
@@ -1063,9 +1072,14 @@ BEGIN
             IF backlog_ratio >= p.backlog_elevated_ratio THEN
                 desired_values := desired_values || jsonb_build_object(
                     'autovacuum_vacuum_threshold', desired_threshold::text,
-                    'autovacuum_vacuum_scale_factor', trim(trailing '.' from to_char(desired_scale_factor, 'FM0.999999999')),
-                    'autovacuum_vacuum_max_threshold', desired_max_threshold::text
+                    'autovacuum_vacuum_scale_factor', trim(trailing '.' from to_char(desired_scale_factor, 'FM0.999999999'))
                 );
+                /* The per-table trigger ceiling exists only on PG18+. */
+                IF server_vnum >= 180000 THEN
+                    desired_values := desired_values || jsonb_build_object(
+                        'autovacuum_vacuum_max_threshold', desired_max_threshold::text
+                    );
+                END IF;
             END IF;
 
             IF insert_ratio >= p.backlog_elevated_ratio THEN
@@ -1414,24 +1428,39 @@ BEGIN
     ELSE
         recommended_workers := GREATEST(overdue_relation_count,
                                         current_autovacuum_workers + 1);
+        /* PG18 caps reloadable raises at autovacuum_worker_slots; PG17 has no
+           slots concept (the GUC itself needs a restart there), so the
+           recommendation is bounded by policy alone and stays record-only. */
         recommended_workers := LEAST(recommended_workers,
                                      GREATEST(1, host_cpu_count / 4),
                                      p.recommendation_workers_max,
-                                     COALESCE(autovacuum_worker_slots_cfg,
-                                              current_autovacuum_workers));
+                                     CASE WHEN server_vnum >= 180000
+                                          THEN COALESCE(autovacuum_worker_slots_cfg,
+                                                        current_autovacuum_workers)
+                                          ELSE p.recommendation_workers_max END);
         recommended_workers := GREATEST(recommended_workers,
                                         current_autovacuum_workers);
 
         IF recommended_workers > current_autovacuum_workers THEN
-            recommendation_reason := recommendation_reason || format(
-                ' %s of %s autovacuum workers are busy while %s relations are'
-                || ' overdue; raise autovacuum_max_workers to %s (reloadable;'
-                || ' the shared vacuum_cost_limit is split across workers, so'
-                || ' this does not raise total un-boosted vacuum I/O; capped by'
-                || ' autovacuum_worker_slots=%s which needs a restart to raise).',
-                av_workers_running, current_autovacuum_workers,
-                overdue_relation_count, recommended_workers,
-                autovacuum_worker_slots_cfg);
+            IF server_vnum >= 180000 THEN
+                recommendation_reason := recommendation_reason || format(
+                    ' %s of %s autovacuum workers are busy while %s relations are'
+                    || ' overdue; raise autovacuum_max_workers to %s (reloadable;'
+                    || ' the shared vacuum_cost_limit is split across workers, so'
+                    || ' this does not raise total un-boosted vacuum I/O; capped by'
+                    || ' autovacuum_worker_slots=%s which needs a restart to raise).',
+                    av_workers_running, current_autovacuum_workers,
+                    overdue_relation_count, recommended_workers,
+                    autovacuum_worker_slots_cfg);
+            ELSE
+                recommendation_reason := recommendation_reason || format(
+                    ' %s of %s autovacuum workers are busy while %s relations are'
+                    || ' overdue; raise autovacuum_max_workers to %s (on'
+                    || ' PostgreSQL 17 this requires a server restart, so it is'
+                    || ' recorded here and never applied automatically).',
+                    av_workers_running, current_autovacuum_workers,
+                    overdue_relation_count, recommended_workers);
+            END IF;
         END IF;
     END IF;
 
@@ -1489,7 +1518,8 @@ BEGIN
      * when it is grossly over-tight (< half of derived); anything in between
      * is respected as operator intent.
      */
-    IF fleet_max_target > 0
+    IF server_vnum >= 180000
+       AND fleet_max_target > 0
        AND (current_vacuum_max_threshold < 0
             OR current_vacuum_max_threshold > fleet_max_target * 1.10
             OR current_vacuum_max_threshold < fleet_max_target * 0.50) THEN
@@ -1571,9 +1601,15 @@ BEGIN
      * worker pool, one cost budget), so when enabled the recommendations are
      * queued for the C worker to APPLY via ALTER SYSTEM + reload.  Per-table
      * reloptions remain the tool for outlier relations only.  Changes are
-     * deduplicated, rate-limited per GUC by global_change_cooldown_seconds,
-     * and audited with their pre-change value.  autovacuum_max_workers only
-     * ratchets up automatically; lowering it is left to the DBA.
+     * deduplicated (one pending row per GUC, no-op values filtered) and
+     * audited with their pre-change value.  There is deliberately NO per-GUC
+     * cooldown: correlated settings must be able to move together — raising
+     * autovacuum_max_workers alone splits the same cost_limit across more
+     * workers, so the cost side has to be able to follow on the very next
+     * cycle instead of starving until a timer expires.  The naptime between
+     * cycles and the at-most-doubling step are the pacing.
+     * autovacuum_max_workers only ratchets up automatically; lowering it is
+     * left to the DBA.
      */
     IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global THEN
         INSERT INTO adaptive_autovacuum.global_apply_queue(guc_name, desired_value, reason)
@@ -1586,7 +1622,11 @@ BEGIN
              trim(trailing '.' from to_char(recommended_cost_delay, 'FM999990.99')),
              trim(trailing '.' from to_char(current_global_cost_delay, 'FM999990.99'))),
             ('autovacuum_max_workers',
-             CASE WHEN recommended_workers > current_autovacuum_workers
+             /* Reloadable only on PG18+ (worker slots); on PG17 the GUC is
+                PGC_POSTMASTER, so it stays a recorded recommendation and is
+                never queued for ALTER SYSTEM. */
+             CASE WHEN server_vnum >= 180000
+                       AND recommended_workers > current_autovacuum_workers
                   THEN recommended_workers::text END,
              current_autovacuum_workers::text),
             ('autovacuum_work_mem',
@@ -1626,13 +1666,7 @@ BEGIN
           AND NOT EXISTS (SELECT 1
                           FROM adaptive_autovacuum.global_apply_queue q
                           WHERE q.guc_name = cand.guc_name
-                            AND q.status = 'pending')
-          AND NOT EXISTS (SELECT 1
-                          FROM adaptive_autovacuum.global_apply_queue q
-                          WHERE q.guc_name = cand.guc_name
-                            AND q.status = 'applied'
-                            AND q.applied_at > clock_timestamp()
-                                - make_interval(secs => p.global_change_cooldown_seconds));
+                            AND q.status = 'pending');
     END IF;
 
     UPDATE adaptive_autovacuum.global_apply_queue
@@ -1817,7 +1851,9 @@ SELECT
     progress.index_vacuum_count,
     progress.max_dead_tuple_bytes,
     progress.dead_tuple_bytes,
-    progress.delay_time,
+    /* PG18+ column, NULL on PG17; the jsonb detour lets one view definition
+       parse on both versions. */
+    ((to_jsonb(progress) ->> 'delay_time'))::double precision AS delay_time,
     activity.query LIKE '%(to prevent wraparound)' AS antiwraparound,
     activity.backend_type = 'autovacuum worker' AS is_autovacuum
 FROM pg_stat_progress_vacuum progress

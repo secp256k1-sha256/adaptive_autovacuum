@@ -125,7 +125,7 @@ An automatic write requires all applicable gates:
 3. The extension exists in the target database.
 4. `adaptive_autovacuum.policy.enabled` is true in that database.
 5. `dry_run` is false.
-6. **For cluster settings:** `manage_global_settings` is true; the GUC is on the C-side allowlist; the value passes numeric validation; the same GUC has not been changed within `global_change_cooldown_seconds`; no pending change for it already exists; the new value actually differs numerically from the current one.
+6. **For cluster settings:** `manage_global_settings` is true; the GUC is on the C-side allowlist; the value passes numeric validation; no pending change for it already exists; the new value actually differs numerically from the current one. There is deliberately no per-GUC cooldown: correlated settings must be able to move together (raising `autovacuum_max_workers` alone splits the same `cost_limit` across more workers, so the cost side must be able to follow on the next cycle). The naptime between cycles and the at-most-doubling step provide the pacing.
 7. **For table changes:** the table is not excluded; the observed condition has persisted for the hysteresis window; the relation is outside its change cooldown; no vacuum is currently reported for that relation; the controller still owns every previously managed reloption; the per-cycle DDL limit has not been consumed.
 8. For table cost changes, `manage_table_costs` is true, the admission limit permits the relation, and the cluster-wide boost budget has headroom.
 9. For emergency vacuum, `emergency_vacuum_enabled` is true and no active or recently failed equivalent request exists.
@@ -235,7 +235,7 @@ The original design recorded cluster values as recommendations only. Field exper
 
 - **Fixed allowlist**, enforced twice: the SQL policy only enqueues the eleven managed autovacuum GUCs, and the C applier independently rejects anything outside its compiled-in list.
 - **Numeric validation** of every value at both layers.
-- **Per-GUC cooldown** (`global_change_cooldown_seconds`, default 600 s) plus deduplication and a no-op filter (a change equal to the current value is never enqueued).
+- **Deduplication and a no-op filter**: at most one pending change per GUC, and a change equal to the current value is never enqueued. Pacing comes from the cycle naptime and the at-most-doubling step, not from a timer — a per-GUC cooldown was removed because it starved correlated settings (a workers-only raise dilutes the unchanged cost limit across more workers).
 - **Old-value audit**: the applier captures the pre-change value into the queue row, giving a one-statement rollback path.
 - **Direction rules**: worker count only rises automatically; the trigger ceiling respects tighter operator values; cost aggression falls under host pressure.
 - **Application mechanics**: `ALTER SYSTEM` cannot run through SPI, so the C worker builds the statement nodes and calls the exported `AlterSystemSetConfigFile()`, then signals the postmaster (`SIGHUP`). Every managed GUC is reloadable in PostgreSQL 18, so changes take effect within seconds without restarts.

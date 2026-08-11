@@ -7,8 +7,10 @@ CREATE EXTENSION adaptive_autovacuum;
 SELECT enabled = false AS disabled_by_default,
        dry_run = true AS dry_run_by_default,
        manage_table_costs = false AS cost_changes_opt_in,
-       emergency_vacuum_enabled = false AS emergency_opt_in,
-       manage_global_settings = true AS globals_managed_by_default
+       emergency_vacuum_enabled = true AS emergency_on_by_default,
+       manage_global_settings = true AS globals_managed_by_default,
+       analyze_missing_stats = true AS analyze_missing_stats_by_default,
+       analyze_missing_stats_per_cycle = 3 AS analyze_missing_stats_top3
 FROM adaptive_autovacuum.policy;
 
 SELECT jsonb_typeof(adaptive_autovacuum.host_metrics()) = 'object' AS host_metrics_object;
@@ -143,5 +145,58 @@ WHERE relation_name = 'public.aav_test';
 SELECT count(*) = 1 AS recommendation_recorded
 FROM adaptive_autovacuum.global_recommendations;
 
+CREATE TABLE aav_no_stats(id integer, payload text);
+INSERT INTO aav_no_stats SELECT g, g::text FROM generate_series(1, 1000) g;
+SELECT pg_stat_force_next_flush();
+
+SELECT pg_stat_get_live_tuples('aav_no_stats'::regclass) > 0
+       AND pg_stat_get_last_analyze_time('aav_no_stats'::regclass) IS NULL
+       AND pg_stat_get_last_autoanalyze_time('aav_no_stats'::regclass) IS NULL
+       AS never_analyzed_candidate_visible;
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 1 AS analyze_proposed_in_dry_run
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_no_stats'::regclass
+  AND action = 'propose_analyze'
+  AND NOT applied;
+
+UPDATE adaptive_autovacuum.policy
+SET dry_run = false,
+    manage_global_settings = false;
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT reltuples::integer = 1000 AS analyze_updated_reltuples
+FROM pg_class WHERE oid = 'aav_no_stats'::regclass;
+
+SELECT count(*) = 1 AS analyze_executed
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_no_stats'::regclass
+  AND action = 'analyze'
+  AND applied
+  AND error IS NULL;
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 1 AS analyzed_table_not_repeated
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_no_stats'::regclass
+  AND action = 'analyze';
+
+DROP TABLE aav_no_stats;
 DROP TABLE aav_test;
 DROP EXTENSION adaptive_autovacuum;

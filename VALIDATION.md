@@ -315,6 +315,101 @@ long transaction holding a conflicting lock) and behavior under real host
 pressure; both paths are shared with existing code (`GET STACKED DIAGNOSTICS`
 guard, `host_pressure` gate) but have not been provoked live.
 
+## Validation performed 2026-08-11 (PostgreSQL 17 support)
+
+The version floor was lowered from 18 to 17 (17 is the true floor: the code
+reads the `*_dead_tuple_bytes` progress columns that appeared in 17). The C
+module gates only the PG18 eager-freeze parameter; everything else is decided
+at runtime in SQL from `server_version_num`:
+
+- `pg_stat_progress_vacuum.delay_time` (new in 18) is read through a
+  `to_jsonb(...) ->> 'delay_time'` detour in both `_run_cycle` queries and in
+  the `active_vacuums` view, so one script parses on both majors; on 17 the
+  value is NULL and delay-bound detection stays inactive.
+- `autovacuum_vacuum_max_threshold` (GUC and reloption, new in 18): never
+  recommended, queued, or set on 17; the trigger formula degrades to the
+  classic uncapped one (NULL semantics verified).
+- `autovacuum_max_workers` (PGC_POSTMASTER on 17): recommendation is still
+  recorded with a "requires restart" note but never queued for ALTER SYSTEM;
+  on 17 the recommendation is no longer capped by `autovacuum_worker_slots`
+  (which does not exist there).
+
+Validated on Windows 11 (EDB binaries), scratch clusters of both majors:
+
+- PostgreSQL 17.6: `vacuum()`/`VacuumParams` compile cleanly; full regression
+  run byte-identical to the same expected file used for 18; staged 3-table
+  bloat scenario applied per-table reloptions WITHOUT the max_threshold key;
+  the global queue contained no PG18-only GUCs; the live background worker
+  applied cost_limit/cost_delay/vacuum_threshold/analyze_threshold via
+  ALTER SYSTEM + reload on 17 and executed the never-analyzed ANALYZE
+  autonomously.
+- PostgreSQL 18.4 regression re-run after the changes: byte-identical, and a
+  staged bloat scenario confirmed the max_threshold reloption is still
+  proposed on 18.
+
+Linux parity (same day, AlmaLinux 9 WSL, PGDG PostgreSQL 17.10 from
+`postgresql17-devel`, gcc 11.5, CRB repo required for the devel package's
+perl dependency):
+
+- `make PG_CONFIG=/usr/pgsql-17/bin/pg_config with_llvm=no install` builds
+  cleanly and a real `make installcheck` (pg_regress) passes.
+- Top-3/largest-first ANALYZE semantics reproduced (never-analyzed
+  30K/20K/5K-row tables picked in size order, one manual cycle).
+- Autonomous end-to-end with the library preloaded: after enabling the GUC
+  and reloading, the launcher's database worker drained the remaining three
+  never-analyzed tables in one cycle with no manual `_run_cycle` call.
+
+## Validation performed 2026-08-11 (comprehensive PG18 feature run, Linux lab)
+
+Full-matrix run on the Rocky Linux 9.6 appliance (agord-13l-vbr), scratch PGDG
+PostgreSQL 18.4 on port 55432 (preloaded, `track_cost_delay_timing = on`,
+5-second controller naptime, builtin autovacuum parked at naptime 3600s except
+where staged), built from the current source including the two design changes
+of the same day (no per-GUC cooldown; emergency vacuum enabled by default).
+Product PG 17 untouched; environment fully removed afterwards. Every
+assertion below ran against the live cluster and passed.
+
+- **installcheck** (pg_regress) green; `host_metrics()` returned the real
+  host (56 CPUs, 251 GB, live load average).
+- **Per-table policy suite (21 assertions):** dry-run proposes without
+  writing; live run applies trigger reloptions including the PG18
+  `autovacuum_vacuum_max_threshold`; cost boosts capped at
+  `max_boosted_relations = 2` and within the cluster budget; insert-only
+  table got insert reloptions only; `table_policy` per-table target produced
+  a tighter threshold and `enabled = false` kept the opt-out table invisible;
+  synthetic host pressure blocked new boosts and switched the recommendation
+  to "reduce"; a manual reloption edit flagged `ownership_conflict`, froze
+  automation, and the documented hand-back query resumed it; after `VACUUM`
+  and six healthy cycles the original reloptions
+  (`fillfactor=90, autovacuum_vacuum_threshold=123`) were restored exactly.
+- **Global GUC suite (12 assertions):** mistuned-baseline detectors (dead and
+  insert side) fired; queue deduplicates while pending; the worker applied
+  changes via `ALTER SYSTEM` + reload with `old_value` audit;
+  `autovacuum_vacuum_threshold` 50→500, `autovacuum_analyze_threshold`
+  50→250, fleet-derived `autovacuum_vacuum_max_threshold` applied. The
+  cooldown removal was proven live: cost limit ramped
+  **400→800→1600→3200→6400→10000 in consecutive 5-second cycles** (under the
+  removed 10-minute per-GUC cap this ramp would have taken ~50 minutes).
+- **Never-analyzed suite:** dry-run proposes 3 without touching stats; live
+  run analyzed the top-3 largest first (t4 20000, t2 5000, t5 1000); the
+  autonomous worker drained the remaining two; self-limiting confirmed
+  (exactly 5 analyze decisions total).
+- **Emergency suite:** default-on confirmed; 120,000 XIDs burned via pgbench
+  (5.3K TPS); below the stall line the table stayed a passive
+  `wraparound_warning` with an empty emergency queue; lowering
+  `emergency_xid_age` to 100,000 made never-started fire and the worker froze
+  victim1 (age 120,020 → <5,000) while the opted-out victim2 was untouched; a
+  builtin anti-wraparound autovacuum staged to grind (cost_limit 50, 1M
+  updated rows) was respected while running (`vacuum_already_running`), the
+  delay-bound recommendation fired from `pg_stat_progress_vacuum.delay_time`
+  (exercising the PG17-compat `to_jsonb` read path on 18), and past the
+  60-second takeover minimum the controller cancelled the builtin
+  ("canceling autovacuum task" logged once) and froze the 1M-row table;
+  `wraparound_status` stayed consistent throughout.
+- **Multi-DB + barrier:** with three managed databases the worker cycled all
+  of them within one naptime; `CREATE DATABASE` 83 ms / `DROP DATABASE`
+  149 ms while the launcher was running.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:

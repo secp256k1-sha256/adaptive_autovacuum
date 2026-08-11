@@ -46,8 +46,14 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-#if PG_VERSION_NUM < 180000
-#error "adaptive_autovacuum requires PostgreSQL 18 or later"
+/* PostgreSQL 17 is the floor: pg_stat_progress_vacuum gained the
+   *_dead_tuple_bytes columns in 17.  On 17 the PG18-only surface degrades
+   gracefully: no eager-freeze tuning on emergency vacuums (below), and the
+   SQL policy skips autovacuum_vacuum_max_threshold, autovacuum_worker_slots,
+   delay_time accounting, and the automatic autovacuum_max_workers apply
+   (PGC_POSTMASTER on 17). */
+#if PG_VERSION_NUM < 170000
+#error "adaptive_autovacuum requires PostgreSQL 17 or later"
 #endif
 
 PG_MODULE_MAGIC;
@@ -1397,7 +1403,9 @@ aav_run_emergency_vacuum(const AAVEmergencyRequest *request)
     params.index_cleanup = VACOPTVALUE_DISABLED;
     params.truncate = VACOPTVALUE_DISABLED;
     params.toast_parent = InvalidOid;
+#if PG_VERSION_NUM >= 180000
     params.max_eager_freeze_failure_rate = vacuum_max_eager_freeze_failure_rate;
+#endif
     params.nworkers = 0;
 
     vac_context = AllocSetContextCreate(TopMemoryContext,
