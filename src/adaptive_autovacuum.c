@@ -42,6 +42,7 @@
 #include "utils/guc.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -1061,6 +1062,7 @@ static const char *const aav_allowed_global_gucs[] = {
     "autovacuum_vacuum_cost_delay",
     "autovacuum_max_workers",
     "autovacuum_work_mem",
+    "vacuum_buffer_usage_limit",
     "autovacuum_vacuum_scale_factor",
     "autovacuum_vacuum_threshold",
     "autovacuum_vacuum_max_threshold",
@@ -1194,6 +1196,9 @@ aav_apply_global_settings(void)
         VariableSetStmt *setstmt;
         AlterSystemStmt *stmt;
         A_Const *aconst;
+        MemoryContext oldcontext;
+        ResourceOwner oldowner;
+        char *volatile apply_error = NULL;
 
         if (names[i] == NULL || !aav_global_guc_allowed(names[i]))
         {
@@ -1211,6 +1216,34 @@ aav_apply_global_settings(void)
             continue;
         }
 
+        /*
+         * autovacuum_max_workers must not exceed autovacuum_worker_slots:
+         * the server ACCEPTS a larger value (it only warns and caps the
+         * effective worker count at runtime), so neither the GUC bounds
+         * validation below nor the SQL policy's queue-time pg_settings check
+         * would reject it.  The policy caps its own recommendation, but a
+         * queued row can outlive a restart that lowered the slot count
+         * (autovacuum_worker_slots is postmaster-context), and manual queue
+         * inserts bypass the policy entirely.  The slots GUC does not exist
+         * before PostgreSQL 18, so this check is inert there.
+         */
+        if (strcmp(names[i], "autovacuum_max_workers") == 0)
+        {
+            const char *slots = GetConfigOption("autovacuum_worker_slots",
+                                                true, false);
+
+            if (slots != NULL && atoi(values[i]) > atoi(slots))
+            {
+                char *slots_error = psprintf(
+                    "Value exceeds autovacuum_worker_slots (%s); the excess workers could never start.",
+                    slots);
+
+                aav_mark_global_change(ids[i], "failed", NULL, slots_error);
+                pfree(slots_error);
+                continue;
+            }
+        }
+
         old_value = GetConfigOption(names[i], true, false);
 
         aconst = makeNode(A_Const);
@@ -1226,7 +1259,50 @@ aav_apply_global_settings(void)
         stmt = makeNode(AlterSystemStmt);
         stmt->setstmt = setstmt;
 
-        AlterSystemSetConfigFile(stmt);
+        /*
+         * AlterSystemSetConfigFile() runs the GUC's own parse/bounds
+         * validation and ERRORs on a value the server would not accept.
+         * Isolate each row in a subtransaction so one bad value is marked
+         * failed and the remaining rows still apply; without this the whole
+         * apply transaction aborts, every row stays pending, and the worker
+         * re-hits the same error each cycle until the one-hour queue expiry.
+         */
+        oldcontext = CurrentMemoryContext;
+        oldowner = CurrentResourceOwner;
+        BeginInternalSubTransaction(NULL);
+        PG_TRY();
+        {
+            AlterSystemSetConfigFile(stmt);
+            ReleaseCurrentSubTransaction();
+            MemoryContextSwitchTo(oldcontext);
+            CurrentResourceOwner = oldowner;
+        }
+        PG_CATCH();
+        {
+            ErrorData *edata;
+
+            MemoryContextSwitchTo(oldcontext);
+            edata = CopyErrorData();
+            FlushErrorState();
+            RollbackAndReleaseCurrentSubTransaction();
+            MemoryContextSwitchTo(oldcontext);
+            CurrentResourceOwner = oldowner;
+
+            apply_error = pstrdup(edata->message != NULL
+                                  ? edata->message : "unknown error");
+            FreeErrorData(edata);
+        }
+        PG_END_TRY();
+
+        if (apply_error != NULL)
+        {
+            aav_mark_global_change(ids[i], "failed", NULL, apply_error);
+            elog(WARNING,
+                 "adaptive autovacuum could not set %s = %s cluster-wide: %s",
+                 names[i], values[i], apply_error);
+            pfree(apply_error);
+            continue;
+        }
 
         aav_mark_global_change(ids[i], "applied", old_value, NULL);
         applied_count++;

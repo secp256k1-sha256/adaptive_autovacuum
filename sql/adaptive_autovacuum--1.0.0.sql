@@ -28,7 +28,7 @@ CREATE TABLE adaptive_autovacuum.policy
     target_insert_max               bigint NOT NULL DEFAULT 10000000 CHECK (target_insert_max >= target_insert_min AND target_insert_max <= 2147483647),
     threshold_floor                 integer NOT NULL DEFAULT 50 CHECK (threshold_floor >= 0),
     min_scale_factor                double precision NOT NULL DEFAULT 0.0001 CHECK (min_scale_factor >= 0),
-    max_scale_factor                double precision NOT NULL DEFAULT 0.20 CHECK (max_scale_factor >= min_scale_factor),
+    max_scale_factor                double precision NOT NULL DEFAULT 0.20 CONSTRAINT policy_max_scale_factor_check CHECK (max_scale_factor >= min_scale_factor AND max_scale_factor <= 100),
 
     backlog_elevated_ratio          double precision NOT NULL DEFAULT 1.50 CHECK (backlog_elevated_ratio >= 1),
     backlog_urgent_ratio            double precision NOT NULL DEFAULT 3.00 CHECK (backlog_urgent_ratio >= backlog_elevated_ratio),
@@ -47,10 +47,14 @@ CREATE TABLE adaptive_autovacuum.policy
 
     manage_table_costs              boolean NOT NULL DEFAULT false,
     max_boosted_relations           integer NOT NULL DEFAULT 2 CHECK (max_boosted_relations >= 0),
-    elevated_cost_limit             integer NOT NULL DEFAULT 1000 CHECK (elevated_cost_limit >= 200),
-    urgent_cost_limit               integer NOT NULL DEFAULT 3000 CHECK (urgent_cost_limit >= elevated_cost_limit),
-    critical_cost_limit             integer NOT NULL DEFAULT 6000 CHECK (critical_cost_limit >= urgent_cost_limit),
-    elevated_cost_delay_ms          double precision NOT NULL DEFAULT 2.0 CHECK (elevated_cost_delay_ms >= 0),
+    /* Cost limits are capped at 10000 and delays at 100 ms: the documented
+       maxima of the underlying (auto)vacuum_cost_limit/_cost_delay settings
+       and reloptions, so a mistuned policy can never compute a value the
+       server itself would reject. */
+    elevated_cost_limit             integer NOT NULL DEFAULT 1000 CHECK (elevated_cost_limit >= 200 AND elevated_cost_limit <= 10000),
+    urgent_cost_limit               integer NOT NULL DEFAULT 3000 CONSTRAINT policy_urgent_cost_limit_check CHECK (urgent_cost_limit >= elevated_cost_limit AND urgent_cost_limit <= 10000),
+    critical_cost_limit             integer NOT NULL DEFAULT 6000 CONSTRAINT policy_critical_cost_limit_check CHECK (critical_cost_limit >= urgent_cost_limit AND critical_cost_limit <= 10000),
+    elevated_cost_delay_ms          double precision NOT NULL DEFAULT 2.0 CHECK (elevated_cost_delay_ms >= 0 AND elevated_cost_delay_ms <= 100),
     urgent_cost_delay_ms            double precision NOT NULL DEFAULT 1.0 CHECK (urgent_cost_delay_ms >= 0 AND urgent_cost_delay_ms <= elevated_cost_delay_ms),
     critical_cost_delay_ms          double precision NOT NULL DEFAULT 0.0 CHECK (critical_cost_delay_ms >= 0 AND critical_cost_delay_ms <= urgent_cost_delay_ms),
     boost_ramp_factor               double precision NOT NULL DEFAULT 2.0 CHECK (boost_ramp_factor >= 1.1 AND boost_ramp_factor <= 10),
@@ -84,17 +88,31 @@ CREATE TABLE adaptive_autovacuum.policy
     high_load_per_cpu               double precision NOT NULL DEFAULT 1.50 CHECK (high_load_per_cpu > 0),
     low_memory_percent              double precision NOT NULL DEFAULT 15.0 CHECK (low_memory_percent > 0 AND low_memory_percent < 100),
 
-    recommendation_cost_limit_max   integer NOT NULL DEFAULT 10000 CHECK (recommendation_cost_limit_max >= 200),
-    recommendation_delay_max_ms     integer NOT NULL DEFAULT 20 CHECK (recommendation_delay_max_ms >= 0),
-    recommendation_work_mem_max_mb  integer NOT NULL DEFAULT 4096 CHECK (recommendation_work_mem_max_mb >= 64),
+    recommendation_cost_limit_max   integer NOT NULL DEFAULT 10000 CHECK (recommendation_cost_limit_max >= 200 AND recommendation_cost_limit_max <= 10000),
+    recommendation_delay_max_ms     integer NOT NULL DEFAULT 20 CHECK (recommendation_delay_max_ms >= 0 AND recommendation_delay_max_ms <= 100),
+    /* Floor for the automatic cost-delay walk-down: halving stops here
+       instead of converging to an effectively unthrottled ~0 ms (a manual-
+       vacuum aggression level the controller should not reach on its own).
+       A current delay already below the floor is respected, never raised. */
+    recommendation_delay_min_ms     double precision NOT NULL DEFAULT 0.5 CONSTRAINT policy_recommendation_delay_min_ms_check CHECK (recommendation_delay_min_ms >= 0 AND recommendation_delay_min_ms <= recommendation_delay_max_ms),
+    /* 2097151 MB is the largest value expressible in kilobytes as a 32-bit
+       integer (MAX_KILOBYTES), the domain of autovacuum_work_mem and
+       maintenance_work_mem; larger values would overflow the kB conversion. */
+    recommendation_work_mem_max_mb  integer NOT NULL DEFAULT 4096 CHECK (recommendation_work_mem_max_mb >= 64 AND recommendation_work_mem_max_mb <= 2097151),
+    /* Ceiling for the opportunistic vacuum_buffer_usage_limit raise (16384 MB
+       = the GUC's own 16 GB maximum).  The effective cap is additionally
+       bounded by the server's silent clamp of 1/8 of shared_buffers, divided
+       across the autovacuum worker pool so concurrent rings cannot occupy a
+       disproportionate share of the buffer cache. */
+    recommendation_buffer_usage_limit_max_mb integer NOT NULL DEFAULT 256 CHECK (recommendation_buffer_usage_limit_max_mb >= 2 AND recommendation_buffer_usage_limit_max_mb <= 16384),
     work_mem_available_fraction     double precision NOT NULL DEFAULT 0.10 CHECK (work_mem_available_fraction > 0 AND work_mem_available_fraction <= 0.50),
     recommendation_workers_max      integer NOT NULL DEFAULT 8 CHECK (recommendation_workers_max BETWEEN 1 AND 64),
 
     emergency_vacuum_enabled        boolean NOT NULL DEFAULT true,
     emergency_work_mem_min_mb       integer NOT NULL DEFAULT 128 CHECK (emergency_work_mem_min_mb >= 64),
-    emergency_work_mem_max_mb       integer NOT NULL DEFAULT 2048 CHECK (emergency_work_mem_max_mb >= emergency_work_mem_min_mb),
-    emergency_cost_limit            integer NOT NULL DEFAULT 10000 CHECK (emergency_cost_limit >= 200),
-    emergency_cost_delay_ms         integer NOT NULL DEFAULT 0 CHECK (emergency_cost_delay_ms >= 0),
+    emergency_work_mem_max_mb       integer NOT NULL DEFAULT 2048 CHECK (emergency_work_mem_max_mb >= emergency_work_mem_min_mb AND emergency_work_mem_max_mb <= 2097151),
+    emergency_cost_limit            integer NOT NULL DEFAULT 10000 CHECK (emergency_cost_limit >= 200 AND emergency_cost_limit <= 10000),
+    emergency_cost_delay_ms         integer NOT NULL DEFAULT 0 CHECK (emergency_cost_delay_ms >= 0 AND emergency_cost_delay_ms <= 100),
     emergency_lock_timeout_ms       integer NOT NULL DEFAULT 5000 CHECK (emergency_lock_timeout_ms >= 1),
 
     history_retention_days          integer NOT NULL DEFAULT 30 CHECK (history_retention_days >= 1),
@@ -120,8 +138,8 @@ CREATE TABLE adaptive_autovacuum.table_policy
     CHECK (target_dead_tuple_min IS NULL OR target_dead_tuple_min >= 0),
     CHECK (target_dead_tuple_max IS NULL OR (target_dead_tuple_max >= 0 AND target_dead_tuple_max <= 2147483647)),
     CHECK (target_dead_tuple_min IS NULL OR target_dead_tuple_max IS NULL OR target_dead_tuple_max >= target_dead_tuple_min),
-    CHECK (min_scale_factor IS NULL OR min_scale_factor >= 0),
-    CHECK (max_scale_factor IS NULL OR max_scale_factor >= 0),
+    CHECK (min_scale_factor IS NULL OR (min_scale_factor >= 0 AND min_scale_factor <= 100)),
+    CHECK (max_scale_factor IS NULL OR (max_scale_factor >= 0 AND max_scale_factor <= 100)),
     CHECK (min_scale_factor IS NULL OR max_scale_factor IS NULL OR max_scale_factor >= min_scale_factor)
 );
 
@@ -182,6 +200,7 @@ CREATE TABLE adaptive_autovacuum.global_recommendations
     recommended_cost_limit          integer NOT NULL,
     recommended_cost_delay_ms       double precision NOT NULL,
     recommended_autovacuum_work_mem_kb integer NOT NULL,
+    recommended_buffer_usage_limit_kb integer NOT NULL,
     recommended_autovacuum_workers  integer NOT NULL,
     recommended_vacuum_scale_factor double precision,
     recommended_vacuum_threshold    integer,
@@ -438,6 +457,10 @@ DECLARE
     recommended_cost_limit integer;
     recommended_cost_delay double precision;
     recommended_work_mem_kb integer;
+    current_buffer_usage_limit_kb integer;
+    recommended_buffer_usage_limit_kb integer;
+    buffer_ring_cap_kb bigint;
+    shared_buffers_kb bigint;
     recommendation_reason text;
 
     vacuum_trigger double precision;
@@ -595,6 +618,13 @@ BEGIN
     SELECT setting::integer INTO autovacuum_worker_slots_cfg
     FROM pg_settings WHERE name = 'autovacuum_worker_slots';
 
+    SELECT setting::integer INTO current_buffer_usage_limit_kb
+    FROM pg_settings WHERE name = 'vacuum_buffer_usage_limit';
+
+    SELECT s.setting::bigint * pg_catalog.current_setting('block_size')::bigint / 1024
+    INTO shared_buffers_kb
+    FROM pg_settings s WHERE s.name = 'shared_buffers';
+
     SELECT setting::double precision INTO current_analyze_scale
     FROM pg_settings WHERE name = 'autovacuum_analyze_scale_factor';
 
@@ -642,7 +672,13 @@ BEGIN
     ELSIF delay_bound_count > 0 THEN
         recommended_cost_limit := LEAST(p.recommendation_cost_limit_max,
                                         GREATEST(200, current_global_cost_limit * 2));
-        recommended_cost_delay := GREATEST(0, current_global_cost_delay / 2.0);
+        /* Halve toward more throughput, but stop at the policy floor:
+           delay 0 is manual-vacuum aggression and is never reached
+           automatically.  LEAST(floor, current) means an operator-chosen
+           delay already below the floor is respected, never raised. */
+        recommended_cost_delay := GREATEST(
+            LEAST(p.recommendation_delay_min_ms, GREATEST(current_global_cost_delay, 0)),
+            GREATEST(current_global_cost_delay, 0) / 2.0);
         recommendation_reason := 'Long-running vacuums are spending a material fraction of time in cost delay.';
     ELSE
         recommended_cost_limit := current_global_cost_limit;
@@ -672,7 +708,18 @@ BEGIN
             recommended_work_mem_kb := LEAST(current_autovacuum_work_mem_kb,
                                              recommended_work_mem_kb);
         ELSIF repeated_index_cycle_count = 0 THEN
-            recommended_work_mem_kb := current_autovacuum_work_mem_kb;
+            /* No out-of-memory evidence (repeated index passes).  While
+               autovacuum workers are actually running and host memory is
+               free, raise opportunistically toward the memory-derived value
+               so the running and following vacuums can hold more dead-tuple
+               state; never lower without evidence.  Idle clusters are left
+               untouched. */
+            IF av_workers_running > 0 THEN
+                recommended_work_mem_kb := GREATEST(current_autovacuum_work_mem_kb,
+                                                    recommended_work_mem_kb);
+            ELSE
+                recommended_work_mem_kb := current_autovacuum_work_mem_kb;
+            END IF;
         END IF;
     END IF;
 
@@ -1408,7 +1455,10 @@ BEGIN
     THEN
         recommended_cost_limit := LEAST(p.recommendation_cost_limit_max,
                                         GREATEST(200, current_global_cost_limit * 2));
-        recommended_cost_delay := GREATEST(0, current_global_cost_delay / 2.0);
+        /* Same floored walk-down as the delay-bound branch above. */
+        recommended_cost_delay := GREATEST(
+            LEAST(p.recommendation_delay_min_ms, GREATEST(current_global_cost_delay, 0)),
+            GREATEST(current_global_cost_delay, 0) / 2.0);
         recommendation_reason := format('%s overdue relations were found without host pressure.', overdue_relation_count);
     END IF;
 
@@ -1575,11 +1625,62 @@ BEGIN
             || ' automatically).', freeze_max_age);
     END IF;
 
+    /*
+     * vacuum_buffer_usage_limit (PG16+): the ring of shared_buffers pages a
+     * VACUUM or ANALYZE may occupy.  An idle ring costs nothing, so while
+     * autovacuum workers are actually running and the host has free memory
+     * it is raised (at most doubled per cycle) so long vacuums keep their
+     * heap and index pages cached across passes instead of re-reading them.
+     * Caps: the policy ceiling, and the server's own silent clamp of 1/8 of
+     * shared_buffers divided across the worker pool, so concurrent rings
+     * cannot occupy a disproportionate share of the buffer cache.  Under
+     * host pressure it is halved back toward the built-in default.  A
+     * setting of 0 ("no ring limit") is operator intent and never touched.
+     */
+    recommended_buffer_usage_limit_kb := current_buffer_usage_limit_kb;
+    IF current_buffer_usage_limit_kb > 0 THEN
+        buffer_ring_cap_kb := LEAST(
+            p.recommendation_buffer_usage_limit_max_mb::bigint * 1024,
+            shared_buffers_kb / 8 / GREATEST(current_autovacuum_workers, 1));
+        IF host_pressure THEN
+            SELECT GREATEST(s.boot_val::integer,
+                            current_buffer_usage_limit_kb / 2)
+            INTO recommended_buffer_usage_limit_kb
+            FROM pg_settings s WHERE s.name = 'vacuum_buffer_usage_limit';
+        ELSIF av_workers_running > 0
+              AND host_metrics_available
+              AND current_buffer_usage_limit_kb < buffer_ring_cap_kb THEN
+            recommended_buffer_usage_limit_kb := LEAST(
+                buffer_ring_cap_kb,
+                current_buffer_usage_limit_kb::bigint * 2)::integer;
+        END IF;
+    END IF;
+
+    IF recommended_buffer_usage_limit_kb <> current_buffer_usage_limit_kb THEN
+        IF recommended_buffer_usage_limit_kb > current_buffer_usage_limit_kb THEN
+            recommendation_reason := recommendation_reason || format(
+                ' %s autovacuum worker(s) are running with free host memory:'
+                || ' raising vacuum_buffer_usage_limit %s -> %s kB so'
+                || ' maintenance keeps its pages cached across passes'
+                || ' (cap %s kB = LEAST(policy %s MB, shared_buffers/8 per'
+                || ' worker)).',
+                av_workers_running,
+                current_buffer_usage_limit_kb, recommended_buffer_usage_limit_kb,
+                buffer_ring_cap_kb, p.recommendation_buffer_usage_limit_max_mb);
+        ELSE
+            recommendation_reason := recommendation_reason || format(
+                ' Host pressure: walking vacuum_buffer_usage_limit back'
+                || ' %s -> %s kB.',
+                current_buffer_usage_limit_kb, recommended_buffer_usage_limit_kb);
+        END IF;
+    END IF;
+
     INSERT INTO adaptive_autovacuum.global_recommendations
         (host_metrics, overdue_relations, long_vacuums,
          delay_bound_long_vacuums, repeated_index_vacuum_cycles,
          recommended_cost_limit, recommended_cost_delay_ms,
-         recommended_autovacuum_work_mem_kb, recommended_autovacuum_workers,
+         recommended_autovacuum_work_mem_kb, recommended_buffer_usage_limit_kb,
+         recommended_autovacuum_workers,
          recommended_vacuum_scale_factor, recommended_vacuum_threshold,
          recommended_vacuum_max_threshold,
          recommended_insert_scale_factor, recommended_insert_threshold,
@@ -1589,7 +1690,8 @@ BEGIN
         (host_json, overdue_relation_count, long_vacuum_count,
          delay_bound_count, repeated_index_cycle_count,
          recommended_cost_limit, recommended_cost_delay,
-         recommended_work_mem_kb, recommended_workers,
+         recommended_work_mem_kb, recommended_buffer_usage_limit_kb,
+         recommended_workers,
          recommended_scale, recommended_thresh,
          recommended_max_thresh,
          recommended_ins_scale, recommended_ins_thresh,
@@ -1632,6 +1734,9 @@ BEGIN
             ('autovacuum_work_mem',
              recommended_work_mem_kb::text,
              current_autovacuum_work_mem_kb::text),
+            ('vacuum_buffer_usage_limit',
+             recommended_buffer_usage_limit_kb::text,
+             current_buffer_usage_limit_kb::text),
             ('autovacuum_vacuum_scale_factor',
              CASE WHEN recommended_scale IS NOT NULL
                   THEN trim(trailing '.' from to_char(recommended_scale, 'FM0.9999')) END,
@@ -1663,6 +1768,17 @@ BEGIN
         ) AS cand(guc_name, desired_value, current_value)
         WHERE cand.desired_value IS NOT NULL
           AND cand.desired_value::numeric IS DISTINCT FROM cand.current_value::numeric
+          /* Never enqueue a value outside the GUC's own documented bounds
+             (pg_settings min_val/max_val): ALTER SYSTEM would reject it in
+             the C worker, and the row would sit failing until expiry.  This
+             also drops GUCs the running server version does not have. */
+          AND EXISTS (SELECT 1
+                      FROM pg_settings s
+                      WHERE s.name = cand.guc_name
+                        AND (s.min_val IS NULL
+                             OR cand.desired_value::numeric >= s.min_val::numeric)
+                        AND (s.max_val IS NULL
+                             OR cand.desired_value::numeric <= s.max_val::numeric))
           AND NOT EXISTS (SELECT 1
                           FROM adaptive_autovacuum.global_apply_queue q
                           WHERE q.guc_name = cand.guc_name

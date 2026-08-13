@@ -47,15 +47,16 @@ A background worker checks the whole cluster every minute (configurable). When t
 
 | Setting | Fixed when |
 |---|---|
-| `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump. Lowered if the server is overloaded |
+| `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) — full manual-vacuum aggression is never set automatically. Lowered if the server is overloaded |
 | `autovacuum_max_workers` | more tables are behind than there are workers, or every worker is busy while tables wait. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
-| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory |
+| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure) |
+| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This is the slice of shared buffers a vacuum or analyze may keep its pages in — bigger means long vacuums stop re-reading the same pages; an idle ring costs nothing. Doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself (no limit) is never touched |
 | `autovacuum_vacuum_scale_factor` / `_threshold` | a quarter or more of your tables are behind at the same time. That means the baseline is wrong, not the tables. So the baseline gets corrected instead of patching tables one by one |
 | `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
 | `autovacuum_vacuum_insert_scale_factor` / `_insert_threshold` | the same "baseline is wrong" logic, for insert-only workloads |
 | `autovacuum_analyze_scale_factor` / `_analyze_threshold` | kept in proportion whenever the vacuum baseline is corrected, so planner statistics stay fresh too |
 
-Changes are validated against a fixed list of allowed settings, and logged with old and new values in one table you can query. Prefer to stay in control? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
+Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Prefer to stay in control? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
 
 ### 2. Gives special tables temporary custom settings
 
@@ -267,6 +268,8 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 | `analyze_missing_stats` | `true` | analyze tables that have live rows but were never analyzed at all |
 | `analyze_missing_stats_per_cycle` | `3` | how many never-analyzed tables to analyze per cycle, largest first |
 | `change_cooldown_seconds` | `1800` | minimum gap between changes to the same table |
+| `recommendation_delay_min_ms` | `0.5` | floor for the automatic cost-delay walk-down; delay 0 (manual-vacuum aggression) is never set cluster-wide automatically. A delay you set below the floor yourself is respected, never raised |
+| `recommendation_buffer_usage_limit_max_mb` | `256` | ceiling for the opportunistic `vacuum_buffer_usage_limit` raise while maintenance runs |
 | `healthy_cycles_before_restore` | `6` | healthy checks required before a table's original settings return |
 | `max_boosted_relations` / `boost_total_cost_limit_budget` | `2` / `10000` | how many tables may hold speed boosts, and the combined ceiling |
 | `high_load_per_cpu` / `low_memory_percent` | `1.5` / `15` | what counts as an overloaded server (no boosts beyond this) |

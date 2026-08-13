@@ -410,6 +410,84 @@ assertion below ran against the live cluster and passed.
   of them within one naptime; `CREATE DATABASE` 83 ms / `DROP DATABASE`
   149 ms while the launcher was running.
 
+## Validation performed 2026-08-13 (parameter-bounds hardening)
+
+Guards against absurd tuning values, validated on the Windows workstation
+(EDB PG 18.4 live service on 5432 + scratch initdb PG 17.6 on 5433):
+
+- **Policy CHECK upper bounds:** every knob that feeds a bounded server
+  setting is now capped at that setting's documented maximum — cost limits
+  <= 10000, cost delays <= 100 ms, scale factors <= 100, work_mem MB values
+  <= 2097151 (the kilobyte-conversion overflow line).  Cross-column CHECKs
+  the regression suite exercises carry explicit constraint names.  Seven
+  negative tests added to the regression script; suite green via real
+  `pg_regress` on 18.4 and 17.6 with one shared expected file.
+- **Queue-time bounds validation:** the global-apply INSERT now requires the
+  desired value to fall inside the GUC's own `pg_settings` min/max, so a
+  mistuned policy cannot enqueue a change ALTER SYSTEM would reject.
+- **Per-row apply isolation (C):** each queue row is applied inside an
+  internal subtransaction; a rejected value is marked `failed` with the
+  server's own error and a WARNING, and later rows still apply.  Proven live
+  on the preloaded 18.4 worker: queued out-of-range `cost_limit=50000`
+  (failed: "outside the valid range ... (-1 .. 10000)"), valid
+  `cost_delay=3` (applied, old value audited), non-whitelisted
+  `autovacuum_naptime` (failed: whitelist) — all in one cycle, worker alive.
+  Previously one bad row aborted the whole apply transaction and was retried
+  every cycle until the one-hour queue expiry.
+- **Cost-delay floor:** new `recommendation_delay_min_ms` (default 0.5,
+  CHECK 0..recommendation_delay_max_ms) stops the automatic halving above
+  zero; an operator-set delay already below the floor is respected, never
+  raised (formula verified for current values 2, 1, 0.6, 0.5, 0.2, 0, -1).
+  Deliberate 0-delay profiles (critical boost tier, emergency failsafe) are
+  unchanged.
+- **Worker-slots cross-GUC guard (C):** `autovacuum_max_workers` above
+  `autovacuum_worker_slots` is accepted by the server (runtime warning +
+  cap), so neither the generic bounds checks nor ALTER SYSTEM rejection
+  catches it; the applier now fails such rows explicitly.  Covers queued
+  rows outliving a restart that lowered the slot count (postmaster-context
+  GUC) and manual queue inserts; inert on PG17 (no slots GUC).  Proven live
+  on the 18.4 worker with `autovacuum_worker_slots=16`: queued `20` failed
+  ("exceeds autovacuum_worker_slots (16)"), boundary `16` applied in the
+  same cycle, then restored.
+- Compiled clean against PG 18.4 and 17.6 headers (MSVC); PG17 tree's DLL and
+  script redeployed; all live-cluster test state restored afterwards
+  (autovacuum_vacuum_cost_delay RESET, worker disabled, scratch DBs dropped).
+
+## Validation performed 2026-08-13 (opportunistic memory sizing)
+
+New managed setting `vacuum_buffer_usage_limit` (PG16+, present on both
+supported majors) plus an opportunistic raise for `autovacuum_work_mem`,
+validated on the Windows workstation (EDB PG 18.4 live service + scratch
+initdb PG 17.6):
+
+- **Design:** both are sized only while autovacuum workers are actually
+  running and the host has free memory; an idle cluster is never retuned.
+  The buffer ring is at most doubled per cycle, capped by the new policy
+  knob `recommendation_buffer_usage_limit_max_mb` (default 256, CHECK
+  2..16384 = the GUC's 16 GB maximum) AND by the server's silent
+  1/8-of-shared_buffers clamp divided across the worker pool; halved back
+  toward the built-in default under host pressure; an operator setting of 0
+  ("no ring limit") is never touched.  `autovacuum_work_mem` keeps its
+  repeated-index-pass evidence trigger and additionally ratchets toward the
+  free-memory-derived value while workers run; never lowered without host
+  pressure.
+- **Live E2E (18.4):** staged a grinding autovacuum (400K-row table,
+  per-table cost_limit=50/delay=20), ran a cycle with 8 GB free metrics:
+  queue got `vacuum_buffer_usage_limit` 2048 -> 4096 kB — exactly the
+  predicted first doubling under the derived cap
+  LEAST(256 MB, 1 GB shared_buffers / 8 / 3 workers) = 43690 kB — and the C
+  worker applied it through the extended whitelist (old value audited,
+  `SHOW` = 4MB).  `autovacuum_work_mem` correctly queued NOTHING: the
+  effective value (1 GB via maintenance_work_mem) already exceeded the
+  memory-derived 273 MB and the raise never lowers.  All settings RESET and
+  verified back at defaults afterwards.
+- **Regression:** new-knob default + CHECK-violation tests added; suite
+  green via real `pg_regress` on 18.4 and scratch 17.6 with one shared
+  expected file (also proving the GUC surface parses on 17).
+- Not yet exercised: a raise chain past the first doubling on a live busy
+  cluster, and the host-pressure walk-back of the ring (code path mirrors
+  the proven cost walk-back).
+
 ## Required release gate
 
 For each supported PostgreSQL major version:
