@@ -87,6 +87,14 @@ CREATE TABLE adaptive_autovacuum.policy
     high_delay_fraction             double precision NOT NULL DEFAULT 0.25 CHECK (high_delay_fraction >= 0 AND high_delay_fraction <= 1),
     high_load_per_cpu               double precision NOT NULL DEFAULT 1.50 CHECK (high_load_per_cpu > 0),
     low_memory_percent              double precision NOT NULL DEFAULT 15.0 CHECK (low_memory_percent > 0 AND low_memory_percent < 100),
+    /* Storage guardrail: autovacuum often bottlenecks on storage while CPU
+       and RAM still look idle.  When the measured cluster WAL generation rate
+       (pg_stat_wal delta between cycles, MB/s) exceeds this, the cycle is
+       treated as running under host pressure: no aggression raises, and the
+       walk-back branches engage.  0 disables the guardrail (default), because
+       a sane threshold depends on the storage; size it below the device's
+       known sustained write throughput. */
+    high_wal_mbps                   double precision NOT NULL DEFAULT 0 CHECK (high_wal_mbps >= 0),
 
     recommendation_cost_limit_max   integer NOT NULL DEFAULT 10000 CHECK (recommendation_cost_limit_max >= 200 AND recommendation_cost_limit_max <= 10000),
     recommendation_delay_max_ms     integer NOT NULL DEFAULT 20 CHECK (recommendation_delay_max_ms >= 0 AND recommendation_delay_max_ms <= 100),
@@ -125,6 +133,14 @@ INSERT INTO adaptive_autovacuum.policy(singleton) VALUES (true);
 CREATE TABLE adaptive_autovacuum.table_policy
 (
     relid                 oid PRIMARY KEY,
+    /* Identity fingerprint against OID reuse: OIDs are recycled, so a row
+       keyed by relid alone could silently apply operator intent to an
+       unrelated table created later under the same OID.  Filled automatically
+       by trigger on INSERT and UPDATE; the policy ignores rows whose
+       fingerprint no longer matches pg_class (re-adopt by updating the row,
+       e.g. UPDATE ... SET enabled = enabled ... after a rename). */
+    schema_name           name,
+    relation_name         name,
     enabled               boolean NOT NULL DEFAULT true,
     target_dead_tuple_ratio double precision,
     target_dead_tuple_min bigint,
@@ -142,6 +158,28 @@ CREATE TABLE adaptive_autovacuum.table_policy
     CHECK (max_scale_factor IS NULL OR (max_scale_factor >= 0 AND max_scale_factor <= 100)),
     CHECK (min_scale_factor IS NULL OR max_scale_factor IS NULL OR max_scale_factor >= min_scale_factor)
 );
+
+CREATE FUNCTION adaptive_autovacuum._table_policy_fill_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    SELECT n.nspname, c.relname
+    INTO NEW.schema_name, NEW.relation_name
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = NEW.relid;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER table_policy_fill_identity
+    BEFORE INSERT OR UPDATE ON adaptive_autovacuum.table_policy
+    FOR EACH ROW
+    EXECUTE FUNCTION adaptive_autovacuum._table_policy_fill_identity();
+
+COMMENT ON TABLE adaptive_autovacuum.table_policy IS
+'Per-relation operator overrides. schema_name/relation_name fingerprint the relid against OID reuse: rows whose fingerprint no longer matches pg_class are ignored (touch the row with UPDATE to re-adopt after a rename); rows whose relation was dropped are removed each cycle.';
 
 CREATE TABLE adaptive_autovacuum.relation_state
 (
@@ -272,7 +310,10 @@ CREATE TABLE adaptive_autovacuum.controller_state
 (
     only_row        boolean PRIMARY KEY DEFAULT true CHECK (only_row),
     last_xid8       bigint,
-    last_sample_at  timestamptz
+    last_sample_at  timestamptz,
+    /* pg_stat_wal.wal_bytes at the previous cycle; the delta gives the
+       cluster WAL generation rate for the high_wal_mbps storage guardrail. */
+    last_wal_bytes  bigint
 );
 INSERT INTO adaptive_autovacuum.controller_state (only_row) VALUES (true);
 
@@ -457,6 +498,7 @@ DECLARE
     host_load_per_cpu double precision;
     host_metrics_available boolean;
     host_pressure boolean;
+    storage_pressure boolean;
     host_json jsonb;
 
     autovacuum_enabled_global boolean;
@@ -520,6 +562,9 @@ DECLARE
     prev_xid8 bigint;
     prev_sample_at timestamptz;
     xid_rate double precision;
+    cur_wal_bytes bigint;
+    prev_wal_bytes bigint;
+    wal_rate_mbps double precision;
     stall_xid_age bigint;
     stall_mxid_age bigint;
     av_wraparound_running boolean;
@@ -590,8 +635,47 @@ BEGIN
         ELSE 100.0
     END;
     host_load_per_cpu := host_load1 / host_cpu_count;
+
+    /* XID consumption rate (transactions/second) and WAL generation rate
+       (MB/second) from the deltas since the previous cycle; NULL on the
+       first cycle or when the elapsed window is too small to be
+       meaningful. */
+    cur_xid8 := pg_catalog.pg_current_xact_id()::text::bigint;
+    SELECT w.wal_bytes::bigint INTO cur_wal_bytes
+    FROM pg_catalog.pg_stat_wal w;
+    SELECT cs.last_xid8, cs.last_sample_at, cs.last_wal_bytes
+    INTO prev_xid8, prev_sample_at, prev_wal_bytes
+    FROM adaptive_autovacuum.controller_state cs;
+    xid_rate := NULL;
+    wal_rate_mbps := NULL;
+    IF prev_sample_at IS NOT NULL
+       AND clock_timestamp() > prev_sample_at + interval '1 second' THEN
+        IF prev_xid8 IS NOT NULL AND cur_xid8 > prev_xid8 THEN
+            xid_rate := (cur_xid8 - prev_xid8)::double precision /
+                        extract(epoch FROM clock_timestamp() - prev_sample_at);
+        END IF;
+        IF prev_wal_bytes IS NOT NULL AND cur_wal_bytes >= prev_wal_bytes THEN
+            wal_rate_mbps := (cur_wal_bytes - prev_wal_bytes) / 1048576.0 /
+                             extract(epoch FROM clock_timestamp() - prev_sample_at);
+        END IF;
+    END IF;
+    UPDATE adaptive_autovacuum.controller_state
+    SET last_xid8 = cur_xid8,
+        last_sample_at = clock_timestamp(),
+        last_wal_bytes = cur_wal_bytes;
+
+    /* Storage guardrail (opt-in via high_wal_mbps > 0): CPU/RAM pressure
+       misses a saturated storage device; a sustained WAL rate above the
+       operator-set line is treated exactly like host pressure, so the
+       controller never raises vacuum aggression against saturated storage
+       and the walk-back branches engage. */
+    storage_pressure := p.high_wal_mbps > 0
+                        AND wal_rate_mbps IS NOT NULL
+                        AND wal_rate_mbps >= p.high_wal_mbps;
+
     host_pressure := host_memory_percent < p.low_memory_percent
-                     OR host_load_per_cpu > p.high_load_per_cpu;
+                     OR host_load_per_cpu > p.high_load_per_cpu
+                     OR storage_pressure;
 
     host_json := jsonb_build_object(
         'load1', host_load1,
@@ -601,6 +685,8 @@ BEGIN
         'mem_total_bytes', host_mem_total_bytes,
         'mem_available_percent', host_memory_percent,
         'memory_metrics_available', host_metrics_available,
+        'wal_rate_mbps', wal_rate_mbps,
+        'storage_pressure', storage_pressure,
         'pressure', host_pressure
     );
 
@@ -618,24 +704,6 @@ BEGIN
     SELECT b.blocker_age, b.blocker_kind, b.blocker_detail
     INTO horizon_age, horizon_kind, horizon_detail
     FROM adaptive_autovacuum.horizon_blocker() b;
-
-    /* XID consumption rate (transactions/second) from the 64-bit counter
-       delta since the previous cycle; NULL on the first cycle or when the
-       elapsed window is too small to be meaningful. */
-    cur_xid8 := pg_catalog.pg_current_xact_id()::text::bigint;
-    SELECT cs.last_xid8, cs.last_sample_at
-    INTO prev_xid8, prev_sample_at
-    FROM adaptive_autovacuum.controller_state cs;
-    xid_rate := NULL;
-    IF prev_xid8 IS NOT NULL
-       AND prev_sample_at IS NOT NULL
-       AND cur_xid8 > prev_xid8
-       AND clock_timestamp() > prev_sample_at + interval '1 second' THEN
-        xid_rate := (cur_xid8 - prev_xid8)::double precision /
-                    extract(epoch FROM clock_timestamp() - prev_sample_at);
-    END IF;
-    UPDATE adaptive_autovacuum.controller_state
-    SET last_xid8 = cur_xid8, last_sample_at = clock_timestamp();
 
     SELECT setting::integer INTO current_global_cost_limit
     FROM pg_settings WHERE name = 'autovacuum_vacuum_cost_limit';
@@ -721,7 +789,13 @@ BEGIN
         recommended_cost_limit := GREATEST(200, floor(current_global_cost_limit * 0.75)::integer);
         recommended_cost_delay := LEAST(p.recommendation_delay_max_ms,
                                         GREATEST(current_global_cost_delay, 2.0) * 1.5);
-        recommendation_reason := 'Host pressure is high; reduce vacuum I/O aggression.';
+        recommendation_reason := CASE
+            WHEN storage_pressure THEN format(
+                'WAL generation rate (%s MB/s) exceeds high_wal_mbps (%s); reduce vacuum I/O aggression.',
+                trim(trailing '.' from to_char(wal_rate_mbps, 'FM999999990.9999')),
+                trim(trailing '.' from to_char(p.high_wal_mbps, 'FM999999990.9999')))
+            ELSE 'Host pressure is high; reduce vacuum I/O aggression.'
+        END;
     ELSIF delay_bound_count > 0 THEN
         recommended_cost_limit := LEAST(p.recommendation_cost_limit_max,
                                         GREATEST(200, current_global_cost_limit * 2));
@@ -905,7 +979,12 @@ BEGIN
                    END AS total_bytes
         ) sz
         LEFT JOIN active_vacuum av ON av.relid = c.oid
-        LEFT JOIN adaptive_autovacuum.table_policy tp ON tp.relid = c.oid
+        /* Identity-checked: a row whose fingerprint no longer matches (OID
+           reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+        LEFT JOIN adaptive_autovacuum.table_policy tp
+               ON tp.relid = c.oid
+              AND tp.schema_name = n.nspname
+              AND tp.relation_name = c.relname
         WHERE c.relkind = 'r'
           AND c.relpersistence <> 't'
           AND NOT (n.nspname = ANY (p.excluded_schemas))
@@ -1610,7 +1689,12 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
         LEFT JOIN active_vacuum av ON av.relid = c.oid
-        LEFT JOIN adaptive_autovacuum.table_policy tp ON tp.relid = c.oid
+        /* Identity-checked: a row whose fingerprint no longer matches (OID
+           reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+        LEFT JOIN adaptive_autovacuum.table_policy tp
+               ON tp.relid = c.oid
+              AND tp.schema_name = n.nspname
+              AND tp.relation_name = c.relname
         WHERE c.relkind IN ('r', 'm')
           AND c.relpersistence <> 't'
           AND n.nspname <> 'pg_toast'
@@ -1973,16 +2057,20 @@ BEGIN
     END IF;
 
     /*
-     * vacuum_buffer_usage_limit (PG16+): the ring of shared_buffers pages a
-     * VACUUM or ANALYZE may occupy.  An idle ring costs nothing, so while
-     * autovacuum workers are actually running and the host has free memory
-     * it is raised (at most doubled per cycle) so long vacuums keep their
-     * heap and index pages cached across passes instead of re-reading them.
-     * Caps: the policy ceiling, and the server's own silent clamp of 1/8 of
-     * shared_buffers divided across the worker pool, so concurrent rings
-     * cannot occupy a disproportionate share of the buffer cache.  Under
-     * host pressure it is halved back toward the built-in default.  A
-     * setting of 0 ("no ring limit") is operator intent and never touched.
+     * vacuum_buffer_usage_limit (PG16+): the size of the Buffer Access
+     * Strategy ring VACUUM and ANALYZE use inside shared_buffers.  A larger
+     * ring CAN speed maintenance up, but every ring page displaces a regular
+     * shared-buffers page, and host free memory says nothing about
+     * shared-buffers cache pressure - so this heuristic is deliberately
+     * conservative and the caps do the real work: the policy ceiling, and
+     * 1/8 of shared_buffers divided across the worker pool, so concurrent
+     * rings can never occupy a disproportionate share of the buffer cache.
+     * Raised (at most doubled per cycle) only while autovacuum workers are
+     * actually running; halved back toward the built-in default under host
+     * pressure.  A setting of 0 ("no ring limit") is operator intent and
+     * never touched.  Note this is a separate signal from autovacuum_work_mem:
+     * repeated index passes indicate dead-tuple memory pressure and feed the
+     * work_mem heuristic above, not this one.
      */
     recommended_buffer_usage_limit_kb := current_buffer_usage_limit_kb;
     IF current_buffer_usage_limit_kb > 0 THEN
@@ -2061,8 +2149,18 @@ BEGIN
      * double one value within a single launcher sweep.
      * autovacuum_max_workers only ratchets up automatically; lowering it is
      * left to the DBA.
+     *
+     * Every database still recommends from its own tables only, so on
+     * clusters with several busy databases the applied result is scan-order
+     * dependent.  Setting adaptive_autovacuum.global_settings_database names
+     * ONE database whose worker owns the cluster settings: all others record
+     * recommendations but neither queue nor apply them (the C worker enforces
+     * the apply side too).
      */
-    IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global THEN
+    IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global
+       AND (COALESCE(current_setting('adaptive_autovacuum.global_settings_database', true), '') = ''
+            OR current_setting('adaptive_autovacuum.global_settings_database', true)
+               = pg_catalog.current_database()::text) THEN
         INSERT INTO adaptive_autovacuum.global_apply_queue(guc_name, desired_value, reason)
         SELECT cand.guc_name, cand.desired_value, recommendation_reason
         FROM (VALUES
@@ -2165,7 +2263,12 @@ BEGIN
                    pg_stat_get_live_tuples(c.oid)::bigint AS live_tuples
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN adaptive_autovacuum.table_policy tp ON tp.relid = c.oid
+            /* Identity-checked: a row whose fingerprint no longer matches (OID
+               reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+            LEFT JOIN adaptive_autovacuum.table_policy tp
+                   ON tp.relid = c.oid
+                  AND tp.schema_name = n.nspname
+                  AND tp.relation_name = c.relname
             WHERE c.relkind = 'r'
               AND c.relpersistence <> 't'
               AND NOT (n.nspname = ANY (p.excluded_schemas))
@@ -2206,6 +2309,13 @@ BEGIN
     DELETE FROM adaptive_autovacuum.relation_state state
     WHERE state.last_seen_at < clock_timestamp() - interval '7 days'
       AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = state.relid);
+
+    /* Operator intent must not outlive its relation: a dropped relation's
+       OID can be reused by an unrelated table later.  Identity-mismatched
+       rows (rename, or an OID already reused) are NOT deleted - they are
+       ignored by the scans above and wait for explicit re-adoption. */
+    DELETE FROM adaptive_autovacuum.table_policy tp
+    WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = tp.relid);
 
     DELETE FROM adaptive_autovacuum.decisions
     WHERE decided_at < clock_timestamp() - make_interval(days => p.history_retention_days);
@@ -2344,5 +2454,8 @@ GRANT SELECT ON adaptive_autovacuum.relation_status,
                 adaptive_autovacuum.active_vacuums,
                 adaptive_autovacuum.wraparound_status
 TO PUBLIC;
-GRANT EXECUTE ON FUNCTION adaptive_autovacuum.host_metrics() TO PUBLIC;
+/* host_metrics() reports host-level CPU/memory/load figures; on locked-down
+   multi-tenant systems that is not for every role, so it goes to the
+   monitoring role instead of PUBLIC. */
+GRANT EXECUTE ON FUNCTION adaptive_autovacuum.host_metrics() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.horizon_blocker() TO PUBLIC;

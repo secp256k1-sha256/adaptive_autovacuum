@@ -1,7 +1,7 @@
 /*
  * adaptive_autovacuum.c
  *
- * PostgreSQL 18+ adaptive autovacuum controller.
+ * PostgreSQL 17+ adaptive autovacuum controller (full feature set on 18).
  *
  * The C layer deliberately owns only process orchestration, host metric
  * collection, and the guarded manual VACUUM execution path.  The control
@@ -20,7 +20,9 @@
 #endif
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_database.h"
+#include "commands/dbcommands.h"
 #include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
 #include "executor/spi.h"
@@ -69,7 +71,9 @@ PG_FUNCTION_INFO_V1(adaptive_autovacuum_host_metrics);
 
 static bool aav_enabled = false;
 static char *aav_control_database = NULL;
+static char *aav_global_settings_database = NULL;
 static int aav_naptime_seconds = 60;
+static int aav_max_database_workers = 1;
 static int aav_database_worker_timeout_seconds = 3600;
 static int aav_emergency_timeout_seconds = 86400;
 static bool aav_log_cycle_summary = true;
@@ -143,7 +147,9 @@ static void aav_apply_cgroup_memory_limit(AAVHostMetrics *metrics);
 static double aav_windows_cpu_busy_fraction(void);
 #endif
 static List *aav_list_databases(void);
-static bool aav_run_database_worker(Oid dboid, const char *dbname);
+static void aav_run_database_workers(List *databases);
+static bool aav_start_database_worker(Oid dboid, const char *dbname,
+                                      BackgroundWorkerHandle **handle);
 static bool aav_extension_enabled_in_database(void);
 static void aav_execute_policy_cycle(const AAVHostMetrics *metrics);
 static void aav_apply_global_settings(void);
@@ -189,8 +195,28 @@ _PG_init(void)
                                NULL,
                                NULL);
 
+    /* Each database with manage_global_settings enabled recommends and
+       applies cluster-wide settings from its own tables only.  On clusters
+       with several busy databases that is scan-order dependent; naming one
+       designated database here makes exactly one worker own the globals
+       (both the queueing in the SQL policy and the ALTER SYSTEM apply).
+       Empty keeps the legacy behavior: every database may apply, throttled
+       by the shared per-GUC cooldown. */
+    DefineCustomStringVariable("adaptive_autovacuum.global_settings_database",
+                               "Only this database's worker manages cluster-wide settings.",
+                               "Empty means every database with manage_global_settings enabled may queue and apply them.",
+                               &aav_global_settings_database,
+                               "",
+                               PGC_SIGHUP,
+                               0,
+                               NULL,
+                               NULL,
+                               NULL);
+
+    /* The real revisit period of one database is the scan runtime of the
+       databases ahead of it plus this naptime, not the naptime alone. */
     DefineCustomIntVariable("adaptive_autovacuum.naptime_seconds",
-                            "Seconds between complete cluster scans.",
+                            "Seconds the launcher sleeps after finishing one scan of all databases.",
                             NULL,
                             &aav_naptime_seconds,
                             60,
@@ -198,6 +224,23 @@ _PG_init(void)
                             86400,
                             PGC_SIGHUP,
                             GUC_UNIT_S,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    /* One slow database (large policy scan, lock waits, slow ANALYZE) must
+       not delay the wraparound checks of every database scheduled after it;
+       raising this lets the launcher overlap database workers.  1 preserves
+       the strictly serial scan. */
+    DefineCustomIntVariable("adaptive_autovacuum.max_database_workers",
+                            "Database workers the launcher may run concurrently.",
+                            NULL,
+                            &aav_max_database_workers,
+                            1,
+                            1,
+                            16,
+                            PGC_SIGHUP,
+                            0,
                             NULL,
                             NULL,
                             NULL);
@@ -706,28 +749,26 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        if (aav_enabled)
+        /*
+         * Explicit standby guard (defense in depth): the launcher and its
+         * workers use BgWorkerStart_RecoveryFinished, so on a hot standby
+         * none of this ever starts until promotion.  Should this process
+         * nevertheless observe recovery, it stays strictly observational.
+         */
+        if (aav_enabled && RecoveryInProgress())
+        {
+            elog(LOG,
+                 "adaptive autovacuum launcher is idle: the server is in recovery");
+        }
+        else if (aav_enabled)
         {
             MemoryContext old_context;
             List *databases;
-            ListCell *lc;
 
             MemoryContextReset(cycle_context);
             old_context = MemoryContextSwitchTo(cycle_context);
             databases = aav_list_databases();
-
-            foreach(lc, databases)
-            {
-                AAVDatabaseEntry *entry = lfirst(lc);
-                Oid dboid = entry->dboid;
-                char *dbname = entry->dbname;
-
-                if (aav_got_sigterm)
-                    break;
-
-                (void) aav_run_database_worker(dboid, dbname);
-            }
-
+            aav_run_database_workers(databases);
             MemoryContextSwitchTo(old_context);
         }
 
@@ -811,13 +852,10 @@ aav_list_databases(void)
 }
 
 static bool
-aav_run_database_worker(Oid dboid, const char *dbname)
+aav_start_database_worker(Oid dboid, const char *dbname,
+                          BackgroundWorkerHandle **handle)
 {
     BackgroundWorker worker;
-    BackgroundWorkerHandle *handle;
-    BgwHandleStatus status;
-    pid_t pid;
-    TimestampTz started_at;
 
     MemSet(&worker, 0, sizeof(worker));
     snprintf(worker.bgw_name, BGW_MAXLEN,
@@ -834,7 +872,7 @@ aav_run_database_worker(Oid dboid, const char *dbname)
     worker.bgw_main_arg = ObjectIdGetDatum(dboid);
     worker.bgw_notify_pid = MyProcPid;
 
-    if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+    if (!RegisterDynamicBackgroundWorker(&worker, handle))
     {
         elog(WARNING,
              "adaptive autovacuum could not register worker for database \"%s\"; check max_worker_processes",
@@ -842,45 +880,68 @@ aav_run_database_worker(Oid dboid, const char *dbname)
         return false;
     }
 
-    status = WaitForBackgroundWorkerStartup(handle, &pid);
-    (void) pid;
-    if (status != BGWH_STARTED)
-    {
-        if (status == BGWH_POSTMASTER_DIED)
-            proc_exit(1);
+    return true;
+}
 
-        elog(WARNING,
-             "adaptive autovacuum worker for database \"%s\" did not start",
-             dbname);
-        return false;
-    }
+/* One occupied scheduling slot: a database worker in flight. */
+typedef struct AAVWorkerSlot
+{
+    BackgroundWorkerHandle *handle;
+    const char *dbname;
+    TimestampTz started_at;
+    bool in_use;
+} AAVWorkerSlot;
 
-    started_at = GetCurrentTimestamp();
+/*
+ * Run one database worker per listed database, at most max_database_workers
+ * concurrently.  The default of 1 is the historical strictly serial scan;
+ * higher values keep one slow database from delaying the wraparound checks
+ * of every database scheduled after it.  Each worker still gets its own
+ * database_worker_timeout_seconds budget.
+ */
+static void
+aav_run_database_workers(List *databases)
+{
+    int max_workers = Max(aav_max_database_workers, 1);
+    AAVWorkerSlot *slots = palloc0(sizeof(AAVWorkerSlot) * max_workers);
+    ListCell *next_db = list_head(databases);
+    int active = 0;
 
     for (;;)
     {
-        BgwHandleStatus pid_status;
-        pid_t current_pid;
-        long elapsed_ms;
+        int i;
         int rc;
 
-        pid_status = GetBackgroundWorkerPid(handle, &current_pid);
-        (void) current_pid;
-        if (pid_status == BGWH_STOPPED)
-            return true;
-        if (pid_status == BGWH_POSTMASTER_DIED)
-            proc_exit(1);
-
-        elapsed_ms = (long) ((GetCurrentTimestamp() - started_at) / 1000);
-        if (elapsed_ms >= (long) aav_database_worker_timeout_seconds * 1000L)
+        /* Fill free slots with the next databases in scan order. */
+        while (next_db != NULL && !aav_got_sigterm)
         {
-            elog(WARNING,
-                 "adaptive autovacuum database worker \"%s\" exceeded timeout; requesting termination",
-                 dbname);
-            TerminateBackgroundWorker(handle);
-            (void) WaitForBackgroundWorkerShutdown(handle);
-            return false;
+            AAVDatabaseEntry *entry = lfirst(next_db);
+            int free_slot = -1;
+
+            for (i = 0; i < max_workers; i++)
+            {
+                if (!slots[i].in_use)
+                {
+                    free_slot = i;
+                    break;
+                }
+            }
+            if (free_slot < 0)
+                break;
+
+            if (aav_start_database_worker(entry->dboid, entry->dbname,
+                                          &slots[free_slot].handle))
+            {
+                slots[free_slot].dbname = entry->dbname;
+                slots[free_slot].started_at = GetCurrentTimestamp();
+                slots[free_slot].in_use = true;
+                active++;
+            }
+            next_db = lnext(databases, next_db);
         }
+
+        if (active == 0 && (next_db == NULL || aav_got_sigterm))
+            break;
 
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
@@ -893,13 +954,44 @@ aav_run_database_worker(Oid dboid, const char *dbname)
 
         /* Keep ProcSignalBarriers (e.g. DROP DATABASE) moving. */
         CHECK_FOR_INTERRUPTS();
-        if (aav_got_sigterm)
+
+        for (i = 0; i < max_workers; i++)
         {
-            TerminateBackgroundWorker(handle);
-            (void) WaitForBackgroundWorkerShutdown(handle);
-            return false;
+            BgwHandleStatus status;
+            pid_t pid;
+            long elapsed_ms;
+
+            if (!slots[i].in_use)
+                continue;
+
+            status = GetBackgroundWorkerPid(slots[i].handle, &pid);
+            (void) pid;
+            if (status == BGWH_POSTMASTER_DIED)
+                proc_exit(1);
+            if (status == BGWH_STOPPED)
+            {
+                slots[i].in_use = false;
+                active--;
+                continue;
+            }
+
+            elapsed_ms = (long) ((GetCurrentTimestamp() - slots[i].started_at) / 1000);
+            if (aav_got_sigterm ||
+                elapsed_ms >= (long) aav_database_worker_timeout_seconds * 1000L)
+            {
+                if (!aav_got_sigterm)
+                    elog(WARNING,
+                         "adaptive autovacuum database worker \"%s\" exceeded timeout; requesting termination",
+                         slots[i].dbname);
+                TerminateBackgroundWorker(slots[i].handle);
+                (void) WaitForBackgroundWorkerShutdown(slots[i].handle);
+                slots[i].in_use = false;
+                active--;
+            }
         }
     }
+
+    pfree(slots);
 }
 
 /* ---------- per-database worker ---------- */
@@ -1153,6 +1245,24 @@ aav_apply_global_settings(void)
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
+
+    /* When a designated global-settings database is configured, only its
+       worker may run ALTER SYSTEM; the SQL policy in other databases also
+       stops queueing, so this guard mostly covers leftover queue rows. */
+    if (aav_global_settings_database != NULL &&
+        aav_global_settings_database[0] != '\0')
+    {
+        char *dbname = get_database_name(MyDatabaseId);
+
+        if (dbname == NULL ||
+            strcmp(dbname, aav_global_settings_database) != 0)
+        {
+            PopActiveSnapshot();
+            SPI_finish();
+            CommitTransactionCommand();
+            return;
+        }
+    }
 
     /* Tolerate an older extension SQL version without the queue table. */
     spi_rc = SPI_execute(

@@ -13,6 +13,25 @@ SELECT enabled = false AS disabled_by_default,
        analyze_missing_stats_per_cycle = 3 AS analyze_missing_stats_top3
 FROM adaptive_autovacuum.policy;
 
+SELECT recommendation_delay_min_ms = 0.5 AS delay_floor_default,
+       recommendation_buffer_usage_limit_max_mb = 256 AS buffer_ring_cap_default,
+       high_wal_mbps = 0 AS wal_guardrail_off_by_default
+FROM adaptive_autovacuum.policy;
+
+-- Absurd policy values (outside the documented bounds of the settings they
+-- feed) are rejected by CHECK constraints.  Terse verbosity: the DETAIL line
+-- would print the whole failing row, which contains timestamps.
+\set VERBOSITY terse
+UPDATE adaptive_autovacuum.policy SET recommendation_cost_limit_max = 50000;
+UPDATE adaptive_autovacuum.policy SET recommendation_delay_max_ms = 500;
+UPDATE adaptive_autovacuum.policy SET recommendation_delay_min_ms = 50;
+UPDATE adaptive_autovacuum.policy SET critical_cost_limit = 60000;
+UPDATE adaptive_autovacuum.policy SET elevated_cost_delay_ms = 1000;
+UPDATE adaptive_autovacuum.policy SET emergency_cost_delay_ms = 101;
+UPDATE adaptive_autovacuum.policy SET max_scale_factor = 500;
+UPDATE adaptive_autovacuum.policy SET recommendation_buffer_usage_limit_max_mb = 99999;
+\set VERBOSITY default
+
 SELECT jsonb_typeof(adaptive_autovacuum.host_metrics()) = 'object' AS host_metrics_object;
 SELECT adaptive_autovacuum.host_metrics() ?&
        ARRAY['load1', 'cpu_count', 'mem_total_bytes', 'mem_available_bytes']
@@ -144,6 +163,37 @@ WHERE relation_name = 'public.aav_test';
 
 SELECT count(*) = 1 AS recommendation_recorded
 FROM adaptive_autovacuum.global_recommendations;
+
+-- table_policy identity fingerprint: filled by trigger, refreshed when the
+-- operator touches the row, and rows for dropped relations are cleaned up.
+CREATE TABLE aav_policy_target(id integer);
+INSERT INTO adaptive_autovacuum.table_policy(relid) VALUES ('aav_policy_target'::regclass);
+
+SELECT schema_name = 'public' AND relation_name = 'aav_policy_target'
+       AS table_policy_identity_filled
+FROM adaptive_autovacuum.table_policy
+WHERE relid = 'aav_policy_target'::regclass;
+
+ALTER TABLE aav_policy_target RENAME TO aav_policy_renamed;
+
+UPDATE adaptive_autovacuum.table_policy
+SET enabled = enabled
+WHERE relid = 'aav_policy_renamed'::regclass;
+
+SELECT relation_name = 'aav_policy_renamed' AS table_policy_readopted
+FROM adaptive_autovacuum.table_policy
+WHERE relid = 'aav_policy_renamed'::regclass;
+
+DROP TABLE aav_policy_renamed;
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 0 AS table_policy_dropped_relation_cleaned
+FROM adaptive_autovacuum.table_policy;
 
 CREATE TABLE aav_no_stats(id integer, payload text);
 INSERT INTO aav_no_stats SELECT g, g::text FROM generate_series(1, 1000) g;

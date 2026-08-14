@@ -7,7 +7,7 @@
 ![Language](https://img.shields.io/badge/lang-C%20%2B%20PL%2FpgSQL-555)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
-> **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4 and 17.6), but has not yet completed sustained production-scale testing. 
+> **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4, 18.6, 17.6, and 17.11), including regression suites, a hot-standby drill, live emergency-vacuum drills, and ~20,000 TPS pgbench runs, but has not yet completed sustained production-scale testing.
 
 Out of the box, autovacuum uses conservative settings. On real systems that means familiar problems:
 
@@ -43,20 +43,22 @@ Out of the box, autovacuum uses conservative settings. On real systems that mean
 
 ### 1. Keeps the cluster-wide autovacuum settings right
 
-A background worker checks the whole cluster every minute (configurable). When the data says a global setting is wrong, it fixes settings through the normal `ALTER SYSTEM` + reload config mechanism, with the old value saved so you can always go back:
+A background worker checks every database in turn, then sleeps (`naptime_seconds`, default 60). The time between two checks of the same database is therefore the scan time of the whole cluster plus the naptime, not a fixed minute; on clusters where one database is slow to check, `max_database_workers` lets several databases be checked in parallel. When the data says a global setting is wrong, it fixes settings through the normal `ALTER SYSTEM` + reload config mechanism, with the old value saved so you can always go back:
 
 | Setting | Fixed when |
 |---|---|
 | `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) - full manual-vacuum aggression is never set automatically. Lowered if the server is overloaded |
 | `autovacuum_max_workers` | more tables are behind than there are workers, or every worker is busy while tables wait. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
-| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure) |
-| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This is the slice of shared buffers a vacuum or analyze may keep its pages in - bigger means long vacuums stop re-reading the same pages; an idle ring costs nothing. Doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself (no limit) is never touched |
+| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure). PostgreSQL docs: "Specifies the maximum amount of memory to be used by each autovacuum worker process" |
+| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. PostgreSQL docs: "Specifies the size of the Buffer Access Strategy used by the VACUUM and ANALYZE commands" - the ring of shared buffers those commands work through. A bigger ring can make maintenance faster, but every ring page displaces a normal cached page, so this stays deliberately conservative: doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself is never touched |
 | `autovacuum_vacuum_scale_factor` / `_threshold` | a quarter or more of your tables are behind at the same time. That means the baseline is wrong, not the tables. So the baseline gets corrected instead of patching tables one by one |
-| `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
+| `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. PostgreSQL docs: "Specifies the maximum number of updated or deleted tuples needed to trigger a VACUUM in any one table". Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
 | `autovacuum_vacuum_insert_scale_factor` / `_insert_threshold` | the same "baseline is wrong" logic, for insert-only workloads. On PostgreSQL 18 the insert trigger counts only the not-yet-frozen part of the table, exactly like the server itself |
 | `autovacuum_analyze_scale_factor` / `_analyze_threshold` | kept in proportion whenever the vacuum baseline is corrected, so planner statistics stay fresh too |
 
-Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Each setting is also changed at most once per two check cycles across the whole cluster, no matter how many databases ask for it, so several busy databases can never stack their raises of the same setting on top of each other. Prefer to stay in control? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
+Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Every setting not on that list is treated as operator-owned and is never touched; `autovacuum` on/off and `autovacuum_freeze_max_age` in particular are only ever flagged in the advice, never changed. Each managed setting is also changed at most once per two check cycles across the whole cluster, no matter how many databases ask for it, so several busy databases can never stack their raises of the same setting on top of each other.
+
+Each database judges the cluster from its own tables, so on a cluster with several busy databases the advice can differ. If that is your shape, set `adaptive_autovacuum.global_settings_database = 'yourdb'` in `postgresql.conf`: exactly one database then owns the cluster-wide settings, and every other database only records its advice. Prefer to stay in control entirely? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
 
 ### 2. Gives special tables temporary custom settings
 
@@ -179,8 +181,10 @@ You need the DLL once; build it on any machine with the same PostgreSQL major ve
 3. Open the **"x64 Native Tools Command Prompt for VS"**, go to the extension folder, and run:
 
 ```bat
-build_windows.bat "C:\Program Files\PostgreSQL\18"
+windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 ```
+
+The DLL is written to the extension folder root.
 
 4. Copy the files into your installation (Administrator prompt):
 
@@ -250,8 +254,10 @@ Server settings (`postgresql.conf`):
 | Setting | Default | Meaning |
 |---|---|---|
 | `adaptive_autovacuum.enabled` | `off` | master switch |
-| `adaptive_autovacuum.naptime_seconds` | `60` | how often it checks the cluster |
+| `adaptive_autovacuum.naptime_seconds` | `60` | sleep after one full pass over all databases (the revisit period of a database is the pass time plus this) |
 | `adaptive_autovacuum.control_database` | `postgres` | where the coordinator connects |
+| `adaptive_autovacuum.max_database_workers` | `1` | how many databases may be checked at the same time; raise it if one slow database delays the checks of the others |
+| `adaptive_autovacuum.global_settings_database` | empty | name one database as the sole owner of cluster-wide setting changes; empty lets every managed database apply them (throttled by the shared once-per-two-cycles rule) |
 | `adaptive_autovacuum.database_worker_timeout_seconds` | `3600` | give-up time for one database's check (emergency vacuums are exempt - they run in their own worker) |
 | `adaptive_autovacuum.emergency_timeout_seconds` | `86400` | give-up time for one emergency vacuum; `0` = unlimited |
 | `adaptive_autovacuum.log_cycle_summary` | `on` | one log line per database per cycle |
@@ -274,6 +280,7 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 | `healthy_cycles_before_restore` | `6` | healthy checks required before a table's original settings return |
 | `max_boosted_relations` / `boost_total_cost_limit_budget` | `2` / `10000` | how many tables may hold speed boosts, and the combined ceiling |
 | `high_load_per_cpu` / `low_memory_percent` | `1.5` / `15` | what counts as an overloaded server (no boosts beyond this) |
+| `high_wal_mbps` | `0` (off) | storage guardrail: when the cluster writes WAL faster than this many MB/s, the controller treats the server as overloaded (no aggression raises, walk-backs engage). CPU and RAM checks miss a saturated disk; set this below your storage's known sustained write rate |
 | `emergency_stall_multiplier` | `1.5` | how far past its own trigger the built-in vacuum may be before "never started" counts as failure |
 | `emergency_xid_age` / `emergency_mxid_age` | 1 billion | absolute cap on the failure line above |
 | `emergency_takeover_min_runtime_seconds` | `3600` | how long a grinding forced vacuum runs before it may be judged hopeless and taken over |
@@ -297,6 +304,8 @@ INSERT INTO adaptive_autovacuum.table_policy (relid, enabled, note)
 VALUES ('app.audit_archive'::regclass, false, 'managed manually')
 ON CONFLICT (relid) DO UPDATE SET enabled = false;
 ```
+
+**Renames and dropped tables.** A `table_policy` row remembers the schema and table name it was created for (filled in automatically). If the table is renamed, the row stops matching and is ignored until you confirm it still applies; touch the row to re-adopt it: `UPDATE adaptive_autovacuum.table_policy SET enabled = enabled WHERE relid = 'app.new_name'::regclass;`. Rows whose table was dropped are removed automatically. This protects you from PostgreSQL reusing an internal table ID: your old policy can never silently attach to an unrelated new table.
 
 **Take a table back.** If you change a setting the extension manages, it flags the conflict and stops touching that table. To hand it back (this only clears bookkeeping, it does not touch the table):
 
@@ -351,7 +360,18 @@ You don't have to wait for the emergency to know something is wrong: `SELECT * F
 make installcheck PG_CONFIG=/usr/pgsql-18/bin/pg_config
 ```
 
-CI builds and tests against PostgreSQL 18 on every push. `VALIDATION.md` records the hands-on validation: multi-round pgbench runs (15-36 K TPS mixed workloads against deliberately broken settings), insert-only tables detected within ~70 seconds, boosts ramping and respecting the cluster budget, an eight-setting cluster repair applied in one cycle, automatic restore after load stopped, and a live emergency-vacuum drill (transaction age 92,029 → 31).
+CI builds and runs the regression suite against PostgreSQL 17 and 18 on every push, each twice: once with the library loaded on demand and once preloaded.
+
+`VALIDATION.md` records the hands-on validation, most recently (2026-08-14, Windows 18.4, Linux 18.6 and 17.11, and a Rocky Linux 9 lab):
+
+- Regression suite green on 17 and 18, with and without preload.
+- Live emergency-vacuum drills: a table at transaction age 160,003 was queued, frozen by the dedicated worker, and came back at age 5.
+- Hot-standby drill: with the extension installed and enabled, a standby ran zero extension processes during recovery; after promotion the launcher started on its own.
+- Worker concurrency drill: with the default serial scan, one blocked database froze the checks of the database behind it; with `max_database_workers = 2` the second database kept its checks running during the block.
+- Storage guardrail under real load: a 120 s pgbench run at 19,984 TPS (0 failed) with `high_wal_mbps = 3` measured up to 273 MB/s of WAL and the controller stepped vacuum aggression DOWN (cost limit 7500 to 1000, delay 2 to 20 ms), then reversed after the load stopped. Zero errors in the server logs.
+- One designated database applied all cluster settings while a second database's queued change correctly stayed pending.
+
+Earlier rounds: multi-round pgbench runs (15-36 K TPS mixed workloads against deliberately broken settings), insert-only tables detected within ~70 seconds, boosts ramping and respecting the cluster budget, an eight-setting cluster repair applied in one cycle, and automatic restore after load stopped.
 
 ## Good to know
 
@@ -366,11 +386,12 @@ CI builds and tests against PostgreSQL 18 on every push. `VALIDATION.md` records
   | eager-freeze tuning on emergency vacuums | PG 18 feature | emergency VACUUM runs the same failsafe profile without it |
 
   Everything else (per-table triggers and cost boosts, insert-backlog policy, the other cluster-wide settings via `ALTER SYSTEM`, wraparound emergency protection, never-analyzed table detection) behaves identically on 17.
-- **Windows is supported** (validated against PostgreSQL 18.4 and 17.6). Container memory limits (cgroups) are Linux-only; on Windows the overload check uses CPU busy %; see the Windows install notes.
+- **Windows is supported** (validated against PostgreSQL 18.4 and 17.6; Linux validated against 18.6 and 17.11). Container memory limits (cgroups) are Linux-only; on Windows the overload check uses CPU busy %; see the Windows install notes.
 - Cluster changes go into `postgresql.auto.conf`. If Ansible/Patroni/etc. owns your autovacuum settings, either point that tooling elsewhere or run with `manage_global_settings = false`.
-- With many managed databases, each one may apply cluster changes; they converge on the same values, but audit rows land in whichever database acted.
-- The policy tables reference tables by internal ID, so after a dump/restore re-apply your policy settings.
-- Installation requires superuser; the workers run with superuser rights.
+- With many managed databases, each one may apply cluster changes (at most one change of the same setting per two cycles cluster-wide); audit rows land in whichever database acted. Set `adaptive_autovacuum.global_settings_database` to make one database the sole owner.
+- **Standby / replica servers:** the workers only start on a server that is open for writes. On a hot standby the extension does nothing at all; after a promotion the launcher starts on its own within seconds. Configuration is not replicated by the extension, so keep `postgresql.conf` settings in step across the pair yourself (or let your HA tooling do it).
+- The policy tables reference tables by internal ID, so after a dump/restore re-apply your policy settings. (Against ID reuse inside a running cluster, `table_policy` rows carry a name fingerprint and are ignored or cleaned up when it stops matching.)
+- Installation requires superuser; the workers run with superuser rights. Host metrics (`host_metrics()`) are readable by superusers and the `pg_monitor` role, not by every user.
 - Plain tables only (materialized views are not watched).
 - It is a **reference implementation**: validated in lab conditions (see `VALIDATION.md`), not yet hardened by production mileage.
 

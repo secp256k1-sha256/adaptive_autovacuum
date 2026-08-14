@@ -6,24 +6,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  postgres-18:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        pgversion: [17, 18]
     runs-on: ubuntu-latest
-    container: postgres:18
+    container: postgres:${{ matrix.pgversion }}
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools and server headers
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-18
+          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-${{ matrix.pgversion }}
       - name: Build and install
         run: |
-          make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
-          make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config
+          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config
       - name: Regression tests
         shell: bash
         run: |
           set -euo pipefail
-          export PATH=/usr/lib/postgresql/18/bin:$PATH
+          export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
           chown -R postgres:postgres "$GITHUB_WORKSPACE"
           rm -rf /tmp/aav-pgdata
           su postgres -c "initdb -D /tmp/aav-pgdata --no-locale --encoding=UTF8"
@@ -34,10 +38,10 @@ jobs:
           # shared_preload_libraries).  Catches GUC-context and _PG_init
           # mistakes that only surface without preload.
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start"
-          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config"
+          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
 
           # Pass 2: the real deployment shape - library preloaded, launcher
           # worker registered (extension disabled, so it stays idle).
           echo "shared_preload_libraries = 'adaptive_autovacuum'" >> /tmp/aav-pgdata/postgresql.auto.conf
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -w restart"
-          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config"
+          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"

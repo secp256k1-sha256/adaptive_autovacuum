@@ -2,15 +2,16 @@
 
 ## Completed in this package
 
-- Source is guarded for PostgreSQL 18 and later with `PG_VERSION_NUM`.
-- The C API use was checked against PostgreSQL 18 declarations for background workers, shared-memory hooks, `VacuumParams`, `makeVacuumRelation()`, and `vacuum()`.
+- Source is guarded for PostgreSQL 17 and later with `PG_VERSION_NUM` (full feature set on 18).
+- The C API use was checked against PostgreSQL 17 and 18 declarations for background workers, shared-memory hooks, `VacuumParams`, `makeVacuumRelation()`, and `vacuum()`.
 - SQL policy and C orchestration were reviewed for transaction boundaries, reversible reloption ownership, admission limits, stale request recovery, and emergency-worker cleanup.
 - The architecture DOCX was rendered to 14 page images and every page was visually inspected for clipping, overlap, table breakage, and missing text.
-- GitHub Actions is included to compile, install, initialize PostgreSQL 18, and run `make installcheck` in the official `postgres:18` container.
+- GitHub Actions runs a `postgres:[17, 18]` container matrix: compile, install, initdb, and `make installcheck` twice per major (once loaded on demand, once preloaded).
 
-## Not completed in the current execution environment
+## CI status, stated plainly
 
-The local container has PostgreSQL 17 `pg_config` but no PostgreSQL 18 server headers or server binaries. Therefore the extension was not compiled, linked, loaded, or executed locally against PostgreSQL 18. The source should be treated as a reference implementation until the included PostgreSQL 18 CI job passes and production-like concurrency testing is completed.
+- The PostgreSQL 18 job has run and passed on GitHub Actions (first run failed and was fixed; see the 2026-08-10 CI entry below).
+- The PostgreSQL 17 leg and the matrix form were added on 2026-08-14 and have NOT yet run on GitHub Actions. The identical command sequence (build, install, two-pass installcheck) has passed locally against PGDG 17.11 on AlmaLinux 9; treat the hosted PG17 run as pending until the first green matrix run is recorded here.
 
 ## Validation performed 2026-08-08 (post-review fixes)
 
@@ -414,7 +415,7 @@ Guards against absurd tuning values, validated on the Windows workstation
 (EDB PG 18.4 live service on 5432 + scratch initdb PG 17.6 on 5433):
 
 - **Policy CHECK upper bounds:** every knob that feeds a bounded server
-  setting is now capped at that setting's documented maximum — cost limits
+  setting is now capped at that setting's documented maximum - cost limits
   <= 10000, cost delays <= 100 ms, scale factors <= 100, work_mem MB values
   <= 2097151 (the kilobyte-conversion overflow line).  Cross-column CHECKs
   the regression suite exercises carry explicit constraint names.  Seven
@@ -429,7 +430,7 @@ Guards against absurd tuning values, validated on the Windows workstation
   on the preloaded 18.4 worker: queued out-of-range `cost_limit=50000`
   (failed: "outside the valid range ... (-1 .. 10000)"), valid
   `cost_delay=3` (applied, old value audited), non-whitelisted
-  `autovacuum_naptime` (failed: whitelist) — all in one cycle, worker alive.
+  `autovacuum_naptime` (failed: whitelist) - all in one cycle, worker alive.
   Previously one bad row aborted the whole apply transaction and was retried
   every cycle until the one-hour queue expiry.
 - **Cost-delay floor:** new `recommendation_delay_min_ms` (default 0.5,
@@ -471,9 +472,9 @@ initdb PG 17.6):
   pressure.
 - **Live E2E (18.4):** staged a grinding autovacuum (400K-row table,
   per-table cost_limit=50/delay=20), ran a cycle with 8 GB free metrics:
-  queue got `vacuum_buffer_usage_limit` 2048 -> 4096 kB — exactly the
+  queue got `vacuum_buffer_usage_limit` 2048 -> 4096 kB - exactly the
   predicted first doubling under the derived cap
-  LEAST(256 MB, 1 GB shared_buffers / 8 / 3 workers) = 43690 kB — and the C
+  LEAST(256 MB, 1 GB shared_buffers / 8 / 3 workers) = 43690 kB - and the C
   worker applied it through the extended whitelist (old value audited,
   `SHOW` = 4MB).  `autovacuum_work_mem` correctly queued NOTHING: the
   effective value (1 GB via maintenance_work_mem) already exceeded the
@@ -485,6 +486,66 @@ initdb PG 17.6):
 - Not yet exercised: a raise chain past the first doubling on a live busy
   cluster, and the host-pressure walk-back of the ring (code path mirrors
   the proven cost walk-back).
+
+## Validation performed 2026-08-14 (review round 2: orchestration, standby, identity, storage guardrail)
+
+Changes from the second external review, with minimal-change scope:
+
+- **Designated global-settings database** (`adaptive_autovacuum.global_settings_database`,
+  empty = legacy all-databases behavior): the SQL policy skips queueing and
+  the C worker skips applying outside the designated database.
+- **Bounded launcher concurrency** (`adaptive_autovacuum.max_database_workers`,
+  default 1 = the historical serial scan): slot scheduler in the launcher so
+  one slow database cannot starve the checks of the databases behind it.
+- **Explicit standby guard**: `RecoveryInProgress()` check in the launcher
+  loop (defense in depth on top of `BgWorkerStart_RecoveryFinished`).
+- **table_policy identity fingerprint** (schema/name columns filled by
+  trigger): mismatched rows are ignored until re-adopted; rows for dropped
+  relations are removed each cycle (OID-reuse protection).
+- **WAL-rate storage guardrail** (`policy.high_wal_mbps`, 0 = off):
+  `pg_stat_wal.wal_bytes` delta sampled per cycle into `controller_state`;
+  above the threshold the cycle runs as host pressure.
+- `host_metrics()` EXECUTE moved from PUBLIC to `pg_monitor`; CI converted to
+  a `postgres:[17, 18]` matrix; checked-in Windows build artifacts removed
+  and `.gitignore` added; buffer-ring wording corrected; naptime semantics
+  documented precisely.
+
+Validated the same day on three environments:
+
+- **Windows 11, EDB PG 18.4 (live service)**: MSVC builds clean against 18.4
+  and 17.6 headers. Identity drill (fill -> rename ignored -> re-adopt ->
+  dropped-relation cleanup). Guardrail + designation drill: storage_pressure
+  fired from a real WAL-rate sample, designated DB queued 2 rows, the
+  non-designated DB queued 0, its manual decoy row stayed pending while the
+  designated DB applied with old-value audit. Concurrency drill with a 35 s
+  ACCESS EXCLUSIVE lock on one database's policy table: serial mode stalled
+  the second database for the whole lock (log-verified); with
+  max_database_workers=2 the second database completed mid-lock (22:41:59)
+  while the locked one finished only at lock release (22:42:25).
+- **WSL AlmaLinux 9**: `make installcheck` green twice (no-preload +
+  preloaded) on PGDG 18.6 AND 17.11, including the new regression assertions
+  (identity fill/re-adopt/cleanup, high_wal_mbps default). Hot-standby drill
+  on 18.6 (pg_basebackup + standby.signal): with the library preloaded and
+  the GUC on, ZERO adaptive backends during recovery; after promotion the
+  launcher appeared in pg_stat_activity; no errors.
+- **QA lab (Rocky 9.6, PGDG PG 18.6 scratch cluster on port 55432; el9 .so
+  built on WSL)**: pg_regress green; all drills reproduced (identity,
+  guardrail 0.075 MB/s sample + designation 4-vs-0 queue rows, serial stall
+  4->4 vs concurrent advance 6->7 under lock, decoy stayed pending,
+  pg_monitor grant enforced); emergency lifecycle regression-checked
+  end-to-end through the new scheduler (age 160,003 -> queued -> dedicated
+  worker completed -> age 5). 120 s pgbench soak at 19,984 TPS (0 failed,
+  0.4 ms latency) with high_wal_mbps=3: the guardrail measured up to
+  273 MB/s, flagged 12 pressured cycles, and the controller walked
+  aggression DOWN in cooldown-spaced steps (cost_limit 7500 -> 1000 in 0.75x
+  steps, delay 2 -> 20 ms in 1.5x steps capped at the policy max, buffer
+  ring walked back), then reversed direction after the load stopped;
+  0 relation errors; collector-log scan showed only intentional regression
+  errors and administrator-command shutdowns. Product PG 17.10 instance
+  verified untouched.
+
+Not yet exercised: the hosted GitHub Actions matrix run (see CI status at the
+top), and max_database_workers > 2.
 
 ## Required release gate
 

@@ -1,7 +1,7 @@
 # Adaptive Autovacuum Architecture Guide
 
-**Target:** PostgreSQL 18 and later
-**Extension version:** 1.0.0 reference implementation (revised 2026-08-10; supersedes the original recommendation-only design)
+**Target:** PostgreSQL 17 and later (full feature set on 18)
+**Extension version:** 1.0.0 reference implementation (revised 2026-08-14; supersedes the original recommendation-only design)
 **Safety posture:** disabled by default, dry-run by default, per-table cost boosts and emergency execution disabled by default; cluster-setting management enabled by default but inert until dry-run is lifted
 
 ## 1. Purpose
@@ -63,15 +63,21 @@ PostgreSQL postmaster
         +-- short-lived database worker for database C
 ```
 
-The launcher is registered from `_PG_init()` while the library is loaded through `shared_preload_libraries`. It connects to the configured control database, reads the shared `pg_database` catalog, and starts dynamic database workers sequentially.
+The launcher is registered from `_PG_init()` while the library is loaded through `shared_preload_libraries`. It connects to the configured control database, reads the shared `pg_database` catalog, and starts dynamic database workers - by default one at a time, or up to `adaptive_autovacuum.max_database_workers` concurrently. One full pass over all databases is followed by the `naptime_seconds` sleep, so the revisit period of a database is the pass runtime plus the naptime, not the naptime alone.
 
 A background worker belongs to the cluster, but an internal backend connection is initialized for one database. The launcher therefore cannot use one SPI connection to inspect every database-local `pg_class`, statistics view, policy table, and relation. The launcher-plus-database-workers topology mirrors the database-routing principle used by core autovacuum.
 
 Both worker wait loops call `CHECK_FOR_INTERRUPTS()` after every latch wake-up. This is load-bearing: `DROP DATABASE` (and other operations built on process-signal barriers) waits on **every** process in the cluster, and a background worker that never absorbs those barriers blocks such commands indefinitely. This was found and fixed through live testing.
 
-### Why workers are sequential in this implementation
+### Worker scheduling
 
-Sequential workers keep controller concurrency low and make behavior easy to reason about. In addition, the extension reserves one small shared-memory emergency slot containing the owning worker PID and database OID. A worker must acquire this slot before claiming a queue item, and an exit callback releases it. A later worker can reap a slot whose PID is no longer present in the process array. This preserves the one-emergency-vacuum cluster limit across launcher restarts and abnormal worker exits. The trade-off remains scan latency: a long emergency vacuum delays policy evaluation in later databases.
+The default is one database worker at a time: lowest controller concurrency, easiest behavior to reason about. The trade-off is scan latency - one slow database (a large policy scan, lock waits, a slow ANALYZE) delays the checks, including the wraparound checks, of every database after it. `adaptive_autovacuum.max_database_workers` bounds a slot scheduler in the launcher: up to that many database workers run concurrently, each still under its own `database_worker_timeout_seconds`. Long-running emergency vacuums never occupy a scheduling slot; they run in the dedicated emergency worker (4.2b).
+
+The extension also reserves one small shared-memory emergency slot containing the owning worker PID and database OID. The emergency worker must acquire this slot before claiming a queue item, and an exit callback releases it. A later worker can reap a slot whose PID is no longer present in the process array. This preserves the one-emergency-vacuum cluster limit across launcher restarts and abnormal worker exits.
+
+### Standby behavior
+
+All workers are registered with `BgWorkerStart_RecoveryFinished`: on a hot standby nothing starts, so the extension performs no writes, no `ALTER SYSTEM`, and no vacuums there. After a promotion the postmaster starts the launcher automatically and normal operation begins within one naptime. As defense in depth the launcher also checks `RecoveryInProgress()` each cycle and stays idle (with a log line) if it ever observes recovery. Extension configuration is not synchronized across an HA pair; keep `postgresql.conf` settings aligned yourself or through your HA tooling.
 
 ## 4. Components
 
@@ -82,8 +88,9 @@ Responsibilities:
 - Define extension GUCs.
 - Register the static launcher.
 - Enumerate connectable, non-template databases.
-- Start and supervise one dynamic worker at a time.
+- Start and supervise up to `max_database_workers` dynamic workers (default 1).
 - Terminate a database worker after the configured timeout.
+- Stay idle while the server is in recovery.
 - Reload SIGHUP settings; absorb process-signal barriers.
 
 It does not evaluate table policy.
@@ -96,7 +103,7 @@ Responsibilities:
 - Verify that the extension exists and the database policy is enabled.
 - Read host and cgroup memory information.
 - Invoke the SQL policy evaluator in one transaction.
-- **Apply queued cluster-setting changes**: claim pending rows from `global_apply_queue` (`FOR UPDATE SKIP LOCKED`), validate each GUC name against a fixed C-side allowlist and each value as a plain numeric literal, capture the current value, call the exported `AlterSystemSetConfigFile()` entry point, mark the row applied with its old value, and signal the postmaster to reload. `ALTER SYSTEM` cannot be executed through SPI (utility statements from functions are rejected), which is why the C worker calls the internal entry point directly.
+- **Apply queued cluster-setting changes**: claim pending rows from `global_apply_queue` (`FOR UPDATE SKIP LOCKED`), validate each GUC name against a fixed C-side allowlist and each value as a plain numeric literal, capture the current value, call the exported `AlterSystemSetConfigFile()` entry point, mark the row applied with its old value, and signal the postmaster to reload. `ALTER SYSTEM` cannot be executed through SPI (utility statements from functions are rejected), which is why the C worker calls the internal entry point directly. When `adaptive_autovacuum.global_settings_database` names a database, only that database's worker runs this step (and only that database's policy enqueues), so exactly one database owns the cluster settings.
 - When pending emergency requests exist, **register the dedicated emergency worker** (fire-and-forget) and exit. The database worker itself never runs the vacuum: doing so put the vacuum under the launcher's `database_worker_timeout_seconds`, so any freeze pass longer than that was killed and retried forever, and it stalled the launcher's scan of the remaining databases.
 
 ### 4.2b C emergency worker
@@ -113,7 +120,7 @@ A separate dynamic worker started on demand by a database worker:
 The policy layer contains the tunable logic and durable state:
 
 - `policy`: one database-wide policy row.
-- `table_policy`: optional per-relation overrides or exclusion.
+- `table_policy`: optional per-relation overrides or exclusion. Rows carry a schema/name fingerprint (filled by trigger) so a recycled relation OID can never silently inherit old operator intent: a mismatched row is ignored until the operator re-adopts it by touching the row, and rows whose relation was dropped are removed each cycle.
 - `relation_state`: hysteresis, ownership, original reloptions, and recent metrics (dead and insert backlog).
 - `decisions`: an append-only explanation log within the retention window; every row carries the host metrics the decision was made under.
 - `global_recommendations`: computed cluster-level values with a human-readable reason (always recorded, regardless of whether they are applied).
@@ -132,7 +139,7 @@ An automatic write requires all applicable gates:
 3. The extension exists in the target database.
 4. `adaptive_autovacuum.policy.enabled` is true in that database.
 5. `dry_run` is false.
-6. **For cluster settings:** `manage_global_settings` is true; the GUC is on the C-side allowlist; the value passes numeric validation; no pending change for it already exists; the new value actually differs numerically from the current one. Different settings move together in one cycle on purpose: raising `autovacuum_max_workers` alone splits the same `cost_limit` across more workers, so the cost side must be able to follow immediately. The same setting, however, is applied at most once per two naptimes across all databases (a shared-memory timestamp per GUC). Every database recommends from its own tables only; without that brake, several busy databases could each double one value within a single launcher sweep.
+6. **For cluster settings:** `manage_global_settings` is true; when `adaptive_autovacuum.global_settings_database` is set, the current database is the designated one (checked both at queue time in SQL and at apply time in C); the GUC is on the C-side allowlist; the value passes numeric validation; no pending change for it already exists; the new value actually differs numerically from the current one. Different settings move together in one cycle on purpose: raising `autovacuum_max_workers` alone splits the same `cost_limit` across more workers, so the cost side must be able to follow immediately. The same setting, however, is applied at most once per two naptimes across all databases (a shared-memory timestamp per GUC). Every database recommends from its own tables only; without that brake, several busy databases could each double one value within a single launcher sweep.
 7. **For table changes:** the table is not excluded; the observed condition has persisted for the hysteresis window; the relation is outside its change cooldown; no vacuum is currently reported for that relation; the controller still owns every previously managed reloption; the per-cycle DDL limit has not been consumed.
 8. For table cost changes, `manage_table_costs` is true, the admission limit permits the relation, and the cluster-wide boost budget has headroom.
 9. For emergency vacuum, `emergency_vacuum_enabled` is true and no active or recently failed equivalent request exists; additionally the cleanup horizon must not itself be past the failure line - an old snapshot, prepared transaction, or replication slot pinning the horizon makes freezing futile, so the controller records a `horizon_blocked` decision naming the blocker (see `adaptive_autovacuum.horizon_blocker()`) instead of queueing or taking over - and the relation must not have failed 8 emergency attempts within 24 hours.
@@ -166,7 +173,11 @@ The C worker gathers the one-minute load average, online CPU count, and total/av
 
 On Windows there is no load average. The worker samples the system-wide CPU busy fraction over a 200 ms window (`GetSystemTimes()`) and reports `busy_fraction × cpu_count` as `load1`; memory comes from `GlobalMemoryStatusEx()`. The semantic difference matters for the pressure gate: a Unix load average includes processes waiting to run and can exceed the CPU count, while CPU utilization saturates at 1.0 per CPU - so the default `high_load_per_cpu = 1.5` is unreachable on Windows and deployments there should size it below 1.0 (for example 0.85) if CPU-based pressure gating is desired. Memory-based pressure works identically on both platforms.
 
-Limitations: CPU count is not constrained by cgroup CPU quota; load average / CPU busy is not an application-latency signal; disk latency, queue depth, and PSI are not read. Host pressure therefore blocks or reduces aggressive actions, but absence of reported pressure is not proof that more I/O is safe.
+### Storage signal
+
+CPU and RAM miss the resource autovacuum most often saturates: storage. As a database-native proxy, each cycle samples `pg_stat_wal.wal_bytes` into `controller_state` (alongside the 64-bit transaction counter); the delta gives the cluster WAL generation rate in MB/s. When the opt-in `policy.high_wal_mbps` threshold (0 = disabled) is exceeded, the cycle runs under host pressure: aggression raises are blocked and the walk-back branches engage. The measured rate and the resulting `storage_pressure` flag are recorded in every decision's host-metrics JSON. The threshold is deliberately operator-set - a sane value depends on the storage device - and WAL rate is a write-side proxy, not a full I/O model. Validated under a ~20K TPS pgbench load: the guardrail measured up to 273 MB/s and stepped the cost settings down, then reversed after the load stopped (VALIDATION.md, 2026-08-14).
+
+Limitations: CPU count is not constrained by cgroup CPU quota; load average / CPU busy is not an application-latency signal; OS-level disk latency, queue depth, and PSI are not read (the WAL-rate guardrail above is the database-native stand-in). Host pressure therefore blocks or reduces aggressive actions, but absence of reported pressure is not proof that more I/O is safe.
 
 ## 7. Trigger policy
 
@@ -227,7 +238,7 @@ The controller increments `consecutive_overdue` while a relation is non-normal a
 
 The shared autovacuum cost budget (`autovacuum_vacuum_cost_limit`/`_cost_delay`) is corrected automatically: raised step-wise (at most doubled per change window, capped by `recommendation_cost_limit_max`) when long vacuums are delay-bound or relations are overdue without host pressure, and *reduced* under host pressure. The delay walk-down halves per window but stops at `recommendation_delay_min_ms` (default 0.5 ms): delay 0 equals unthrottled manual-vacuum aggression and is never reached automatically, while an operator-chosen delay already below the floor is respected and never raised.
 
-Two memory-side settings are sized opportunistically while maintenance is actually running and the host has free memory - an idle cluster is never retuned. `vacuum_buffer_usage_limit` (PG16+, the shared_buffers ring a VACUUM/ANALYZE may occupy; an idle ring costs nothing) is at most doubled per cycle up to `recommendation_buffer_usage_limit_max_mb`, additionally bounded by the server's own silent 1/8-of-shared_buffers clamp divided across the worker pool so concurrent rings cannot crowd out the workload's cache; it is halved back toward the built-in default under host pressure, and an operator value of 0 ("no limit") is never touched. `autovacuum_work_mem` keeps its evidence-based raise (repeated index passes = the vacuum ran out of dead-tuple memory) and additionally ratchets toward the free-memory-derived value while workers are running; it is never lowered without host pressure. Because the shared budget is split across workers, raising `autovacuum_max_workers` does not increase total un-boosted vacuum I/O - it adds parallelism. The worker count is therefore raised (never lowered) when overdue relations outnumber workers or all worker slots are busy while relations wait, independent of the host-pressure gate, bounded by `autovacuum_worker_slots`, a quarter of host CPUs, and `recommendation_workers_max`.
+Two memory-side settings are sized opportunistically while maintenance is actually running and the host has free memory - an idle cluster is never retuned. `vacuum_buffer_usage_limit` (PG16+) is, per the PostgreSQL documentation, "the size of the Buffer Access Strategy used by the VACUUM and ANALYZE commands" - the ring those commands work through inside shared_buffers. A larger ring can speed maintenance up, but ring pages displace regular cached pages, and host free memory says nothing about shared-buffers cache pressure. The heuristic is therefore deliberately conservative and the caps do the real work: at most doubled per cycle up to `recommendation_buffer_usage_limit_max_mb`, additionally bounded by the server's own silent 1/8-of-shared_buffers clamp divided across the worker pool so concurrent rings cannot crowd out the workload's cache; it is halved back toward the built-in default under host pressure, and an operator value of 0 ("no limit") is never touched. It is a separate signal from `autovacuum_work_mem`: repeated index passes indicate dead-tuple memory pressure and feed the work_mem heuristic, not the ring size. `autovacuum_work_mem` keeps its evidence-based raise (repeated index passes = the vacuum ran out of dead-tuple memory) and additionally ratchets toward the free-memory-derived value while workers are running; it is never lowered without host pressure. Because the shared budget is split across workers, raising `autovacuum_max_workers` does not increase total un-boosted vacuum I/O - it adds parallelism. The worker count is therefore raised (never lowered) when overdue relations outnumber workers or all worker slots are busy while relations wait, independent of the host-pressure gate, bounded by `autovacuum_worker_slots`, a quarter of host CPUs, and `recommendation_workers_max`.
 
 ### Table level
 
@@ -253,7 +264,7 @@ The original design recorded cluster values as recommendations only. Field exper
 - **Application mechanics**: `ALTER SYSTEM` cannot run through SPI, so the C worker builds the statement nodes and calls the exported `AlterSystemSetConfigFile()`, then signals the postmaster (`SIGHUP`). Every managed GUC is reloadable in PostgreSQL 18, so changes take effect within seconds without restarts.
 - **Failure containment**: an invalid row is marked `failed` with a reason; rows that stay pending for an hour expire; the queue is retention-pruned.
 
-In clusters with many managed databases, each database's worker evaluates and may apply cluster changes. Values converge (all workers compute from the same cluster-wide inputs and current settings, and application is idempotent), but audit rows land in the database whose worker acted. A single-coordinator variant remains future work.
+In clusters with many managed databases, each database's worker evaluates cluster settings from its own tables, so the applied result can be scan-order dependent. Two rails bound this: the shared per-GUC once-per-two-naptimes cooldown (always on), and `adaptive_autovacuum.global_settings_database`, which names one database as the sole owner of queueing and applying cluster changes - the recommended configuration for multi-database clusters. Audit rows land in the database whose worker acted. Full cross-database aggregation (the launcher merging per-database summaries into one cluster recommendation) remains future work.
 
 Recommendations are still always recorded in `global_recommendations` - including when they are also applied - because the reason text is the operator-facing explanation.
 
@@ -334,7 +345,7 @@ A crash after claim but before completion can leave a queue row in `running`. At
 
 - Installation requires superuser because it installs C code and a background worker.
 - Internal policy functions are `SECURITY DEFINER` with a fixed search path.
-- Public privileges are revoked from all internal tables and functions; public read access is granted only to the status views and `host_metrics()`.
+- Public privileges are revoked from all internal tables and functions; public read access is granted only to the status views and `horizon_blocker()`. `host_metrics()` exposes host-level resource figures and is granted to `pg_monitor` rather than PUBLIC.
 - Dynamic SQL receives a relation name built from catalog identifiers; managed keys and values are allowlisted and validated - for table reloptions in SQL, and for cluster GUCs independently in both SQL and C.
 - Database workers connect as the bootstrap superuser. This is powerful and is a principal reason for conservative defaults, the narrow actuator surface, and the double-validated allowlists.
 
@@ -362,13 +373,13 @@ Production deployments may replace public view access with a monitoring role and
 
 The SQL layer targets PostgreSQL 18 columns and semantics (`autovacuum_vacuum_max_threshold`, `pg_stat_progress_vacuum.delay_time`, `autovacuum_worker_slots`, reloadable `autovacuum_max_workers`). The C layer uses server headers and exported backend functions; PostgreSQL does not promise a stable C ABI across major releases. The most sensitive boundaries are the `VacuumParams` structure and `vacuum()` invocation (emergency path) and `AlterSystemSetConfigFile()` (cluster application).
 
-Required release process for every major version: build against that major's headers; compare the declarations above; run regression tests; run an assertion-enabled server; test SIGTERM during policy DDL and during emergency vacuum; test upgrade/uninstall; run sustained workload tests; publish per-major binaries. The compile-time guard rejecting versions below 18 is not proof that an untested future major is compatible.
+Required release process for every major version: build against that major's headers; compare the declarations above; run regression tests; run an assertion-enabled server; test SIGTERM during policy DDL and during emergency vacuum; test upgrade/uninstall; run sustained workload tests; publish per-major binaries. The compile-time guard rejecting versions below 17 is not proof that an untested future major is compatible. CI exercises the regression suite on PostgreSQL 17 and 18, each with and without `shared_preload_libraries`.
 
 ### Platform compatibility
 
 The SQL layer is operating-system independent. The C layer isolates its platform-specific code to host-metric collection (`#ifdef WIN32` / `#ifdef __linux__` branches); everything else - background workers, signal delivery (`kill(PostmasterPid, SIGHUP)`), `AlterSystemSetConfigFile()`, `vacuum()` - goes through PostgreSQL's own portability layer and works unchanged on Windows.
 
-On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-built servers (such as the EDB distribution); the provided `build_windows.bat` compiles the DLL with Visual Studio Build Tools directly against the installation's shipped server headers (`include\server\port\win32_msvc`, `win32`, `server`) and links `lib\postgres.lib`. Both artifacts come from the same source file; no platform forks exist.
+On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-built servers (such as the EDB distribution); the provided `windows/build_windows.bat` compiles the DLL with Visual Studio Build Tools directly against the installation's shipped server headers (`include\server\port\win32_msvc`, `win32`, `server`) and links `lib\postgres.lib`. Both artifacts come from the same source file; no platform forks exist. Windows-only tooling lives in the `windows/` folder; the Unix Makefile and the shared `src/` are unaffected.
 
 ## 18. Deployment runbook
 
@@ -398,15 +409,12 @@ On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-b
 
 ## 20. Future work
 
-- Single-coordinator application of cluster settings (today each managed database may apply; values converge but audit is distributed).
-- Shared-memory cluster budget for bounded parallel database workers.
-- Delta sampling from `pg_stat_io` and Linux PSI/disk telemetry; cgroup CPU quota detection.
+- Cross-database aggregation of cluster settings: the launcher merging per-database summaries into one cluster recommendation (today: designated-database ownership via `global_settings_database`, or per-database apply under the shared cooldown).
+- Delta sampling from `pg_stat_io` (read/write timing, evictions) to refine the WAL-rate storage guardrail; Linux PSI/disk telemetry; cgroup CPU quota detection.
 - Application-latency and connection-pressure guardrails.
 - TOAST-specific reloption policy (TOAST age is already assessed).
-- Explicit cleanup-horizon blocker diagnostics with advisory-only remediation suggestions.
 - Prometheus-compatible status functions.
-- Maximum attempt count / exponential backoff for emergency requests.
-- Dump/restore-safe policy storage (today's tables are OID-keyed).
+- Dump/restore-safe policy storage (tables are OID-keyed; the name fingerprint protects against in-cluster OID reuse but does not survive a dump/restore).
 - Property and concurrency tests for ownership reconciliation.
 
 ## 21. Important decision summary
@@ -415,7 +423,9 @@ On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-b
 |---|---|---|
 | Background-worker extension | Tight integration, no external scheduler | Superuser C code and per-major rebuilds |
 | Launcher plus database workers | Database-local catalogs require database-local connections | More process orchestration |
-| Sequential workers plus shared emergency slot | Low controller concurrency; restart-safe one-vacuum admission | Long vacuum delays later databases |
+| Serial-by-default workers, bounded concurrency opt-in | Low controller concurrency; one slow database no longer starves the rest when raised | Operators must size `max_database_workers` on multi-database clusters |
+| Shared emergency slot in shared memory | Restart-safe one-emergency-vacuum admission cluster-wide | Emergencies queue behind each other by design |
+| Designated global-settings database (opt-in) | Cluster settings decided per database are scan-order dependent; one owner removes the race | Advice from other databases is recorded but not applied |
 | SQL policy, C orchestration | Reviewable, upgradeable policy | More boundary code |
 | Dry-run default | No accidental changes at install | Requires staged enablement |
 | **Cluster settings applied, not just recommended** | Autovacuum starvation is a cluster problem; a human-in-the-loop for every correction re-creates the gap the tool closes | Writes `postgresql.auto.conf`; needs allowlists, cooldowns, old-value audit, and an opt-out (all provided) |
