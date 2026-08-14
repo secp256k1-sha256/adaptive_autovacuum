@@ -392,6 +392,49 @@ BEGIN
 END
 $$;
 
+/* The oldest snapshot, prepared transaction, or replication slot holding back
+   the cleanup horizon in this database.  VACUUM can only advance relfrozenxid
+   up to this horizon: when the horizon itself is older than the emergency
+   stall line, an emergency VACUUM would burn one full unthrottled table scan
+   without lowering the age at all, so the controller must report the blocker
+   instead of escalating.  MXID pressure is judged separately: slots and
+   snapshots do not hold back multixact cleanup the same way. */
+CREATE FUNCTION adaptive_autovacuum.horizon_blocker()
+RETURNS TABLE (blocker_age bigint, blocker_kind text, blocker_detail text)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT b.blocker_age, b.blocker_kind, b.blocker_detail
+    FROM (
+        SELECT GREATEST(age(a.backend_xmin), age(a.backend_xid))::bigint AS blocker_age,
+               'backend'::text AS blocker_kind,
+               format('pid %s, user %s, application %s, state %s, xact_start %s',
+                      a.pid, a.usename, COALESCE(a.application_name, ''),
+                      a.state, a.xact_start) AS blocker_detail
+        FROM pg_catalog.pg_stat_activity a
+        WHERE (a.datname = pg_catalog.current_database() OR a.datname IS NULL)
+          AND (a.backend_xmin IS NOT NULL OR a.backend_xid IS NOT NULL)
+        UNION ALL
+        SELECT age(px.transaction)::bigint,
+               'prepared_transaction',
+               format('gid %L, prepared %s, owner %s', px.gid, px.prepared, px.owner)
+        FROM pg_catalog.pg_prepared_xacts px
+        WHERE px.database = pg_catalog.current_database()
+        UNION ALL
+        SELECT GREATEST(age(s.xmin), age(s.catalog_xmin))::bigint,
+               'replication_slot',
+               format('slot %s, type %s, active %s', s.slot_name, s.slot_type, s.active)
+        FROM pg_catalog.pg_replication_slots s
+        WHERE s.xmin IS NOT NULL OR s.catalog_xmin IS NOT NULL
+    ) b
+    WHERE b.blocker_age IS NOT NULL
+    ORDER BY b.blocker_age DESC
+    LIMIT 1
+$$;
+
+COMMENT ON FUNCTION adaptive_autovacuum.horizon_blocker() IS
+'Oldest cleanup-horizon blocker visible from this database: long snapshot/transaction, prepared transaction, or replication slot xmin. NULL row set when nothing holds an xmin.';
+
 CREATE FUNCTION adaptive_autovacuum._run_cycle(
     host_load1 double precision,
     host_cpu_count integer,
@@ -469,6 +512,10 @@ DECLARE
     pressure_ratio double precision;
     xid_ratio double precision;
     mxid_ratio double precision;
+    horizon_age bigint;
+    horizon_kind text;
+    horizon_detail text;
+    xid_horizon_blocked boolean;
     cur_xid8 bigint;
     prev_xid8 bigint;
     prev_sample_at timestamptz;
@@ -565,6 +612,12 @@ BEGIN
 
     SELECT setting::bigint INTO multixact_freeze_max_age
     FROM pg_settings WHERE name = 'autovacuum_multixact_freeze_max_age';
+
+    /* Oldest cleanup-horizon blocker, fetched once per cycle; NULLs when
+       nothing currently holds an xmin. */
+    SELECT b.blocker_age, b.blocker_kind, b.blocker_detail
+    INTO horizon_age, horizon_kind, horizon_detail
+    FROM adaptive_autovacuum.horizon_blocker() b;
 
     /* XID consumption rate (transactions/second) from the 64-bit counter
        delta since the previous cycle; NULL on the first cycle or when the
@@ -808,6 +861,21 @@ BEGIN
                      current_insert_threshold) AS insert_threshold,
             COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_scale_factor')::double precision,
                      current_insert_scale_factor) AS insert_scale_factor,
+            /* PostgreSQL 18 core multiplies the insert-trigger scale
+               component by the share of pages not yet all-frozen
+               (pg_class.relallfrozen), so append-mostly-frozen tables are
+               insert-vacuumed sooner.  The jsonb detour keeps this parseable
+               on PG17, where the column does not exist and the factor stays
+               1.0 (the PG17 core formula). */
+            CASE
+                WHEN c.relpages > 0
+                 AND COALESCE(((to_jsonb(c) ->> 'relallfrozen'))::bigint, 0) > 0
+                THEN GREATEST(0.0,
+                              1.0 - LEAST(((to_jsonb(c) ->> 'relallfrozen'))::bigint,
+                                          c.relpages)::double precision
+                                    / c.relpages)
+                ELSE 1.0
+            END AS insert_pcnt_unfrozen,
             av.vacuum_pid,
             av.phase,
             av.heap_blks_total,
@@ -911,7 +979,8 @@ BEGIN
             insert_ratio := r.inserts_since_vacuum /
                             GREATEST(1, r.insert_threshold
                                         + r.insert_scale_factor
-                                          * GREATEST(r.reltuples, 0));
+                                          * GREATEST(r.reltuples, 0)
+                                          * r.insert_pcnt_unfrozen);
         END IF;
         pressure_ratio := GREATEST(backlog_ratio, insert_ratio);
         xid_ratio := r.xid_age::double precision / NULLIF(r.effective_xid_freeze_max_age, 0);
@@ -945,7 +1014,7 @@ BEGIN
         /* Any AUTOVACUUM worker on the relation counts: past the wraparound
            trigger point every autovacuum runs aggressively and does the
            freezing work, but a dead-tuple-triggered one is NOT tagged
-           "(to prevent wraparound)" — gating on the tag would miss the common
+           "(to prevent wraparound)" - gating on the tag would miss the common
            production shape (old age + dead tuples).  Manual vacuums are still
            excluded and are never judged or cancelled. */
         av_wraparound_running := r.vacuum_pid IS NOT NULL
@@ -964,17 +1033,28 @@ BEGIN
                 GREATEST(2147483648 - 3000000 - r.xid_age, 0)::double precision / xid_rate;
         END IF;
 
+        /* When the cleanup horizon itself is past the stall line, no VACUUM
+           (emergency or otherwise) can advance relfrozenxid below that line:
+           suppress the XID-driven emergency paths and report the blocker
+           instead of cancelling a working autovacuum or burning unthrottled
+           scans that cannot lower the age.  MXID-driven paths stay active. */
+        xid_horizon_blocked := horizon_age IS NOT NULL
+                               AND horizon_age >= stall_xid_age;
+
         emergency_takeover := av_wraparound_running
             AND av_elapsed_seconds >= p.emergency_takeover_min_runtime_seconds
-            AND (r.xid_age >= stall_xid_age
-                 OR r.mxid_age >= stall_mxid_age
-                 OR (av_eta_seconds IS NOT NULL
-                     AND seconds_until_readonly IS NOT NULL
-                     AND av_eta_seconds > seconds_until_readonly));
+            AND (r.mxid_age >= stall_mxid_age
+                 OR (NOT xid_horizon_blocked
+                     AND (r.xid_age >= stall_xid_age
+                          OR (av_eta_seconds IS NOT NULL
+                              AND seconds_until_readonly IS NOT NULL
+                              AND av_eta_seconds > seconds_until_readonly))));
 
         emergency_due := emergency_takeover
             OR (r.vacuum_pid IS NULL
-                AND (r.xid_age >= stall_xid_age OR r.mxid_age >= stall_mxid_age));
+                AND (r.mxid_age >= stall_mxid_age
+                     OR (NOT xid_horizon_blocked
+                         AND r.xid_age >= stall_xid_age)));
 
         IF emergency_due THEN
             relation_state := 'wraparound_critical';
@@ -992,9 +1072,13 @@ BEGIN
                                  trim(trailing '.' from to_char(p.emergency_stall_multiplier, 'FM990.99')),
                                  p.emergency_xid_age, p.emergency_mxid_age);
             END IF;
+        ELSIF xid_horizon_blocked AND r.xid_age >= stall_xid_age THEN
+            relation_state := 'horizon_blocked';
+            reason := format('XID age %s is past the stall line %s, but the cleanup horizon is held at age %s by a %s (%s); VACUUM cannot advance relfrozenxid past the horizon, so emergency escalation is suppressed until the blocker goes away.',
+                             r.xid_age, stall_xid_age, horizon_age, horizon_kind, horizon_detail);
         ELSIF xid_ratio >= p.xid_warning_ratio OR mxid_ratio >= p.mxid_warning_ratio THEN
             relation_state := 'wraparound_warning';
-            reason := format('XID/MXID age ratio vs freeze_max_age is elevated (xid=%s, mxid=%s); the forced autovacuum will handle this — prioritized only.', to_char(xid_ratio, 'FM0.000'), to_char(mxid_ratio, 'FM0.000'));
+            reason := format('XID/MXID age ratio vs freeze_max_age is elevated (xid=%s, mxid=%s); the forced autovacuum will handle this - prioritized only.', to_char(xid_ratio, 'FM0.000'), to_char(mxid_ratio, 'FM0.000'));
         ELSIF pressure_ratio >= p.backlog_critical_ratio THEN
             relation_state := 'backlog_critical';
             reason := format('%s backlog is %sx the current trigger.',
@@ -1141,6 +1225,10 @@ BEGIN
             desired_values := previous.managed_values
                               - 'autovacuum_vacuum_cost_limit'
                               - 'autovacuum_vacuum_cost_delay';
+        ELSIF relation_state = 'horizon_blocked' THEN
+            /* Hold everything as-is: more vacuum aggression cannot advance
+               the horizon, and a restore now would flap once it clears. */
+            desired_values := previous.managed_values;
         ELSE
             desired_values := '{}'::jsonb;
         END IF;
@@ -1148,6 +1236,7 @@ BEGIN
         has_existing_cost_boost := previous.managed_values ? 'autovacuum_vacuum_cost_limit';
         wants_cost_boost := p.manage_table_costs
                             AND relation_state <> 'normal'
+                            AND relation_state <> 'horizon_blocked'
                             AND (r.normal_autovacuum_enabled OR relation_state LIKE 'wraparound_%')
                             AND (NOT host_pressure OR relation_state = 'wraparound_critical')
                             AND (has_existing_cost_boost
@@ -1282,6 +1371,7 @@ BEGIN
         ELSIF relation_state <> 'normal' OR previous.ownership_conflict THEN
             action_name := CASE
                 WHEN previous.ownership_conflict THEN 'ownership_conflict'
+                WHEN relation_state = 'horizon_blocked' THEN 'horizon_blocked'
                 WHEN relation_state LIKE 'backlog_%' AND NOT r.normal_autovacuum_enabled THEN 'autovacuum_disabled'
                 WHEN r.vacuum_pid IS NOT NULL THEN 'vacuum_already_running'
                 WHEN NOT cooldown_ok THEN 'cooldown'
@@ -1365,6 +1455,13 @@ BEGIN
                 WHERE q.relid = r.relid
                   AND q.status = 'failed'
                   AND q.next_retry_at > clock_timestamp())
+           /* Hard daily cap: with the escalating per-failure backoff this is
+              a backstop against any remaining retry-storm shape. */
+           AND (SELECT count(*)
+                FROM adaptive_autovacuum.emergency_queue q
+                WHERE q.relid = r.relid
+                  AND q.status = 'failed'
+                  AND q.finished_at > clock_timestamp() - interval '24 hours') < 8
         THEN
             emergency_work_mem_mb := CASE
                 WHEN host_metrics_available THEN
@@ -1448,6 +1545,256 @@ BEGIN
             last_xid_age = EXCLUDED.last_xid_age,
             last_mxid_age = EXCLUDED.last_mxid_age,
             last_error = EXCLUDED.last_error;
+    END LOOP;
+
+    /*
+     * Wraparound safety scan.  Age-based protection must not depend on the
+     * performance scan's size/schema/table-policy filters: a tiny or excluded
+     * (e.g. pg_catalog) relation ages exactly like a large one and holds the
+     * database's datfrozenxid back on its own.  This pass covers every
+     * permanent heap relation and materialized view the performance scan did
+     * NOT evaluate, filtered down to the (normally empty) set whose age is
+     * already past the emergency stall line, and runs only the
+     * emergency/wraparound branch: no reloption management, no cost boosts.
+     * System catalogs stay conservative: their running autovacuum is never
+     * cancelled for a takeover.
+     */
+    FOR r IN
+        WITH active_vacuum AS
+        (
+            SELECT
+                pv.relid,
+                pv.pid AS vacuum_pid,
+                pv.phase,
+                pv.heap_blks_total,
+                pv.heap_blks_scanned,
+                pv.index_vacuum_count,
+                clock_timestamp() - a.query_start AS vacuum_elapsed,
+                a.backend_type = 'autovacuum worker' AS is_autovacuum
+            FROM pg_stat_progress_vacuum pv
+            JOIN pg_stat_activity a ON a.pid = pv.pid
+            WHERE pv.datid = (SELECT d.oid
+                              FROM pg_catalog.pg_database d
+                              WHERE d.datname = pg_catalog.current_database())
+        )
+        SELECT
+            c.oid AS relid,
+            format('%I.%I', n.nspname, c.relname) AS fqname,
+            n.nspname,
+            GREATEST(age(c.relfrozenxid),
+                     COALESCE(age(tc.relfrozenxid), 0))::bigint AS xid_age,
+            GREATEST(mxid_age(c.relminmxid),
+                     COALESCE(mxid_age(tc.relminmxid), 0))::bigint AS mxid_age,
+            CASE
+                WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age') IS NULL
+                  OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint < 0
+                THEN freeze_max_age
+                ELSE LEAST(freeze_max_age,
+                           adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint)
+            END AS effective_xid_freeze_max_age,
+            CASE
+                WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age') IS NULL
+                  OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint < 0
+                THEN multixact_freeze_max_age
+                ELSE LEAST(multixact_freeze_max_age,
+                           adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint)
+            END AS effective_mxid_freeze_max_age,
+            av.vacuum_pid,
+            av.phase,
+            av.heap_blks_total,
+            av.heap_blks_scanned,
+            av.index_vacuum_count,
+            av.vacuum_elapsed,
+            av.is_autovacuum
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
+        LEFT JOIN active_vacuum av ON av.relid = c.oid
+        LEFT JOIN adaptive_autovacuum.table_policy tp ON tp.relid = c.oid
+        WHERE c.relkind IN ('r', 'm')
+          AND c.relpersistence <> 't'
+          AND n.nspname <> 'pg_toast'
+          /* only relations the performance scan above did NOT evaluate */
+          AND NOT (c.relkind = 'r'
+                   AND NOT (n.nspname = ANY (p.excluded_schemas))
+                   AND COALESCE(tp.enabled, true)
+                   AND (CASE WHEN c.relpages > 0
+                             THEN c.relpages::bigint
+                                  * pg_catalog.current_setting('block_size')::bigint
+                             ELSE pg_total_relation_size(c.oid)
+                        END) >= p.min_table_bytes)
+          /* age already past this relation's stall line */
+          AND (GREATEST(age(c.relfrozenxid),
+                        COALESCE(age(tc.relfrozenxid), 0))::bigint
+                   >= LEAST(p.emergency_xid_age,
+                            ceil(p.emergency_stall_multiplier *
+                                 CASE
+                                     WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age') IS NULL
+                                       OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint < 0
+                                     THEN freeze_max_age
+                                     ELSE LEAST(freeze_max_age,
+                                                adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint)
+                                 END)::bigint)
+               OR GREATEST(mxid_age(c.relminmxid),
+                           COALESCE(mxid_age(tc.relminmxid), 0))::bigint
+                   >= LEAST(p.emergency_mxid_age,
+                            ceil(p.emergency_stall_multiplier *
+                                 CASE
+                                     WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age') IS NULL
+                                       OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint < 0
+                                     THEN multixact_freeze_max_age
+                                     ELSE LEAST(multixact_freeze_max_age,
+                                                adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint)
+                                 END)::bigint))
+    LOOP
+        stall_xid_age := LEAST(p.emergency_xid_age,
+                               ceil(p.emergency_stall_multiplier
+                                    * COALESCE(NULLIF(r.effective_xid_freeze_max_age, 0),
+                                               freeze_max_age))::bigint);
+        stall_mxid_age := LEAST(p.emergency_mxid_age,
+                                ceil(p.emergency_stall_multiplier
+                                     * COALESCE(NULLIF(r.effective_mxid_freeze_max_age, 0),
+                                                multixact_freeze_max_age))::bigint);
+
+        av_wraparound_running := r.vacuum_pid IS NOT NULL
+                                 AND COALESCE(r.is_autovacuum, false);
+        av_elapsed_seconds := extract(epoch FROM COALESCE(r.vacuum_elapsed, interval '0'));
+
+        av_eta_seconds := NULL;
+        IF av_wraparound_running AND COALESCE(r.heap_blks_scanned, 0) > 0 THEN
+            av_eta_seconds := av_elapsed_seconds
+                              * GREATEST(COALESCE(r.heap_blks_total, 0) - r.heap_blks_scanned, 0)::double precision
+                              / r.heap_blks_scanned;
+        END IF;
+        seconds_until_readonly := NULL;
+        IF xid_rate IS NOT NULL AND xid_rate > 0 THEN
+            seconds_until_readonly :=
+                GREATEST(2147483648 - 3000000 - r.xid_age, 0)::double precision / xid_rate;
+        END IF;
+
+        xid_horizon_blocked := horizon_age IS NOT NULL
+                               AND horizon_age >= stall_xid_age;
+
+        emergency_takeover := r.nspname <> 'pg_catalog'
+            AND av_wraparound_running
+            AND av_elapsed_seconds >= p.emergency_takeover_min_runtime_seconds
+            AND (r.mxid_age >= stall_mxid_age
+                 OR (NOT xid_horizon_blocked
+                     AND (r.xid_age >= stall_xid_age
+                          OR (av_eta_seconds IS NOT NULL
+                              AND seconds_until_readonly IS NOT NULL
+                              AND av_eta_seconds > seconds_until_readonly))));
+
+        emergency_due := emergency_takeover
+            OR (r.vacuum_pid IS NULL
+                AND (r.mxid_age >= stall_mxid_age
+                     OR (NOT xid_horizon_blocked
+                         AND r.xid_age >= stall_xid_age)));
+
+        IF NOT emergency_due THEN
+            IF xid_horizon_blocked AND r.xid_age >= stall_xid_age THEN
+                INSERT INTO adaptive_autovacuum.decisions
+                    (relid, relation_name, state, action, reason, host_metrics,
+                     relation_metrics, proposed_reloptions, applied)
+                VALUES
+                    (r.relid, r.fqname, 'horizon_blocked', 'horizon_blocked',
+                     format('Safety scan: XID age %s is past the stall line %s, but the cleanup horizon is held at age %s by a %s (%s); emergency escalation is suppressed until the blocker goes away.',
+                            r.xid_age, stall_xid_age, horizon_age, horizon_kind, horizon_detail),
+                     host_json,
+                     jsonb_build_object('xid_age', r.xid_age,
+                                        'mxid_age', r.mxid_age,
+                                        'safety_scan', true),
+                     NULL, false);
+            END IF;
+            CONTINUE;
+        END IF;
+
+        IF emergency_takeover THEN
+            reason := format('Safety scan: anti-wraparound autovacuum (pid %s) has been running %s s on this relation without finishing (XID age %s / stall line %s, MXID age %s / stall line %s); taking over with the index-skipping profile. The relation was invisible to the performance scan (size/schema/table-policy filters).',
+                             r.vacuum_pid, round(av_elapsed_seconds),
+                             r.xid_age, stall_xid_age, r.mxid_age, stall_mxid_age);
+        ELSE
+            reason := format('Safety scan: no autovacuum is running although XID age %s / MXID age %s is past the stall line (%s / %s); the relation was invisible to the performance scan (size/schema/table-policy filters).',
+                             r.xid_age, r.mxid_age, stall_xid_age, stall_mxid_age);
+        END IF;
+
+        IF p.dry_run OR NOT p.emergency_vacuum_enabled THEN
+            INSERT INTO adaptive_autovacuum.decisions
+                (relid, relation_name, state, action, reason, host_metrics,
+                 relation_metrics, proposed_reloptions, applied)
+            VALUES
+                (r.relid, r.fqname, 'wraparound_critical', 'propose_emergency_vacuum',
+                 reason, host_json,
+                 jsonb_build_object('xid_age', r.xid_age,
+                                    'mxid_age', r.mxid_age,
+                                    'safety_scan', true),
+                 NULL, false);
+            CONTINUE;
+        END IF;
+
+        IF (r.vacuum_pid IS NULL OR emergency_takeover)
+           AND NOT EXISTS
+               (SELECT 1
+                FROM adaptive_autovacuum.emergency_queue q
+                WHERE q.relid = r.relid
+                  AND q.status IN ('pending', 'running'))
+           AND NOT EXISTS
+               (SELECT 1
+                FROM adaptive_autovacuum.emergency_queue q
+                WHERE q.relid = r.relid
+                  AND q.status = 'failed'
+                  AND q.next_retry_at > clock_timestamp())
+           AND (SELECT count(*)
+                FROM adaptive_autovacuum.emergency_queue q
+                WHERE q.relid = r.relid
+                  AND q.status = 'failed'
+                  AND q.finished_at > clock_timestamp() - interval '24 hours') < 8
+        THEN
+            emergency_work_mem_mb := CASE
+                WHEN host_metrics_available THEN
+                    LEAST(
+                        p.emergency_work_mem_max_mb,
+                        GREATEST(
+                            p.emergency_work_mem_min_mb,
+                            floor((host_mem_available_bytes / 1048576.0)
+                                  * p.work_mem_available_fraction)::integer
+                        )
+                    )
+                ELSE p.emergency_work_mem_min_mb
+            END;
+
+            IF emergency_takeover THEN
+                PERFORM pg_catalog.pg_cancel_backend(r.vacuum_pid);
+            END IF;
+
+            INSERT INTO adaptive_autovacuum.emergency_queue
+                (relid, relation_name, reason, priority, work_mem_mb,
+                 cost_limit, cost_delay_ms, lock_timeout_ms, is_wraparound)
+            VALUES
+                (r.relid, r.fqname, reason,
+                 1000 + (GREATEST(r.xid_age, r.mxid_age) / 1000000)::integer,
+                 emergency_work_mem_mb,
+                 CASE WHEN host_pressure THEN GREATEST(200, p.emergency_cost_limit / 2)
+                      ELSE p.emergency_cost_limit END,
+                 CASE WHEN host_pressure THEN GREATEST(1, p.emergency_cost_delay_ms)
+                      ELSE p.emergency_cost_delay_ms END,
+                 p.emergency_lock_timeout_ms,
+                 true);
+
+            INSERT INTO adaptive_autovacuum.decisions
+                (relid, relation_name, state, action, reason, host_metrics,
+                 relation_metrics, proposed_reloptions, applied)
+            VALUES
+                (r.relid, r.fqname, 'wraparound_critical',
+                 CASE WHEN emergency_takeover
+                      THEN 'queue_emergency_takeover'
+                      ELSE 'queue_emergency_vacuum' END,
+                 reason, host_json,
+                 jsonb_build_object('xid_age', r.xid_age,
+                                    'mxid_age', r.mxid_age,
+                                    'safety_scan', true),
+                 NULL, true);
+        END IF;
     END LOOP;
 
     IF NOT host_pressure AND overdue_relation_count > 0
@@ -1704,12 +2051,14 @@ BEGIN
      * queued for the C worker to APPLY via ALTER SYSTEM + reload.  Per-table
      * reloptions remain the tool for outlier relations only.  Changes are
      * deduplicated (one pending row per GUC, no-op values filtered) and
-     * audited with their pre-change value.  There is deliberately NO per-GUC
-     * cooldown: correlated settings must be able to move together — raising
-     * autovacuum_max_workers alone splits the same cost_limit across more
-     * workers, so the cost side has to be able to follow on the very next
-     * cycle instead of starving until a timer expires.  The naptime between
-     * cycles and the at-most-doubling step are the pacing.
+     * audited with their pre-change value.  DIFFERENT settings deliberately
+     * move together in one cycle: raising autovacuum_max_workers alone splits
+     * the same cost_limit across more workers, so the cost side has to be
+     * able to follow immediately.  The SAME setting, however, is applied at
+     * most once per two naptimes across ALL databases (enforced in the C
+     * worker via shared memory): every database recommends from its own
+     * tables only, and without that brake several busy databases could each
+     * double one value within a single launcher sweep.
      * autovacuum_max_workers only ratchets up automatically; lowering it is
      * left to the DBA.
      */
@@ -1795,7 +2144,7 @@ BEGIN
      * Missing planner statistics: a table that has live rows but was never
      * analyzed in its whole life (no manual ANALYZE, no autoanalyze) leaves
      * the planner estimating from hardcoded defaults.  Analyze the largest
-     * offenders directly, one at a time — unlike VACUUM, ANALYZE is legal
+     * offenders directly, one at a time - unlike VACUUM, ANALYZE is legal
      * inside a function's transaction.  Deliberately NOT gated on
      * min_table_bytes: missing statistics mislead the planner regardless of
      * table size, and n_live_tup > 0 already proves there is something to
@@ -1939,7 +2288,7 @@ CROSS JOIN adaptive_autovacuum.policy p
 ORDER BY age(d.datfrozenxid) DESC;
 
 COMMENT ON VIEW adaptive_autovacuum.wraparound_status IS
-'Per-database transaction-age early warning: ok / watch (half the emergency threshold) / alarm (emergency threshold). Alarm means the built-in anti-wraparound autovacuum is not keeping up — investigate stuck replication slots, prepared transactions, or long-running queries.';
+'Per-database transaction-age early warning: ok / watch (half the emergency threshold) / alarm (emergency threshold). Alarm means the built-in anti-wraparound autovacuum is not keeping up - investigate stuck replication slots, prepared transactions, or long-running queries; adaptive_autovacuum.horizon_blocker() names the oldest blocker for the current database.';
 
 CREATE VIEW adaptive_autovacuum.latest_global_recommendation AS
 SELECT recommendation.*
@@ -1996,3 +2345,4 @@ GRANT SELECT ON adaptive_autovacuum.relation_status,
                 adaptive_autovacuum.wraparound_status
 TO PUBLIC;
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.host_metrics() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION adaptive_autovacuum.horizon_blocker() TO PUBLIC;

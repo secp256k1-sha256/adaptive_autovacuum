@@ -15,8 +15,7 @@ The local container has PostgreSQL 17 `pg_config` but no PostgreSQL 18 server he
 ## Validation performed 2026-08-08 (post-review fixes)
 
 Compiled against PGDG PostgreSQL 18.4 on EL9 (AlmaLinux 9 build host; gcc 11.5)
-and validated on Rocky Linux 9.6 (Veeam VBR v13 appliance, agord-13l-vbr,
-scratch PG 18.4 instance on port 55432, product PG 17 untouched):
+and validated on Rocky Linux 9.6 (PG 18.4 instance on port 55432):
 
 - `make installcheck` passes (expected output regenerated from a real
   `pg_regress` run; the originally shipped file was hand-written and could
@@ -214,8 +213,8 @@ at its 1B default in both drills):
 
 ## Validation performed 2026-08-10 (Linux re-test of the final revision)
 
-Full fresh pass on Rocky Linux 9.6 (Veeam appliance, scratch PG 18.4 on
-port 55432, product PG 17.10 untouched): PGDG packages + gcc/make from
+Full fresh pass on Rocky Linux 9.6 (PG 18.4 on
+port 55432): PGDG packages + gcc/make from
 temporary Rocky 9.6 vault repos, PGXS build (`with_llvm=no` - the PGDG
 bitcode step expects llvm21, absent from the 9.6 vault; the .so is
 unaffected).
@@ -295,9 +294,8 @@ Windows, and the installed `$system` copy wins if listed first):
   (decision ids 1..3) while t1/t3 kept `reltuples = -1`; cycle 2 analyzed
   t3 then t1; cycle 3 was a no-op (decision count stayed 5).
 
-Linux parity (same day, Rocky Linux 9.6 appliance agord-13l-vbr, scratch
-PGDG PostgreSQL 18.4 on port 55432, product PG 17 untouched, environment
-fully removed afterwards):
+Linux parity (same day, Rocky Linux 9.6,
+PGDG PostgreSQL 18.4 on port 55432):
 
 - Extension compiled from the same source (`make install with_llvm=no`).
 - The full regression run is byte-identical to the expected file (after
@@ -361,7 +359,7 @@ perl dependency):
 
 ## Validation performed 2026-08-11 (comprehensive PG18 feature run, Linux lab)
 
-Full-matrix run on the Rocky Linux 9.6 appliance (agord-13l-vbr), scratch PGDG
+Full-matrix run on the Rocky Linux 9.6, PGDG
 PostgreSQL 18.4 on port 55432 (preloaded, `track_cost_delay_timing = on`,
 5-second controller naptime, builtin autovacuum parked at naptime 3600s except
 where staged), built from the current source including the two design changes

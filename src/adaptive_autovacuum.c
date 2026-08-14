@@ -44,6 +44,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -62,6 +63,7 @@ PG_MODULE_MAGIC;
 PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void adaptive_autovacuum_launcher_main(Datum main_arg);
 PGDLLEXPORT void adaptive_autovacuum_database_main(Datum main_arg);
+PGDLLEXPORT void adaptive_autovacuum_emergency_main(Datum main_arg);
 
 PG_FUNCTION_INFO_V1(adaptive_autovacuum_host_metrics);
 
@@ -69,10 +71,12 @@ static bool aav_enabled = false;
 static char *aav_control_database = NULL;
 static int aav_naptime_seconds = 60;
 static int aav_database_worker_timeout_seconds = 3600;
+static int aav_emergency_timeout_seconds = 86400;
 static bool aav_log_cycle_summary = true;
 
 static volatile sig_atomic_t aav_got_sigterm = false;
 static volatile sig_atomic_t aav_got_sighup = false;
+static volatile sig_atomic_t aav_emergency_timed_out = false;
 
 
 /* ---------- host metrics ---------- */
@@ -102,11 +106,21 @@ typedef struct AAVEmergencyRequest
     bool is_wraparound;
 } AAVEmergencyRequest;
 
+/* Fixed capacity for per-GUC apply timestamps; must cover the whitelist. */
+#define AAV_GLOBAL_GUC_SLOTS 16
+
 typedef struct AAVSharedState
 {
     slock_t mutex;
     pid_t emergency_worker_pid;
     Oid emergency_database_oid;
+    /* Last successful cluster-wide apply per whitelisted GUC, indexed by the
+       GUC's position in aav_allowed_global_gucs.  Every database evaluates
+       the cluster from its own tables only, so without a shared brake N busy
+       databases could each double the same setting within one launcher
+       sweep; this limits any one GUC to one apply per cooldown window
+       cluster-wide. */
+    TimestampTz global_applied_at[AAV_GLOBAL_GUC_SLOTS];
 } AAVSharedState;
 
 static AAVSharedState *aav_shared_state = NULL;
@@ -133,6 +147,9 @@ static bool aav_run_database_worker(Oid dboid, const char *dbname);
 static bool aav_extension_enabled_in_database(void);
 static void aav_execute_policy_cycle(const AAVHostMetrics *metrics);
 static void aav_apply_global_settings(void);
+static bool aav_has_pending_emergency_request(void);
+static bool aav_start_emergency_worker(Oid dboid);
+static void aav_emergency_timeout_handler(void);
 static bool aav_claim_emergency_request(AAVEmergencyRequest *request);
 static void aav_finish_emergency_request(const AAVEmergencyRequest *request,
                                          const char *status,
@@ -187,11 +204,29 @@ _PG_init(void)
 
     DefineCustomIntVariable("adaptive_autovacuum.database_worker_timeout_seconds",
                             "Maximum time the launcher waits for one database worker.",
-                            "This includes a guarded emergency VACUUM when one is selected.",
+                            "Covers the policy cycle only; emergency VACUUMs run in a "
+                            "dedicated worker governed by emergency_timeout_seconds.",
                             &aav_database_worker_timeout_seconds,
                             3600,
                             10,
                             86400,
+                            PGC_SIGHUP,
+                            GUC_UNIT_S,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    /* A long emergency VACUUM must never be killed by the database-worker
+       supervision timeout (that produced an abort/retry livelock on tables
+       whose freeze pass exceeds one hour), so the dedicated emergency worker
+       carries its own, much longer budget.  0 disables the timeout. */
+    DefineCustomIntVariable("adaptive_autovacuum.emergency_timeout_seconds",
+                            "Maximum runtime of one guarded emergency VACUUM.",
+                            "Applies per queued relation inside the dedicated emergency worker; 0 disables the limit.",
+                            &aav_emergency_timeout_seconds,
+                            86400,
+                            0,
+                            604800,
                             PGC_SIGHUP,
                             GUC_UNIT_S,
                             NULL,
@@ -874,8 +909,7 @@ adaptive_autovacuum_database_main(Datum main_arg)
 {
     Oid dboid = DatumGetObjectId(main_arg);
     AAVHostMetrics metrics;
-    AAVEmergencyRequest request;
-    bool have_request = false;
+    bool started_emergency = false;
 
     pqsignal(SIGTERM, aav_sigterm);
     pqsignal(SIGHUP, aav_sighup);
@@ -892,50 +926,21 @@ adaptive_autovacuum_database_main(Datum main_arg)
         aav_execute_policy_cycle(&metrics);
         aav_apply_global_settings();
 
-        if (!aav_got_sigterm && aav_try_acquire_emergency_slot(dboid))
-        {
-            have_request = aav_claim_emergency_request(&request);
-            if (!have_request)
-                aav_release_emergency_slot(0, (Datum) 0);
-        }
-
-        if (have_request && !aav_got_sigterm)
-        {
-            PG_TRY();
-            {
-                aav_run_emergency_vacuum(&request);
-                aav_finish_emergency_request(&request, "completed", NULL);
-            }
-            PG_CATCH();
-            {
-                ErrorData *edata;
-                MemoryContext old_context;
-                char *message;
-
-                old_context = MemoryContextSwitchTo(TopMemoryContext);
-                edata = CopyErrorData();
-                message = pstrdup(edata->message ? edata->message : "unknown error");
-                MemoryContextSwitchTo(old_context);
-
-                FlushErrorState();
-                aav_abort_transaction_if_needed();
-                aav_finish_emergency_request(&request, "failed", message);
-                FreeErrorData(edata);
-
-                elog(WARNING,
-                     "adaptive autovacuum emergency VACUUM failed for relation %u: %s",
-                     request.relid,
-                     message);
-            }
-            PG_END_TRY();
-            aav_release_emergency_slot(0, (Datum) 0);
-        }
+        /*
+         * Emergency VACUUMs run in a dedicated worker (fire-and-forget):
+         * executing them here put the vacuum under the launcher's
+         * database_worker_timeout_seconds, so a freeze pass longer than that
+         * was killed and retried forever, and it stalled the launcher's scan
+         * of the remaining databases for up to the whole timeout.
+         */
+        if (!aav_got_sigterm && aav_has_pending_emergency_request())
+            started_emergency = aav_start_emergency_worker(dboid);
 
         if (aav_log_cycle_summary)
             elog(LOG,
                  "adaptive autovacuum cycle completed for database %u%s",
                  dboid,
-                 have_request ? " with one emergency VACUUM request" : "");
+                 started_emergency ? "; emergency VACUUM worker started" : "");
     }
     PG_CATCH();
     {
@@ -1072,17 +1077,21 @@ static const char *const aav_allowed_global_gucs[] = {
     "autovacuum_analyze_threshold",
 };
 
-static bool
-aav_global_guc_allowed(const char *name)
+StaticAssertDecl(lengthof(aav_allowed_global_gucs) <= AAV_GLOBAL_GUC_SLOTS,
+                 "aav_allowed_global_gucs exceeds AAV_GLOBAL_GUC_SLOTS");
+
+/* Whitelist position, or -1 when the GUC is not managed. */
+static int
+aav_global_guc_index(const char *name)
 {
     int i;
 
     for (i = 0; i < (int) lengthof(aav_allowed_global_gucs); i++)
     {
         if (strcmp(name, aav_allowed_global_gucs[i]) == 0)
-            return true;
+            return i;
     }
-    return false;
+    return -1;
 }
 
 static void
@@ -1199,12 +1208,38 @@ aav_apply_global_settings(void)
         MemoryContext oldcontext;
         ResourceOwner oldowner;
         char *volatile apply_error = NULL;
+        int guc_index;
 
-        if (names[i] == NULL || !aav_global_guc_allowed(names[i]))
+        guc_index = (names[i] != NULL) ? aav_global_guc_index(names[i]) : -1;
+        if (guc_index < 0)
         {
             aav_mark_global_change(ids[i], "failed", NULL,
                                    "GUC is not in the managed whitelist.");
             continue;
+        }
+
+        /*
+         * Cross-database cooldown: each database recommends cluster settings
+         * from its own tables only, so several busy databases could each
+         * double the same GUC within one launcher sweep (2^N escalation).
+         * Allow one cluster-wide apply per GUC per two naptimes; a skipped
+         * row simply stays pending and is retried on a later cycle.
+         */
+        if (aav_shared_state == NULL)
+            aav_attach_shared_state();
+        if (aav_shared_state != NULL)
+        {
+            TimestampTz last_applied;
+
+            SpinLockAcquire(&aav_shared_state->mutex);
+            last_applied = aav_shared_state->global_applied_at[guc_index];
+            SpinLockRelease(&aav_shared_state->mutex);
+
+            if (last_applied != 0 &&
+                !TimestampDifferenceExceeds(last_applied,
+                                            GetCurrentTimestamp(),
+                                            2 * aav_naptime_seconds * 1000))
+                continue;
         }
 
         if (values[i] == NULL || values[i][0] == '\0' ||
@@ -1304,6 +1339,13 @@ aav_apply_global_settings(void)
             continue;
         }
 
+        if (aav_shared_state != NULL)
+        {
+            SpinLockAcquire(&aav_shared_state->mutex);
+            aav_shared_state->global_applied_at[guc_index] = GetCurrentTimestamp();
+            SpinLockRelease(&aav_shared_state->mutex);
+        }
+
         aav_mark_global_change(ids[i], "applied", old_value, NULL);
         applied_count++;
 
@@ -1319,6 +1361,186 @@ aav_apply_global_settings(void)
 
     if (applied_count > 0)
         (void) kill(PostmasterPid, SIGHUP);
+}
+
+/* ---------- emergency worker ---------- */
+
+static bool
+aav_has_pending_emergency_request(void)
+{
+    bool pending = false;
+    int spi_rc;
+    bool isnull;
+
+    StartTransactionCommand();
+    SPI_connect();
+    PushActiveSnapshot(GetTransactionSnapshot());
+
+    spi_rc = SPI_execute(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM adaptive_autovacuum.emergency_queue "
+        "  WHERE status = 'pending' "
+        "    AND next_retry_at <= clock_timestamp()"
+        ")",
+        true,
+        1);
+
+    if (spi_rc == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        pending = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                             SPI_tuptable->tupdesc,
+                                             1,
+                                             &isnull));
+        if (isnull)
+            pending = false;
+    }
+
+    PopActiveSnapshot();
+    SPI_finish();
+    CommitTransactionCommand();
+
+    return pending;
+}
+
+/*
+ * Fire-and-forget: the database worker only registers the emergency worker
+ * and exits.  Serialization happens inside the emergency worker via the
+ * shared-memory slot; if another emergency VACUUM is already running
+ * cluster-wide the new worker exits immediately and the queued request is
+ * retried on a later cycle.
+ */
+static bool
+aav_start_emergency_worker(Oid dboid)
+{
+    BackgroundWorker worker;
+
+    MemSet(&worker, 0, sizeof(worker));
+    snprintf(worker.bgw_name, BGW_MAXLEN,
+             "adaptive autovacuum emergency worker");
+    snprintf(worker.bgw_type, BGW_MAXLEN,
+             "adaptive autovacuum emergency worker");
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+                       BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    snprintf(worker.bgw_library_name, MAXPGPATH, "adaptive_autovacuum");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN,
+             "adaptive_autovacuum_emergency_main");
+    worker.bgw_main_arg = ObjectIdGetDatum(dboid);
+    worker.bgw_notify_pid = 0;
+
+    if (!RegisterDynamicBackgroundWorker(&worker, NULL))
+    {
+        elog(WARNING,
+             "adaptive autovacuum could not register the emergency worker for database %u; check max_worker_processes",
+             dboid);
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * SIGALRM context: flags only.  QueryCancelPending makes the next
+ * CHECK_FOR_INTERRUPTS() inside vacuum() throw a cancel error, which the
+ * per-request PG_CATCH turns into a 'failed' queue row.
+ */
+static void
+aav_emergency_timeout_handler(void)
+{
+    aav_emergency_timed_out = true;
+    QueryCancelPending = true;
+    InterruptPending = true;
+    SetLatch(MyLatch);
+}
+
+PGDLLEXPORT void
+adaptive_autovacuum_emergency_main(Datum main_arg)
+{
+    Oid dboid = DatumGetObjectId(main_arg);
+    AAVEmergencyRequest request;
+    TimeoutId timeout_id;
+    int processed = 0;
+
+    pqsignal(SIGTERM, aav_sigterm);
+    pqsignal(SIGHUP, aav_sighup);
+    BackgroundWorkerUnblockSignals();
+
+    BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+
+    /* One emergency VACUUM cluster-wide; the slot is released by the
+       before_shmem_exit hook even on abnormal exit. */
+    if (!aav_try_acquire_emergency_slot(dboid))
+        proc_exit(0);
+
+    timeout_id = RegisterTimeout(USER_TIMEOUT, aav_emergency_timeout_handler);
+
+    /* Drain the queue serially; each request gets its own timeout budget. */
+    while (!aav_got_sigterm && aav_claim_emergency_request(&request))
+    {
+        PG_TRY();
+        {
+            aav_emergency_timed_out = false;
+            if (aav_emergency_timeout_seconds > 0)
+                enable_timeout_after(timeout_id,
+                                     aav_emergency_timeout_seconds * 1000);
+
+            aav_run_emergency_vacuum(&request);
+
+            disable_timeout(timeout_id, false);
+            if (aav_emergency_timed_out)
+            {
+                /* The vacuum finished in the same instant the timeout fired;
+                   do not let the stale cancel abort the bookkeeping. */
+                aav_emergency_timed_out = false;
+                QueryCancelPending = false;
+            }
+            aav_finish_emergency_request(&request, "completed", NULL);
+        }
+        PG_CATCH();
+        {
+            ErrorData *edata;
+            MemoryContext old_context;
+            char *message;
+
+            disable_timeout(timeout_id, false);
+            QueryCancelPending = false;
+
+            old_context = MemoryContextSwitchTo(TopMemoryContext);
+            edata = CopyErrorData();
+            message = pstrdup(edata->message ? edata->message : "unknown error");
+            MemoryContextSwitchTo(old_context);
+
+            FlushErrorState();
+            aav_abort_transaction_if_needed();
+
+            if (aav_emergency_timed_out)
+            {
+                message = psprintf("adaptive_autovacuum.emergency_timeout_seconds (%d s) exceeded: %s",
+                                   aav_emergency_timeout_seconds, message);
+                aav_emergency_timed_out = false;
+            }
+
+            aav_finish_emergency_request(&request, "failed", message);
+            FreeErrorData(edata);
+
+            elog(WARNING,
+                 "adaptive autovacuum emergency VACUUM failed for relation %u: %s",
+                 request.relid,
+                 message);
+        }
+        PG_END_TRY();
+
+        processed++;
+    }
+
+    if (aav_log_cycle_summary)
+        elog(LOG,
+             "adaptive autovacuum emergency worker for database %u processed %d request(s)",
+             dboid,
+             processed);
+
+    proc_exit(0);
 }
 
 static bool
@@ -1406,15 +1628,25 @@ aav_finish_emergency_request(const AAVEmergencyRequest *request,
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
+    /* Escalating backoff: the Nth recent failure for the same relation waits
+       N x 5 minutes (capped at 2 hours) before the policy may requeue it, so
+       a vacuum that keeps failing cannot become a fixed-cadence retry storm. */
     spi_rc = SPI_execute_with_args(
-        "UPDATE adaptive_autovacuum.emergency_queue "
+        "UPDATE adaptive_autovacuum.emergency_queue q "
         "SET status = $2, "
         "    finished_at = clock_timestamp(), "
         "    last_error = $3, "
         "    next_retry_at = CASE WHEN $2 = 'failed' "
-        "                         THEN clock_timestamp() + interval '5 minutes' "
-        "                         ELSE next_retry_at END "
-        "WHERE id = $1",
+        "                         THEN clock_timestamp() "
+        "                              + LEAST(24, 1 + (SELECT count(*) "
+        "                                               FROM adaptive_autovacuum.emergency_queue f "
+        "                                               WHERE f.relid = q.relid "
+        "                                                 AND f.id <> q.id "
+        "                                                 AND f.status = 'failed' "
+        "                                                 AND f.finished_at > clock_timestamp() - interval '24 hours')) "
+        "                                * interval '5 minutes' "
+        "                         ELSE q.next_retry_at END "
+        "WHERE q.id = $1",
         3,
         argtypes,
         values,

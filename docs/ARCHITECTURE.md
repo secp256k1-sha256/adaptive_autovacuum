@@ -8,8 +8,8 @@
 
 The extension is a bounded controller around PostgreSQL's existing autovacuum subsystem. It does not replace the core autovacuum launcher or workers. It observes whether table maintenance is falling behind and acts at two levels, mirroring how production DBAs tune autovacuum:
 
-1. **Cluster level first.** Autovacuum is a cluster-wide phenomenon — one worker pool, one shared cost budget, one trigger baseline. When the data shows a cluster setting is wrong, the controller corrects it through `ALTER SYSTEM` plus configuration reload, within a fixed allowlist, rate limits, and a full old-value audit.
-2. **Table level for outliers.** Relations that remain special after the baseline is right — disproportionate-DML tables, very large tables, insert-only tables — receive reversible per-table storage parameters that are automatically restored once the relation is healthy.
+1. **Cluster level first.** Autovacuum is a cluster-wide phenomenon - one worker pool, one shared cost budget, one trigger baseline. When the data shows a cluster setting is wrong, the controller corrects it through `ALTER SYSTEM` plus configuration reload, within a fixed allowlist, rate limits, and a full old-value audit.
+2. **Table level for outliers.** Relations that remain special after the baseline is right - disproportionate-DML tables, very large tables, insert-only tables - receive reversible per-table storage parameters that are automatically restored once the relation is healthy.
 
 It can additionally execute a guarded manual vacuum when a relation's transaction-ID age is critical and no equivalent vacuum is active.
 
@@ -20,7 +20,7 @@ The central design objective is not maximum vacuum speed. It is to reduce backlo
 ### Goals
 
 - Detect persistent dead-tuple backlog and insert backlog rather than react to one noisy sample.
-- Correct the cluster-wide autovacuum baseline (trigger thresholds and scale factors for vacuum, insert-vacuum, and analyze; cost limit and delay; worker count; autovacuum memory) when evidence shows it is mistuned — applied automatically with rails, or recorded as recommendations when the operator prefers.
+- Correct the cluster-wide autovacuum baseline (trigger thresholds and scale factors for vacuum, insert-vacuum, and analyze; cost limit and delay; worker count; autovacuum memory) when evidence shows it is mistuned - applied automatically with rails, or recorded as recommendations when the operator prefers.
 - Size the PostgreSQL 18 dead-tuple trigger ceiling (`autovacuum_vacuum_max_threshold`) from the actual fleet rather than a constant.
 - Derive per-table thresholds from a target dead-tuple / inserted-rows budget for outlier relations only.
 - Allocate stronger table-level cost settings gradually (ramp), to a bounded number of urgent relations, under a cluster-wide sum budget.
@@ -97,9 +97,16 @@ Responsibilities:
 - Read host and cgroup memory information.
 - Invoke the SQL policy evaluator in one transaction.
 - **Apply queued cluster-setting changes**: claim pending rows from `global_apply_queue` (`FOR UPDATE SKIP LOCKED`), validate each GUC name against a fixed C-side allowlist and each value as a plain numeric literal, capture the current value, call the exported `AlterSystemSetConfigFile()` entry point, mark the row applied with its old value, and signal the postmaster to reload. `ALTER SYSTEM` cannot be executed through SPI (utility statements from functions are rejected), which is why the C worker calls the internal entry point directly.
-- Acquire the cluster-wide shared-memory emergency slot, then claim at most one queue item.
-- Run a manual vacuum with session-local maintenance and cost settings.
-- Record completion or failure and release the emergency slot on both normal and abnormal exit.
+- When pending emergency requests exist, **register the dedicated emergency worker** (fire-and-forget) and exit. The database worker itself never runs the vacuum: doing so put the vacuum under the launcher's `database_worker_timeout_seconds`, so any freeze pass longer than that was killed and retried forever, and it stalled the launcher's scan of the remaining databases.
+
+### 4.2b C emergency worker
+
+A separate dynamic worker started on demand by a database worker:
+
+- Acquire the cluster-wide shared-memory emergency slot (exit immediately if another emergency vacuum is running anywhere in the cluster; the slot is released by a `before_shmem_exit` hook on both normal and abnormal exit).
+- Drain the queue serially: claim one item at a time (`FOR UPDATE SKIP LOCKED`), run the manual vacuum with session-local maintenance and cost settings.
+- Enforce `adaptive_autovacuum.emergency_timeout_seconds` (default 24 h, `0` = unlimited) per request through the timeout infrastructure: on expiry the vacuum is cancelled and the request marked failed.
+- Record completion or failure; failures set an escalating retry backoff (N recent failures → N × 5 minutes, capped at 2 h), and the policy additionally refuses to requeue a relation that failed 8 times within 24 h.
 
 ### 4.3 SQL policy layer
 
@@ -112,7 +119,7 @@ The policy layer contains the tunable logic and durable state:
 - `global_recommendations`: computed cluster-level values with a human-readable reason (always recorded, regardless of whether they are applied).
 - `global_apply_queue`: cluster-setting changes awaiting or completed application, with old value, status, and error.
 - `emergency_queue`: guarded manual-vacuum requests.
-- `changed_tables` (view): one row per (relation, managed key) with original versus current value — the operator-facing answer to "what has it changed right now."
+- `changed_tables` (view): one row per (relation, managed key) with original versus current value - the operator-facing answer to "what has it changed right now."
 
 Keeping policy in SQL makes most changes reviewable and upgradeable without adding more C-level dependencies on PostgreSQL internals.
 
@@ -125,10 +132,12 @@ An automatic write requires all applicable gates:
 3. The extension exists in the target database.
 4. `adaptive_autovacuum.policy.enabled` is true in that database.
 5. `dry_run` is false.
-6. **For cluster settings:** `manage_global_settings` is true; the GUC is on the C-side allowlist; the value passes numeric validation; no pending change for it already exists; the new value actually differs numerically from the current one. There is deliberately no per-GUC cooldown: correlated settings must be able to move together (raising `autovacuum_max_workers` alone splits the same `cost_limit` across more workers, so the cost side must be able to follow on the next cycle). The naptime between cycles and the at-most-doubling step provide the pacing.
+6. **For cluster settings:** `manage_global_settings` is true; the GUC is on the C-side allowlist; the value passes numeric validation; no pending change for it already exists; the new value actually differs numerically from the current one. Different settings move together in one cycle on purpose: raising `autovacuum_max_workers` alone splits the same `cost_limit` across more workers, so the cost side must be able to follow immediately. The same setting, however, is applied at most once per two naptimes across all databases (a shared-memory timestamp per GUC). Every database recommends from its own tables only; without that brake, several busy databases could each double one value within a single launcher sweep.
 7. **For table changes:** the table is not excluded; the observed condition has persisted for the hysteresis window; the relation is outside its change cooldown; no vacuum is currently reported for that relation; the controller still owns every previously managed reloption; the per-cycle DDL limit has not been consumed.
 8. For table cost changes, `manage_table_costs` is true, the admission limit permits the relation, and the cluster-wide boost budget has headroom.
-9. For emergency vacuum, `emergency_vacuum_enabled` is true and no active or recently failed equivalent request exists.
+9. For emergency vacuum, `emergency_vacuum_enabled` is true and no active or recently failed equivalent request exists; additionally the cleanup horizon must not itself be past the failure line - an old snapshot, prepared transaction, or replication slot pinning the horizon makes freezing futile, so the controller records a `horizon_blocked` decision naming the blocker (see `adaptive_autovacuum.horizon_blocker()`) instead of queueing or taking over - and the relation must not have failed 8 emergency attempts within 24 hours.
+
+Wraparound age checks run twice per cycle: once inside the performance scan, and once in a **safety scan** that deliberately ignores `min_table_bytes`, `excluded_schemas`, and `table_policy.enabled` - a tiny or excluded relation ages exactly like a large one. The safety scan covers system catalogs and materialized views too, and never cancels a running autovacuum on a system catalog.
 
 These gates are independent. Enabling the launcher does not implicitly enable a database policy, and enabling a database policy does not disable dry-run.
 
@@ -139,8 +148,9 @@ These gates are independent. Enabling the launcher does not implicitly enable a 
 The policy reads, per eligible relation:
 
 - `pg_class.reltuples`, `pg_class.relpages`, `pg_class.reloptions`
-- `pg_class.relfrozenxid` and `pg_class.relminmxid` — **combined with the TOAST relation's** `relfrozenxid`/`relminmxid` via `GREATEST(...)`, because the TOAST table ages independently and is easy to miss
+- `pg_class.relfrozenxid` and `pg_class.relminmxid` - **combined with the TOAST relation's** `relfrozenxid`/`relminmxid` via `GREATEST(...)`, because the TOAST table ages independently and is easy to miss
 - `pg_stat_get_live_tuples()` / `pg_stat_get_dead_tuples()` / `pg_stat_get_ins_since_vacuum()` (direct per-relation statistics functions; cheaper than joining the `pg_stat_all_tables` view across the whole catalog)
+- `pg_class.relallfrozen` (PostgreSQL 18): the insert-trigger scale component is multiplied by the share of pages not yet all-frozen, matching the core formula; on PostgreSQL 17 the column does not exist and the factor is 1.0, which is the core formula there too
 - relation size, estimated from `relpages × block size` with a `pg_total_relation_size()` fallback only for never-analyzed relations (avoids taking a lock on every relation and its indexes each cycle)
 - `pg_stat_progress_vacuum` joined to `pg_stat_activity`, **filtered to the current database's `datid`** (the view is cluster-wide; an unfiltered join lets a same-OID relation in another database masquerade as a local vacuum)
 
@@ -154,7 +164,7 @@ PostgreSQL 18 exposes fields used by this implementation: elapsed time from the 
 
 The C worker gathers the one-minute load average, online CPU count, and total/available memory. On Linux it reads `/proc/meminfo` and then constrains memory to the current cgroup v2 or v1 memory limit when that limit is lower than host RAM.
 
-On Windows there is no load average. The worker samples the system-wide CPU busy fraction over a 200 ms window (`GetSystemTimes()`) and reports `busy_fraction × cpu_count` as `load1`; memory comes from `GlobalMemoryStatusEx()`. The semantic difference matters for the pressure gate: a Unix load average includes processes waiting to run and can exceed the CPU count, while CPU utilization saturates at 1.0 per CPU — so the default `high_load_per_cpu = 1.5` is unreachable on Windows and deployments there should size it below 1.0 (for example 0.85) if CPU-based pressure gating is desired. Memory-based pressure works identically on both platforms.
+On Windows there is no load average. The worker samples the system-wide CPU busy fraction over a 200 ms window (`GetSystemTimes()`) and reports `busy_fraction × cpu_count` as `load1`; memory comes from `GlobalMemoryStatusEx()`. The semantic difference matters for the pressure gate: a Unix load average includes processes waiting to run and can exceed the CPU count, while CPU utilization saturates at 1.0 per CPU - so the default `high_load_per_cpu = 1.5` is unreachable on Windows and deployments there should size it below 1.0 (for example 0.85) if CPU-based pressure gating is desired. Memory-based pressure works identically on both platforms.
 
 Limitations: CPU count is not constrained by cgroup CPU quota; load average / CPU busy is not an application-latency signal; disk latency, queue depth, and PSI are not read. Host pressure therefore blocks or reduces aggressive actions, but absence of reported pressure is not proof that more I/O is safe.
 
@@ -188,11 +198,11 @@ Trigger reloptions are changed only for backlog states and only when normal auto
 
 ### Cluster baseline correction (mistuned-baseline detector)
 
-Per-table overrides are for outliers. When at least **3 relations and 25% of the eligible fleet** are dead-overdue in the same cycle, the baseline — not the tables — is wrong. The controller then takes the **median** of the per-relation desired thresholds and scale factors as the new cluster-wide `autovacuum_vacuum_threshold` / `autovacuum_vacuum_scale_factor`, keeps `autovacuum_analyze_scale_factor`/`_threshold` in proportion (half the vacuum scale, PostgreSQL's default ratio, with floors), and the same rule applies independently on the insert side for `autovacuum_vacuum_insert_*`.
+Per-table overrides are for outliers. When at least **3 relations and 25% of the eligible fleet** are dead-overdue in the same cycle, the baseline - not the tables - is wrong. The controller then takes the **median** of the per-relation desired thresholds and scale factors as the new cluster-wide `autovacuum_vacuum_threshold` / `autovacuum_vacuum_scale_factor`, keeps `autovacuum_analyze_scale_factor`/`_threshold` in proportion (half the vacuum scale, PostgreSQL's default ratio, with floors), and the same rule applies independently on the insert side for `autovacuum_vacuum_insert_*`.
 
 ### Fleet-derived trigger ceiling
 
-`autovacuum_vacuum_max_threshold` — PostgreSQL 18's cap that lets one sane percentage coexist with very large tables — is not a constant here. It is derived every cycle as the dead-tuple target of the **largest** eligible relation (ratio × rows, clamped to the policy bounds): the biggest table never waits longer than its own policy target, while smaller relations keep triggering via the scale factor because their computed trigger stays below the ceiling. Hysteresis prevents churn: the ceiling is tightened when disabled or more than 10% looser than derived, raised only when grossly over-tight (below half of derived), and anything in between is respected as operator intent.
+`autovacuum_vacuum_max_threshold` - PostgreSQL 18's cap that lets one sane percentage coexist with very large tables - is not a constant here. It is derived every cycle as the dead-tuple target of the **largest** eligible relation (ratio × rows, clamped to the policy bounds): the biggest table never waits longer than its own policy target, while smaller relations keep triggering via the scale factor because their computed trigger stays below the ceiling. Hysteresis prevents churn: the ceiling is tightened when disabled or more than 10% looser than derived, raised only when grossly over-tight (below half of derived), and anything in between is respected as operator intent.
 
 ## 8. State machine and hysteresis
 
@@ -217,13 +227,13 @@ The controller increments `consecutive_overdue` while a relation is non-normal a
 
 The shared autovacuum cost budget (`autovacuum_vacuum_cost_limit`/`_cost_delay`) is corrected automatically: raised step-wise (at most doubled per change window, capped by `recommendation_cost_limit_max`) when long vacuums are delay-bound or relations are overdue without host pressure, and *reduced* under host pressure. The delay walk-down halves per window but stops at `recommendation_delay_min_ms` (default 0.5 ms): delay 0 equals unthrottled manual-vacuum aggression and is never reached automatically, while an operator-chosen delay already below the floor is respected and never raised.
 
-Two memory-side settings are sized opportunistically while maintenance is actually running and the host has free memory — an idle cluster is never retuned. `vacuum_buffer_usage_limit` (PG16+, the shared_buffers ring a VACUUM/ANALYZE may occupy; an idle ring costs nothing) is at most doubled per cycle up to `recommendation_buffer_usage_limit_max_mb`, additionally bounded by the server's own silent 1/8-of-shared_buffers clamp divided across the worker pool so concurrent rings cannot crowd out the workload's cache; it is halved back toward the built-in default under host pressure, and an operator value of 0 ("no limit") is never touched. `autovacuum_work_mem` keeps its evidence-based raise (repeated index passes = the vacuum ran out of dead-tuple memory) and additionally ratchets toward the free-memory-derived value while workers are running; it is never lowered without host pressure. Because the shared budget is split across workers, raising `autovacuum_max_workers` does not increase total un-boosted vacuum I/O — it adds parallelism. The worker count is therefore raised (never lowered) when overdue relations outnumber workers or all worker slots are busy while relations wait, independent of the host-pressure gate, bounded by `autovacuum_worker_slots`, a quarter of host CPUs, and `recommendation_workers_max`.
+Two memory-side settings are sized opportunistically while maintenance is actually running and the host has free memory - an idle cluster is never retuned. `vacuum_buffer_usage_limit` (PG16+, the shared_buffers ring a VACUUM/ANALYZE may occupy; an idle ring costs nothing) is at most doubled per cycle up to `recommendation_buffer_usage_limit_max_mb`, additionally bounded by the server's own silent 1/8-of-shared_buffers clamp divided across the worker pool so concurrent rings cannot crowd out the workload's cache; it is halved back toward the built-in default under host pressure, and an operator value of 0 ("no limit") is never touched. `autovacuum_work_mem` keeps its evidence-based raise (repeated index passes = the vacuum ran out of dead-tuple memory) and additionally ratchets toward the free-memory-derived value while workers are running; it is never lowered without host pressure. Because the shared budget is split across workers, raising `autovacuum_max_workers` does not increase total un-boosted vacuum I/O - it adds parallelism. The worker count is therefore raised (never lowered) when overdue relations outnumber workers or all worker slots are busy while relations wait, independent of the host-pressure gate, bounded by `autovacuum_worker_slots`, a quarter of host CPUs, and `recommendation_workers_max`.
 
 ### Table level
 
 Table cost overrides are disabled by default. When enabled, the controller can add `autovacuum_vacuum_cost_limit` / `autovacuum_vacuum_cost_delay` per table, with three protections:
 
-- **Ramp.** A boost enters at the elevated tier and multiplies by `boost_ramp_factor` (default 2.0) once per change window while the relation stays overdue — never a jump to the maximum — capped by the severity tier (elevated/urgent/critical), which also ramps a boost back down when severity drops.
+- **Ramp.** A boost enters at the elevated tier and multiplies by `boost_ramp_factor` (default 2.0) once per change window while the relation stays overdue - never a jump to the maximum - capped by the severity tier (elevated/urgent/critical), which also ramps a boost back down when severity drops.
 - **Budget.** The *sum* of all boosted cost limits stays within `boost_total_cost_limit_budget`. This is mandatory, not cosmetic: a vacuum running on a table with explicit cost parameters is excluded from core PostgreSQL's cost balancing, so many boosted tables can multiply aggregate I/O far beyond the apparent global budget.
 - **Admission.** At most `max_boosted_relations` tables hold boosts simultaneously; the most urgent win. New boosts are refused during host pressure except for critical wraparound.
 
@@ -236,8 +246,8 @@ Changing a table reloption does not retune a worker that has already read the ta
 The original design recorded cluster values as recommendations only. Field experience inverted that: autovacuum starvation is a cluster problem (worker pool, cost budget, baseline), and requiring a human to apply every correction re-created the exact operational gap the extension exists to close. The shipped design **applies** cluster settings by default, with the following rails, and downgrades to recommendation-only when `manage_global_settings = false`:
 
 - **Fixed allowlist**, enforced twice: the SQL policy only enqueues the twelve managed maintenance GUCs, and the C applier independently rejects anything outside its compiled-in list.
-- **Numeric validation** of every value at both layers, plus **bounds validation**: the SQL policy never enqueues a value outside the GUC's own `pg_settings` min/max, the `policy` table's CHECK constraints cap every knob that feeds a bounded setting at that setting's documented maximum (cost limits ≤ 10000, delays ≤ 100 ms, scale factors ≤ 100, work_mem below the kilobyte-conversion overflow), and the C applier isolates each queue row in a subtransaction — a value the server rejects is marked failed individually instead of aborting the whole apply cycle and being retried until expiry. One constraint the server does NOT reject is enforced explicitly at apply time: `autovacuum_max_workers` above `autovacuum_worker_slots` is merely warned about and capped at runtime, so the applier fails such a row itself — the policy caps its own recommendation, but a queued row can outlive a restart that lowered the slot count, and manual queue inserts bypass the policy.
-- **Deduplication and a no-op filter**: at most one pending change per GUC, and a change equal to the current value is never enqueued. Pacing comes from the cycle naptime and the at-most-doubling step, not from a timer — a per-GUC cooldown was removed because it starved correlated settings (a workers-only raise dilutes the unchanged cost limit across more workers).
+- **Numeric validation** of every value at both layers, plus **bounds validation**: the SQL policy never enqueues a value outside the GUC's own `pg_settings` min/max, the `policy` table's CHECK constraints cap every knob that feeds a bounded setting at that setting's documented maximum (cost limits ≤ 10000, delays ≤ 100 ms, scale factors ≤ 100, work_mem below the kilobyte-conversion overflow), and the C applier isolates each queue row in a subtransaction - a value the server rejects is marked failed individually instead of aborting the whole apply cycle and being retried until expiry. One constraint the server does NOT reject is enforced explicitly at apply time: `autovacuum_max_workers` above `autovacuum_worker_slots` is merely warned about and capped at runtime, so the applier fails such a row itself - the policy caps its own recommendation, but a queued row can outlive a restart that lowered the slot count, and manual queue inserts bypass the policy.
+- **Deduplication and a no-op filter**: at most one pending change per GUC, and a change equal to the current value is never enqueued. Pacing comes from the cycle naptime and the at-most-doubling step, not from a timer - a per-GUC cooldown was removed because it starved correlated settings (a workers-only raise dilutes the unchanged cost limit across more workers).
 - **Old-value audit**: the applier captures the pre-change value into the queue row, giving a one-statement rollback path.
 - **Direction rules**: worker count only rises automatically; the trigger ceiling respects tighter operator values; cost aggression falls under host pressure.
 - **Application mechanics**: `ALTER SYSTEM` cannot run through SPI, so the C worker builds the statement nodes and calls the exported `AlterSystemSetConfigFile()`, then signals the postmaster (`SIGHUP`). Every managed GUC is reloadable in PostgreSQL 18, so changes take effect within seconds without restarts.
@@ -245,11 +255,11 @@ The original design recorded cluster values as recommendations only. Field exper
 
 In clusters with many managed databases, each database's worker evaluates and may apply cluster changes. Values converge (all workers compute from the same cluster-wide inputs and current settings, and application is idempotent), but audit rows land in the database whose worker acted. A single-coordinator variant remains future work.
 
-Recommendations are still always recorded in `global_recommendations` — including when they are also applied — because the reason text is the operator-facing explanation.
+Recommendations are still always recorded in `global_recommendations` - including when they are also applied - because the reason text is the operator-facing explanation.
 
 ## 11. Memory policy
 
-`autovacuum_work_mem` is a per-worker maximum, so the recommendation divides a bounded fraction of currently available (cgroup-aware) memory across `autovacuum_max_workers`, with floors and caps. It is changed only when a running vacuum is observed making repeated index-vacuum passes — the concrete evidence of a memory-bound vacuum — and never raised under host pressure. The effective current value resolves `-1` to `maintenance_work_mem`.
+`autovacuum_work_mem` is a per-worker maximum, so the recommendation divides a bounded fraction of currently available (cgroup-aware) memory across `autovacuum_max_workers`, with floors and caps. It is changed only when a running vacuum is observed making repeated index-vacuum passes - the concrete evidence of a memory-bound vacuum - and never raised under host pressure. The effective current value resolves `-1` to `maintenance_work_mem`.
 
 For a critical emergency relation, the manual vacuum receives a session-local `maintenance_work_mem` calculated from available memory and clamped between emergency minimum and maximum values. This changes only the short-lived database worker session.
 
@@ -266,14 +276,14 @@ mxid_ratio = mxid_age / effective_mxid_freeze_max_age
 
 TOAST inclusion matters: the TOAST relation has its own freeze horizon and lags whenever the main heap is vacuumed with `PROCESS_TOAST off` or by paths that skip TOAST. The effective maximum is the lower of the cluster setting and any nonnegative table-level override.
 
-`wraparound_warning` is relative — a configurable ratio of the effective `autovacuum_freeze_max_age` (default 0.70). It only prioritizes the relation and surfaces visibility; ages between the warning and the forced-vacuum point are core PostgreSQL's job, handled routinely by its cost-throttled anti-wraparound autovacuum.
+`wraparound_warning` is relative - a configurable ratio of the effective `autovacuum_freeze_max_age` (default 0.70). It only prioritizes the relation and surfaces visibility; ages between the warning and the forced-vacuum point are core PostgreSQL's job, handled routinely by its cost-throttled anti-wraparound autovacuum.
 
 `wraparound_critical` requires **evidence that the built-in mechanism is failing**, judged from the built-in vacuum's own behavior. An earlier revision fired the emergency at 85% of `autovacuum_freeze_max_age`; that was rejected because a manual `vacuum()` bypasses autovacuum cost balancing, and spending unthrottled I/O in territory the forced autovacuum resolves on its own is pure waste. A later revision used a bare absolute age; the shipped criteria refine it to two failure modes:
 
-- **Never started.** No vacuum is running on the relation although its age is past `stall_age = LEAST(emergency_xid_age, emergency_stall_multiplier × effective freeze_max_age)`. With the 1.5 default the forced autovacuum is 50% of its own trigger overdue — the launcher or worker pool is failing. The absolute `emergency_xid_age` cap (default 1 billion, the AWS RDS `MaximumUsedTransactionIDs` alarm point, ~50% of the ~2.1 billion read-only cutoff) governs clusters running very large `freeze_max_age` values. The multiplier is constrained > 1.0 so the emergency can never fire before the built-in trigger point.
-- **Running but hopeless (takeover).** An autovacuum has been running on the relation for at least `emergency_takeover_min_runtime_seconds` (default 3600) and either the age still crossed the stall line while it ground on, or its heap-progress rate projects completion after the read-only cutoff at the measured XID consumption rate (the launcher samples the 64-bit transaction counter each cycle into `controller_state`; the delta gives transactions/second). The doomed worker is cancelled with `pg_cancel_backend()` and the emergency profile — which skips index cleanup, the usual reason such vacuums crawl — replaces it. The gate is `backend_type = 'autovacuum worker'`, **not** the `(to prevent wraparound)` query tag: a dead-tuple-triggered autovacuum past the wraparound trigger runs the same aggressive freeze without the tag, and that mixed shape is the common production case. A manual `VACUUM` is never judged or cancelled.
+- **Never started.** No vacuum is running on the relation although its age is past `stall_age = LEAST(emergency_xid_age, emergency_stall_multiplier × effective freeze_max_age)`. With the 1.5 default the forced autovacuum is 50% of its own trigger overdue - the launcher or worker pool is failing. The absolute `emergency_xid_age` cap (default 1 billion, the AWS RDS `MaximumUsedTransactionIDs` alarm point, ~50% of the ~2.1 billion read-only cutoff) governs clusters running very large `freeze_max_age` values. The multiplier is constrained > 1.0 so the emergency can never fire before the built-in trigger point.
+- **Running but hopeless (takeover).** An autovacuum has been running on the relation for at least `emergency_takeover_min_runtime_seconds` (default 3600) and either the age still crossed the stall line while it ground on, or its heap-progress rate projects completion after the read-only cutoff at the measured XID consumption rate (the launcher samples the 64-bit transaction counter each cycle into `controller_state`; the delta gives transactions/second). The doomed worker is cancelled with `pg_cancel_backend()` and the emergency profile - which skips index cleanup, the usual reason such vacuums crawl - replaces it. The gate is `backend_type = 'autovacuum worker'`, **not** the `(to prevent wraparound)` query tag: a dead-tuple-triggered autovacuum past the wraparound trigger runs the same aggressive freeze without the tag, and that mixed shape is the common production case. A manual `VACUUM` is never judged or cancelled.
 
-Complementarily, a mistuned `autovacuum_freeze_max_age` (< 50M: near-constant forced vacuums; > 1.2B: little headroom before `vacuum_failsafe_age` and the read-only cutoff) is flagged in the global recommendation reason. It has postmaster context, so it is record-only — never applied automatically.
+Complementarily, a mistuned `autovacuum_freeze_max_age` (< 50M: near-constant forced vacuums; > 1.2B: little headroom before `vacuum_failsafe_age` and the read-only cutoff) is flagged in the global recommendation reason. It has postmaster context, so it is record-only - never applied automatically.
 
 The `wraparound_status` view exposes the early-warning model per database (`age(datfrozenxid)` and multixact age, headroom to the read-only cutoff, `ok`/`watch`/`alarm` at half / full `emergency_xid_age`) for external monitoring.
 
@@ -302,7 +312,7 @@ Before the first successful write it captures the complete original `pg_class.re
 
 When desired managed keys change, a security-definer reconciler validates every key against a fixed allowlist and every value as numeric, restores the original value for a key being released, resets keys that did not originally exist, sets the new desired keys, and uses a transaction-local lock timeout. The managed-key allowlist covers the five trigger keys (vacuum threshold/scale/max-threshold, insert threshold/scale) and the two cost keys.
 
-The explicit `original_captured` flag distinguishes "the original options array was NULL" from "no original state has been captured" — without it, a later tier change could capture controller-written options as the baseline.
+The explicit `original_captured` flag distinguishes "the original options array was NULL" from "no original state has been captured" - without it, a later tier change could capture controller-written options as the baseline.
 
 ## 14. Locking and transaction boundaries
 
@@ -312,7 +322,7 @@ Each database policy cycle runs in one transaction through SPI. Relation DDL exe
 
 ### Cluster-setting application
 
-Runs in its own transaction after the policy cycle. The `postgresql.auto.conf` write itself is non-transactional; if the transaction fails after the file write, the row remains pending and the next cycle re-applies the same value — idempotent by construction.
+Runs in its own transaction after the policy cycle. The `postgresql.auto.conf` write itself is non-transactional; if the transaction fails after the file write, the row remains pending and the next cycle re-applies the same value - idempotent by construction.
 
 ### Emergency vacuum
 
@@ -325,7 +335,7 @@ A crash after claim but before completion can leave a queue row in `running`. At
 - Installation requires superuser because it installs C code and a background worker.
 - Internal policy functions are `SECURITY DEFINER` with a fixed search path.
 - Public privileges are revoked from all internal tables and functions; public read access is granted only to the status views and `host_metrics()`.
-- Dynamic SQL receives a relation name built from catalog identifiers; managed keys and values are allowlisted and validated — for table reloptions in SQL, and for cluster GUCs independently in both SQL and C.
+- Dynamic SQL receives a relation name built from catalog identifiers; managed keys and values are allowlisted and validated - for table reloptions in SQL, and for cluster GUCs independently in both SQL and C.
 - Database workers connect as the bootstrap superuser. This is powerful and is a principal reason for conservative defaults, the narrow actuator surface, and the double-validated allowlists.
 
 Production deployments may replace public view access with a monitoring role and should audit all changes to `policy`, `table_policy`, and controller state.
@@ -356,7 +366,7 @@ Required release process for every major version: build against that major's hea
 
 ### Platform compatibility
 
-The SQL layer is operating-system independent. The C layer isolates its platform-specific code to host-metric collection (`#ifdef WIN32` / `#ifdef __linux__` branches); everything else — background workers, signal delivery (`kill(PostmasterPid, SIGHUP)`), `AlterSystemSetConfigFile()`, `vacuum()` — goes through PostgreSQL's own portability layer and works unchanged on Windows.
+The SQL layer is operating-system independent. The C layer isolates its platform-specific code to host-metric collection (`#ifdef WIN32` / `#ifdef __linux__` branches); everything else - background workers, signal delivery (`kill(PostmasterPid, SIGHUP)`), `AlterSystemSetConfigFile()`, `vacuum()` - goes through PostgreSQL's own portability layer and works unchanged on Windows.
 
 On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-built servers (such as the EDB distribution); the provided `build_windows.bat` compiles the DLL with Visual Studio Build Tools directly against the installation's shipped server headers (`include\server\port\win32_msvc`, `win32`, `server`) and links `lib\postgres.lib`. Both artifacts come from the same source file; no platform forks exist.
 
@@ -368,7 +378,7 @@ On Unix the build uses PGXS (`make`). On Windows, PGXS is unavailable for MSVC-b
 4. Create the extension in one noncritical database.
 5. Configure the database policy with dry-run true; enable the cluster GUC and reload.
 6. Observe several cycles: review `decisions`, `global_recommendations`, and proposed values against real churn.
-7. Turn dry-run off. Cluster-setting management activates here — set `manage_global_settings = false` first if cluster changes must stay manual.
+7. Turn dry-run off. Cluster-setting management activates here - set `manage_global_settings = false` first if cluster changes must stay manual.
 8. Confirm reversible restoration, ownership-conflict behavior, and the cluster-change audit trail.
 9. Optionally enable table cost boosts with a small admission limit.
 10. Enable emergency vacuum only after rehearsing blockers, cancellation, timeout, and recovery.

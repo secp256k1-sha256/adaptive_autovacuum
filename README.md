@@ -47,16 +47,16 @@ A background worker checks the whole cluster every minute (configurable). When t
 
 | Setting | Fixed when |
 |---|---|
-| `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) — full manual-vacuum aggression is never set automatically. Lowered if the server is overloaded |
+| `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) - full manual-vacuum aggression is never set automatically. Lowered if the server is overloaded |
 | `autovacuum_max_workers` | more tables are behind than there are workers, or every worker is busy while tables wait. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
 | `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure) |
-| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This is the slice of shared buffers a vacuum or analyze may keep its pages in — bigger means long vacuums stop re-reading the same pages; an idle ring costs nothing. Doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself (no limit) is never touched |
+| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This is the slice of shared buffers a vacuum or analyze may keep its pages in - bigger means long vacuums stop re-reading the same pages; an idle ring costs nothing. Doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself (no limit) is never touched |
 | `autovacuum_vacuum_scale_factor` / `_threshold` | a quarter or more of your tables are behind at the same time. That means the baseline is wrong, not the tables. So the baseline gets corrected instead of patching tables one by one |
 | `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
-| `autovacuum_vacuum_insert_scale_factor` / `_insert_threshold` | the same "baseline is wrong" logic, for insert-only workloads |
+| `autovacuum_vacuum_insert_scale_factor` / `_insert_threshold` | the same "baseline is wrong" logic, for insert-only workloads. On PostgreSQL 18 the insert trigger counts only the not-yet-frozen part of the table, exactly like the server itself |
 | `autovacuum_analyze_scale_factor` / `_analyze_threshold` | kept in proportion whenever the vacuum baseline is corrected, so planner statistics stay fresh too |
 
-Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Prefer to stay in control? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
+Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Each setting is also changed at most once per two check cycles across the whole cluster, no matter how many databases ask for it, so several busy databases can never stack their raises of the same setting on top of each other. Prefer to stay in control? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
 
 ### 2. Gives special tables temporary custom settings
 
@@ -252,7 +252,8 @@ Server settings (`postgresql.conf`):
 | `adaptive_autovacuum.enabled` | `off` | master switch |
 | `adaptive_autovacuum.naptime_seconds` | `60` | how often it checks the cluster |
 | `adaptive_autovacuum.control_database` | `postgres` | where the coordinator connects |
-| `adaptive_autovacuum.database_worker_timeout_seconds` | `3600` | give-up time for one database's check |
+| `adaptive_autovacuum.database_worker_timeout_seconds` | `3600` | give-up time for one database's check (emergency vacuums are exempt - they run in their own worker) |
+| `adaptive_autovacuum.emergency_timeout_seconds` | `86400` | give-up time for one emergency vacuum; `0` = unlimited |
 | `adaptive_autovacuum.log_cycle_summary` | `on` | one log line per database per cycle |
 
 Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The ones most worth knowing:
@@ -320,12 +321,18 @@ The extension steps in only on **evidence that the built-in mechanism is failing
 
 It deliberately does **not** fire at a mere percentage of `autovacuum_freeze_max_age`: a manual vacuum ignores autovacuum's cost throttling, and firing it in territory the built-in vacuum handles anyway would just burn I/O and CPU for nothing. Separately, if `autovacuum_freeze_max_age` itself is set to something unreasonable (below 50 million or above 1.2 billion), the extension flags it in its advice; that setting needs a restart, so it is never changed automatically.
 
+Before escalating at all, the controller checks whether a freeze can even help: if an old snapshot, a prepared transaction, or a replication slot pins the **cleanup horizon** past the failure line, no vacuum can advance the table's age. In that case nothing is queued and nothing is cancelled - the controller records a `horizon_blocked` decision naming the culprit (also queryable any time via `SELECT * FROM adaptive_autovacuum.horizon_blocker()`), because the fix is removing the blocker, not more vacuum I/O.
+
+The age checks deliberately ignore the `min_table_bytes` size filter, the schema exclusions, and per-table opt-outs (a separate safety scan): a tiny or excluded table ages exactly like a big one, and system catalogs are protected too - though a running catalog autovacuum is never cancelled.
+
 The emergency vacuum:
 
 - targets **only** the at-risk table (TOAST included), never the whole database;
 - runs **one at a time** across the whole cluster, worst table first, never a stampede;
+- runs in its **own dedicated worker process** with its own generous time budget (`emergency_timeout_seconds`, default 24 hours), so a long freeze is never killed by the routine per-database timeout and never delays the scan of other databases;
 - uses the fastest safe recipe: freeze everything, **skip index cleanup** (a later normal vacuum tidies the indexes), skip steps that need heavy locks;
 - has its own memory and speed limits, and gives up on locks in seconds instead of hanging;
+- backs off progressively when it keeps failing (5, 10, 15 … minutes between attempts, at most 8 attempts per table per day);
 - recovers automatically if the process running it dies mid-way.
 
 Enabled by default; if you prefer to evaluate without it first, switch it off as step 4 of the rollout.
