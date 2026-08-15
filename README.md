@@ -43,22 +43,22 @@ Out of the box, autovacuum uses conservative settings. On real systems that mean
 
 ### 1. Keeps the cluster-wide autovacuum settings right
 
-A background worker checks every database in turn, then sleeps (`naptime_seconds`, default 60). The time between two checks of the same database is therefore the scan time of the whole cluster plus the naptime, not a fixed minute; on clusters where one database is slow to check, `max_database_workers` lets several databases be checked in parallel. When the data says a global setting is wrong, it fixes settings through the normal `ALTER SYSTEM` + reload config mechanism, with the old value saved so you can always go back:
+A background worker checks every database in turn, then sleeps (`naptime_seconds`, default 60). The time between two checks of the same database is therefore the scan time of the whole cluster plus the naptime, not a fixed minute; `max_database_workers` (default 2) lets databases be checked in parallel so one slow database does not hold up the others. When the data says a global setting is wrong, it fixes settings through the normal `ALTER SYSTEM` + reload config mechanism, with the old value saved so you can always go back:
 
 | Setting | Fixed when |
 |---|---|
 | `autovacuum_vacuum_cost_limit` / `cost_delay` | autovacuums is severely throttled and tables are falling behind. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) - full manual-vacuum aggression is never set automatically. Lowered if the server is overloaded |
 | `autovacuum_max_workers` | more tables are behind than there are workers, or every worker is busy while tables wait. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
-| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure). PostgreSQL docs: "Specifies the maximum amount of memory to be used by each autovacuum worker process" |
-| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. PostgreSQL docs: "Specifies the size of the Buffer Access Strategy used by the VACUUM and ANALYZE commands" - the ring of shared buffers those commands work through. A bigger ring can make maintenance faster, but every ring page displaces a normal cached page, so this stays deliberately conservative: doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself is never touched |
+| `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure).|
+| `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This stays deliberately conservative: doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself is never touched |
 | `autovacuum_vacuum_scale_factor` / `_threshold` | a quarter or more of your tables are behind at the same time. That means the baseline is wrong, not the tables. So the baseline gets corrected instead of patching tables one by one |
-| `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. PostgreSQL docs: "Specifies the maximum number of updated or deleted tuples needed to trigger a VACUUM in any one table". Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
+| `autovacuum_vacuum_max_threshold` | PostgreSQL 18's cap on the dead-row trigger. Sized from your actual data: your biggest table should never wait for more dead rows than its policy target, while normal tables keep using the percentage. Only tightened automatically; a stricter value you set yourself is respected. (Does not exist on PostgreSQL 17, skipped there) |
 | `autovacuum_vacuum_insert_scale_factor` / `_insert_threshold` | the same "baseline is wrong" logic, for insert-only workloads. On PostgreSQL 18 the insert trigger counts only the not-yet-frozen part of the table, exactly like the server itself |
 | `autovacuum_analyze_scale_factor` / `_analyze_threshold` | kept in proportion whenever the vacuum baseline is corrected, so planner statistics stay fresh too |
 
 Changes are validated against a fixed list of allowed settings *and* against each setting's own documented minimum/maximum (a value the server would reject is never queued, and a bad row is marked failed individually instead of blocking the rest), and logged with old and new values in one table you can query. Every setting not on that list is treated as operator-owned and is never touched; `autovacuum` on/off and `autovacuum_freeze_max_age` in particular are only ever flagged in the advice, never changed. Each managed setting is also changed at most once per two check cycles across the whole cluster, no matter how many databases ask for it, so several busy databases can never stack their raises of the same setting on top of each other.
 
-Each database judges the cluster from its own tables, so on a cluster with several busy databases the advice can differ. If that is your shape, set `adaptive_autovacuum.global_settings_database = 'yourdb'` in `postgresql.conf`: exactly one database then owns the cluster-wide settings, and every other database only records its advice. Prefer to stay in control entirely? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
+Cluster-wide decisions rest on cluster-wide evidence: after every check, each managed database publishes a small summary (how many tables it watches, how many are behind, and what trigger settings they want) into shared memory, and every database folds the others' summaries into its own numbers before recommending a cluster setting. A quiet database can no longer talk the cluster out of help that a busy database needs, and vice versa. On top of that you can set `adaptive_autovacuum.global_settings_database = 'yourdb'` in `postgresql.conf` so that exactly one database *influences* the cluster-wide settings and all audit rows land in one place; every other database still contributes its evidence and records its advice. Prefer to stay in control entirely? Set `manage_global_settings = false` and the extension only *writes down its advice* instead of applying it.
 
 ### 2. Gives special tables temporary custom settings
 
@@ -184,12 +184,12 @@ You need the DLL once; build it on any machine with the same PostgreSQL major ve
 windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 ```
 
-The DLL is written to the extension folder root.
+All build outputs land in the `windows\` folder.
 
 4. Copy the files into your installation (Administrator prompt):
 
 ```bat
-copy adaptive_autovacuum.dll            "C:\Program Files\PostgreSQL\18\lib\"
+copy windows\adaptive_autovacuum.dll    "C:\Program Files\PostgreSQL\18\lib\"
 copy adaptive_autovacuum.control        "C:\Program Files\PostgreSQL\18\share\extension\"
 copy sql\adaptive_autovacuum--1.0.0.sql "C:\Program Files\PostgreSQL\18\share\extension\"
 ```
@@ -256,7 +256,7 @@ Server settings (`postgresql.conf`):
 | `adaptive_autovacuum.enabled` | `off` | master switch |
 | `adaptive_autovacuum.naptime_seconds` | `60` | sleep after one full pass over all databases (the revisit period of a database is the pass time plus this) |
 | `adaptive_autovacuum.control_database` | `postgres` | where the coordinator connects |
-| `adaptive_autovacuum.max_database_workers` | `1` | how many databases may be checked at the same time; raise it if one slow database delays the checks of the others |
+| `adaptive_autovacuum.max_database_workers` | `2` | how many databases may be checked at the same time. The default of 2 keeps one busy database (for example one running its in-cycle ANALYZE of a large table) from delaying the checks of the others; set 1 for a strictly serial scan |
 | `adaptive_autovacuum.global_settings_database` | empty | name one database as the sole owner of cluster-wide setting changes; empty lets every managed database apply them (throttled by the shared once-per-two-cycles rule) |
 | `adaptive_autovacuum.database_worker_timeout_seconds` | `3600` | give-up time for one database's check (emergency vacuums are exempt - they run in their own worker) |
 | `adaptive_autovacuum.emergency_timeout_seconds` | `86400` | give-up time for one emergency vacuum; `0` = unlimited |
@@ -283,7 +283,8 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 | `high_wal_mbps` | `0` (off) | storage guardrail: when the cluster writes WAL faster than this many MB/s, the controller treats the server as overloaded (no aggression raises, walk-backs engage). CPU and RAM checks miss a saturated disk; set this below your storage's known sustained write rate |
 | `emergency_stall_multiplier` | `1.5` | how far past its own trigger the built-in vacuum may be before "never started" counts as failure |
 | `emergency_xid_age` / `emergency_mxid_age` | 1 billion | absolute cap on the failure line above |
-| `emergency_takeover_min_runtime_seconds` | `3600` | how long a grinding forced vacuum runs before it may be judged hopeless and taken over |
+| `emergency_takeover_min_runtime_seconds` | `3600` | how long a forced vacuum must have been running before a takeover may even be considered |
+| `emergency_takeover_stall_samples` | `5` | consecutive checks with zero progress (all vacuum progress counters frozen) required before a running forced vacuum is judged stuck and taken over; a moving vacuum is never cancelled |
 
 Everything else (severity ladders, boost tiers, emergency limits, retention) has sensible defaults and is documented as column comments and constraints on the `policy` table.
 
@@ -326,13 +327,13 @@ Every table has a transaction "age" that PostgreSQL must reset with a freeze vac
 The extension steps in only on **evidence that the built-in mechanism is failing**, judged from the built-in vacuum's own behavior. Two situations qualify:
 
 - **It never started.** The table's age is 1.5× past the point where PostgreSQL should have launched a forced vacuum (`emergency_stall_multiplier` × `autovacuum_freeze_max_age`), and no vacuum is running on the table. If the built-in is 50% of its own trigger overdue, something is wrong with it (launcher stuck, workers permanently occupied elsewhere). An absolute cap (`emergency_xid_age`, default **1 billion**, about half the read-only ceiling) keeps this sane on clusters running a very large `autovacuum_freeze_max_age`.
-- **It's running but will never make it.** A forced vacuum has been grinding on the table for a long time (`emergency_takeover_min_runtime_seconds`, default 1 hour), typically stuck in index cleanup, and either the age has kept climbing past the 1.5× line anyway, or its progress rate projects it finishing *after* the read-only cutoff at the cluster's measured transaction consumption rate. The extension then **cancels the doomed autovacuum and takes over** with the fast recipe below; the takeover typically finishes orders of magnitude faster precisely because it skips index cleanup. It never cancels a vacuum a human started.
+- **It's running but provably stuck.** A rising table age does NOT count as evidence against a running vacuum: PostgreSQL only updates the table's frozen-transaction marker at the very end of a vacuum, so the age keeps climbing for the whole runtime of a perfectly healthy one. Instead, the controller samples the vacuum's progress counters (phase, heap blocks scanned and vacuumed, index passes, indexes processed, dead-tuple bytes) every cycle. Only when a forced vacuum has run for at least `emergency_takeover_min_runtime_seconds` (default 1 hour), the age is past the 1.5× line, **and** every one of those counters has been frozen for `emergency_takeover_stall_samples` consecutive checks (default 5) does the extension **cancel the stuck autovacuum and take over** with the fast recipe below. A vacuum that is moving, however slowly, is never cancelled, and neither is a vacuum a human started.
 
 It deliberately does **not** fire at a mere percentage of `autovacuum_freeze_max_age`: a manual vacuum ignores autovacuum's cost throttling, and firing it in territory the built-in vacuum handles anyway would just burn I/O and CPU for nothing. Separately, if `autovacuum_freeze_max_age` itself is set to something unreasonable (below 50 million or above 1.2 billion), the extension flags it in its advice; that setting needs a restart, so it is never changed automatically.
 
 Before escalating at all, the controller checks whether a freeze can even help: if an old snapshot, a prepared transaction, or a replication slot pins the **cleanup horizon** past the failure line, no vacuum can advance the table's age. In that case nothing is queued and nothing is cancelled - the controller records a `horizon_blocked` decision naming the culprit (also queryable any time via `SELECT * FROM adaptive_autovacuum.horizon_blocker()`), because the fix is removing the blocker, not more vacuum I/O.
 
-The age checks deliberately ignore the `min_table_bytes` size filter, the schema exclusions, and per-table opt-outs (a separate safety scan): a tiny or excluded table ages exactly like a big one, and system catalogs are protected too - though a running catalog autovacuum is never cancelled.
+The age checks deliberately ignore the `min_table_bytes` size filter, the schema exclusions, and per-table opt-outs (a separate safety scan): a tiny or excluded table ages exactly like a big one, and system catalogs are protected too. The safety scan never cancels a running vacuum of any kind; it only steps in when no vacuum has started at all.
 
 The emergency vacuum:
 
@@ -388,7 +389,7 @@ Earlier rounds: multi-round pgbench runs (15-36 K TPS mixed workloads against de
   Everything else (per-table triggers and cost boosts, insert-backlog policy, the other cluster-wide settings via `ALTER SYSTEM`, wraparound emergency protection, never-analyzed table detection) behaves identically on 17.
 - **Windows is supported** (validated against PostgreSQL 18.4 and 17.6; Linux validated against 18.6 and 17.11). Container memory limits (cgroups) are Linux-only; on Windows the overload check uses CPU busy %; see the Windows install notes.
 - Cluster changes go into `postgresql.auto.conf`. If Ansible/Patroni/etc. owns your autovacuum settings, either point that tooling elsewhere or run with `manage_global_settings = false`.
-- With many managed databases, each one may apply cluster changes (at most one change of the same setting per two cycles cluster-wide); audit rows land in whichever database acted. Set `adaptive_autovacuum.global_settings_database` to make one database the sole owner.
+- With many managed databases, cluster-wide recommendations are computed from all of them together (each database publishes a per-cycle summary; the merge warms up one cycle after startup). Any managed database may apply the changes (at most one change of the same setting per two cycles cluster-wide); audit rows land in whichever database acted. Set `adaptive_autovacuum.global_settings_database` to make one database the sole applier.
 - **Standby / replica servers:** the workers only start on a server that is open for writes. On a hot standby the extension does nothing at all; after a promotion the launcher starts on its own within seconds. Configuration is not replicated by the extension, so keep `postgresql.conf` settings in step across the pair yourself (or let your HA tooling do it).
 - The policy tables reference tables by internal ID, so after a dump/restore re-apply your policy settings. (Against ID reuse inside a running cluster, `table_policy` rows carry a name fingerprint and are ignored or cleaned up when it stops matching.)
 - Installation requires superuser; the workers run with superuser rights. Host metrics (`host_metrics()`) are readable by superusers and the `pg_monitor` role, not by every user.

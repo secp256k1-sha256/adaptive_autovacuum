@@ -39,24 +39,29 @@ if errorlevel 1 (
     popd & exit /b 1
 )
 
+rem All build outputs (dll, obj, exp, lib) stay inside the windows folder;
+rem the source tree root holds sources only.
 cl /nologo /LD /MD /O2 /W3 ^
    /D WIN32 /D _WINDOWS /D _CRT_SECURE_NO_WARNINGS ^
    /I"%PGROOT%\include\server\port\win32_msvc" ^
    /I"%PGROOT%\include\server\port\win32" ^
    /I"%PGROOT%\include\server" ^
    /I"%PGROOT%\include" ^
+   /Fo"windows\adaptive_autovacuum.obj" ^
    src\adaptive_autovacuum.c ^
-   /link /LIBPATH:"%PGROOT%\lib" postgres.lib /OUT:adaptive_autovacuum.dll
+   /link /LIBPATH:"%PGROOT%\lib" postgres.lib ^
+   /OUT:"windows\adaptive_autovacuum.dll" ^
+   /IMPLIB:"windows\adaptive_autovacuum.lib"
 if errorlevel 1 (
     echo BUILD FAILED
     popd & exit /b 1
 )
 
 echo.
-echo Built adaptive_autovacuum.dll
+echo Built windows\adaptive_autovacuum.dll
 echo.
 echo Install into the running cluster (elevated prompt required):
-echo   copy adaptive_autovacuum.dll                 "%PGROOT%\lib\"
+echo   copy windows\adaptive_autovacuum.dll         "%PGROOT%\lib\"
 echo   copy adaptive_autovacuum.control             "%PGROOT%\share\extension\"
 echo   copy sql\adaptive_autovacuum--1.0.0.sql      "%PGROOT%\share\extension\"
 echo.

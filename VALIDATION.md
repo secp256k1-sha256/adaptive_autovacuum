@@ -547,6 +547,80 @@ Validated the same day on three environments:
 Not yet exercised: the hosted GitHub Actions matrix run (see CI status at the
 top), and max_database_workers > 2.
 
+## Validation performed 2026-08-15 (major review round 3: takeover safety, cluster aggregation)
+
+Changes from the 2026-08-15 major-issues review:
+
+- **Takeover requires observed stall, never age or ETA** (the review's top
+  issue: relfrozenxid only advances at the END of a vacuum, so a rising age
+  is guaranteed for any long healthy vacuum and must never justify
+  cancelling it). Each cycle stores a progress fingerprint per relation
+  (phase, heap_blks_scanned/vacuumed, indexes_processed, index_vacuum_count,
+  dead_tuple_bytes - every pg_stat_progress_vacuum counter that moves in any
+  phase) keyed to the vacuum PID in relation_state. Takeover now requires
+  minimum runtime AND age past the stall line AND an unchanged fingerprint
+  for emergency_takeover_stall_samples consecutive samples (new knob,
+  default 5, CHECK >= 2). The heap-scan ETA branch was removed from the
+  cancellation decision (it mispredicts index-dominated vacuums), and the
+  safety scan no longer cancels anything (it has no per-relation state, so
+  stall evidence cannot exist there; never-started escalation only).
+- **True cluster-level aggregation for global GUCs**: after every cycle each
+  database worker publishes a summary (eligible/overdue/dead-overdue/
+  insert-overdue counts, fleet ceiling target, trigger-setting medians) into
+  a 64-slot shared-memory array; before each cycle the worker hands the
+  aggregate of the OTHER databases' fresh slots (10-naptime staleness
+  window) to _run_cycle as jsonb. The mistuned-baseline detectors, worker
+  recommendation, and overdue cost branch run on the merged values; medians
+  merge as overdue-count-weighted averages; the reason text states the
+  cluster evidence. global_settings_database remains the single-applier
+  control.
+- **PG17 version-specific regression assertions** (the CI matrix itself was
+  added 2026-08-14): the suite now asserts that autovacuum_vacuum_max_threshold
+  is recommended and queued on 18 but neither recommended nor queued on 17,
+  from the same shared expected file.
+
+Validated the same day on Windows and Linux localhost :
+
+- **Windows 11, EDB PG 18.4 (live service)**: MSVC builds clean vs 18.4 and
+  17.6 headers. Full regression file byte-identical (modulo psql -f line
+  prefixes). Aggregation end-to-end through real background workers and
+  shared memory: a database with six staged overdue tables and an EMPTY
+  database both produced cluster recommendations carrying "Cluster-wide
+  evidence: 2 databases, 6 eligible relations, 6 overdue"; the empty
+  database recommended the busy database's weighted medians (scale ~0.2,
+  threshold 500), its fleet ceiling (5000), and workers 6 - the exact
+  db2-develops-debt scenario from the review. Takeover NEGATIVE drill: a
+  grinding anti-wraparound autovacuum (cost_limit=1/delay=100 reloptions,
+  age 160,003 past the 150,000 stall line, runtime 113 s past the 60 s
+  minimum - conditions under which the previous logic cancelled) was left
+  alone: stalled_cycles stayed 0, decisions showed only
+  vacuum_already_running, zero takeover decisions, empty queue, same pid
+  still vacuuming.
+- **WSL AlmaLinux 9**: make installcheck green twice (no-preload +
+  preloaded) on PGDG 18.6 AND 17.11 - the PG17 leg exercising the new
+  version-gate assertions on a real 17 server. Takeover POSITIVE drill on
+  18.6: the same grinding autovacuum was first observed moving for several
+  controller samples (stalled_cycles 0, no takeover), then SIGSTOPped;
+  stalled_cycles climbed and exactly ONE queue_emergency_takeover fired at
+  the 3rd consecutive frozen sample ("zero observable progress for 3
+  consecutive checks", runtime 108 s), pg_cancel_backend was issued, and
+  after the stopped worker exited the emergency vacuum completed (age
+  160,041 -> 5). The first emergency attempt correctly failed on its lock
+  timeout while the cancelled worker still held the lock and was retried
+  via the queue - the designed backoff path, observed live.
+
+Follow-up the same day: `adaptive_autovacuum.max_database_workers` default
+raised from 1 to 2. Emergency vacuums already run outside the scheduler
+slots, but the in-cycle ANALYZE of a large never-analyzed table can still
+make one database's cycle slow, and with the serial default that delayed
+every other database's wraparound checks; 2 is also the configuration the
+concurrency drills validated. 1 remains available for a strictly serial
+scan.
+
+Not yet exercised: the hosted CI matrix run on GitHub Actions, aggregation
+with more than two databases, and a lab-scale soak of the new takeover
+logic.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:

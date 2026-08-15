@@ -125,6 +125,7 @@ SELECT emergency_xid_age = 1000000000
        AND emergency_mxid_age = 1000000000
        AND emergency_stall_multiplier = 1.5
        AND emergency_takeover_min_runtime_seconds = 3600
+       AND emergency_takeover_stall_samples = 5
        AS emergency_trigger_defaults
 FROM adaptive_autovacuum.policy;
 t
@@ -236,6 +237,40 @@ FROM adaptive_autovacuum.decisions
 WHERE relid = 'aav_no_stats'::regclass
   AND action = 'analyze';
 t
+-- Cluster-evidence merge: with no local relations eligible, an injected
+-- summary of two other databases must drive the cluster recommendation.
+-- Also exercises the PG17/PG18 branches around the trigger ceiling.
+UPDATE adaptive_autovacuum.policy
+SET manage_global_settings = true,
+    min_table_bytes = 9223372036854775807;
+SELECT o_eligible = 0 AND o_overdue = 0 AS local_summary_row_returned
+FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0,
+    '{"db_count":2,"eligible":8,"overdue":6,"dead_overdue":6,"insert_overdue":0,"fleet_max_target":50000,"w_scale_sum":0.06,"w_thresh_sum":3000,"w_ins_scale_sum":0,"w_ins_thresh_sum":0}'::jsonb);
+t
+SELECT recommended_vacuum_scale_factor BETWEEN 0.0099 AND 0.0101
+       AND recommended_vacuum_threshold = 500
+       AND reason LIKE '%Cluster-wide evidence: 3 databases%'
+       AS cluster_merge_drives_recommendation
+FROM adaptive_autovacuum.latest_global_recommendation;
+t
+SELECT (recommended_vacuum_max_threshold IS NOT NULL)
+       = (current_setting('server_version_num')::integer >= 180000)
+       AS trigger_ceiling_only_on_pg18
+FROM adaptive_autovacuum.latest_global_recommendation;
+t
+SELECT count(*) = CASE WHEN current_setting('server_version_num')::integer >= 180000
+                       THEN 1 ELSE 0 END
+       AS max_threshold_queued_only_on_pg18
+FROM adaptive_autovacuum.global_apply_queue
+WHERE guc_name = 'autovacuum_vacuum_max_threshold';
+t
+SELECT count(*) = 1 AS scale_factor_queued_from_cluster_evidence
+FROM adaptive_autovacuum.global_apply_queue
+WHERE guc_name = 'autovacuum_vacuum_scale_factor'
+  AND desired_value = '0.01';
+t
+DELETE FROM adaptive_autovacuum.global_apply_queue;
+UPDATE adaptive_autovacuum.policy SET manage_global_settings = false;
 DROP TABLE aav_no_stats;
 DROP TABLE aav_test;
 DROP EXTENSION adaptive_autovacuum;

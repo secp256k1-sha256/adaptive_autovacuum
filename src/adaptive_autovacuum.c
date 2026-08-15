@@ -113,18 +113,53 @@ typedef struct AAVEmergencyRequest
 /* Fixed capacity for per-GUC apply timestamps; must cover the whitelist. */
 #define AAV_GLOBAL_GUC_SLOTS 16
 
+/* One managed database's most recent cycle summary, published after every
+   policy cycle so the other databases' cluster merges can see it.  This is
+   what makes cluster-wide GUC recommendations rest on cluster-wide evidence
+   instead of one database's tables. */
+typedef struct AAVDbSummary
+{
+    Oid dboid;
+    TimestampTz updated_at;
+    int32 eligible;
+    int32 overdue;
+    int32 dead_overdue;
+    int32 insert_overdue;
+    int64 fleet_max_target;
+    double median_scale;
+    double median_thresh;
+    double median_ins_scale;
+    double median_ins_thresh;
+} AAVDbSummary;
+
+#define AAV_SUMMARY_SLOTS 64
+
+/* Aggregate of the other databases' summaries handed to the SQL policy. */
+typedef struct AAVClusterAgg
+{
+    int db_count;
+    int64 eligible;
+    int64 overdue;
+    int64 dead_overdue;
+    int64 insert_overdue;
+    int64 fleet_max_target;
+    double w_scale_sum;
+    double w_thresh_sum;
+    double w_ins_scale_sum;
+    double w_ins_thresh_sum;
+} AAVClusterAgg;
+
 typedef struct AAVSharedState
 {
     slock_t mutex;
     pid_t emergency_worker_pid;
     Oid emergency_database_oid;
     /* Last successful cluster-wide apply per whitelisted GUC, indexed by the
-       GUC's position in aav_allowed_global_gucs.  Every database evaluates
-       the cluster from its own tables only, so without a shared brake N busy
-       databases could each double the same setting within one launcher
-       sweep; this limits any one GUC to one apply per cooldown window
-       cluster-wide. */
+       GUC's position in aav_allowed_global_gucs; limits any one GUC to one
+       apply per cooldown window cluster-wide. */
     TimestampTz global_applied_at[AAV_GLOBAL_GUC_SLOTS];
+    /* Latest per-database cycle summaries (see AAVDbSummary). */
+    AAVDbSummary summaries[AAV_SUMMARY_SLOTS];
 } AAVSharedState;
 
 static AAVSharedState *aav_shared_state = NULL;
@@ -152,6 +187,8 @@ static bool aav_start_database_worker(Oid dboid, const char *dbname,
                                       BackgroundWorkerHandle **handle);
 static bool aav_extension_enabled_in_database(void);
 static void aav_execute_policy_cycle(const AAVHostMetrics *metrics);
+static int aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg);
+static void aav_publish_summary(const AAVDbSummary *summary);
 static void aav_apply_global_settings(void);
 static bool aav_has_pending_emergency_request(void);
 static bool aav_start_emergency_worker(Oid dboid);
@@ -228,15 +265,17 @@ _PG_init(void)
                             NULL,
                             NULL);
 
-    /* One slow database (large policy scan, lock waits, slow ANALYZE) must
-       not delay the wraparound checks of every database scheduled after it;
-       raising this lets the launcher overlap database workers.  1 preserves
-       the strictly serial scan. */
+    /* One slow database (large policy scan, lock waits, or the in-cycle
+       ANALYZE of a big never-analyzed table) must not delay the wraparound
+       checks of every database scheduled after it.  Emergency VACUUMs
+       already run in their own dedicated worker; the default of 2 keeps the
+       routine checks flowing past one busy database as well.  1 gives the
+       strictly serial scan. */
     DefineCustomIntVariable("adaptive_autovacuum.max_database_workers",
                             "Database workers the launcher may run concurrently.",
                             NULL,
                             &aav_max_database_workers,
-                            1,
+                            2,
                             1,
                             16,
                             PGC_SIGHUP,
@@ -894,9 +933,9 @@ typedef struct AAVWorkerSlot
 
 /*
  * Run one database worker per listed database, at most max_database_workers
- * concurrently.  The default of 1 is the historical strictly serial scan;
- * higher values keep one slow database from delaying the wraparound checks
- * of every database scheduled after it.  Each worker still gets its own
+ * concurrently (default 2, so one slow database cannot delay the wraparound
+ * checks of every database scheduled after it; 1 gives the historical
+ * strictly serial scan).  Each worker still gets its own
  * database_worker_timeout_seconds budget.
  */
 static void
@@ -1115,12 +1154,96 @@ aav_extension_enabled_in_database(void)
     return installed && enabled;
 }
 
+/*
+ * Sum the other managed databases' latest cycle summaries.  Slots older than
+ * ten naptimes are ignored (their database is gone, disabled, or the cluster
+ * was just restarted).  Returns the number of contributing databases.
+ */
+static int
+aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
+{
+    TimestampTz now = GetCurrentTimestamp();
+    int i;
+
+    MemSet(agg, 0, sizeof(*agg));
+
+    if (aav_shared_state == NULL)
+        aav_attach_shared_state();
+    if (aav_shared_state == NULL)
+        return 0;
+
+    SpinLockAcquire(&aav_shared_state->mutex);
+    for (i = 0; i < AAV_SUMMARY_SLOTS; i++)
+    {
+        const AAVDbSummary *s = &aav_shared_state->summaries[i];
+
+        if (s->dboid == InvalidOid || s->dboid == exclude_dboid)
+            continue;
+        if (TimestampDifferenceExceeds(s->updated_at, now,
+                                       10 * aav_naptime_seconds * 1000))
+            continue;
+
+        agg->db_count++;
+        agg->eligible += s->eligible;
+        agg->overdue += s->overdue;
+        agg->dead_overdue += s->dead_overdue;
+        agg->insert_overdue += s->insert_overdue;
+        agg->fleet_max_target = Max(agg->fleet_max_target,
+                                    s->fleet_max_target);
+        agg->w_scale_sum += s->median_scale * s->dead_overdue;
+        agg->w_thresh_sum += s->median_thresh * s->dead_overdue;
+        agg->w_ins_scale_sum += s->median_ins_scale * s->insert_overdue;
+        agg->w_ins_thresh_sum += s->median_ins_thresh * s->insert_overdue;
+    }
+    SpinLockRelease(&aav_shared_state->mutex);
+
+    return agg->db_count;
+}
+
+static void
+aav_publish_summary(const AAVDbSummary *summary)
+{
+    int i;
+    int free_slot = -1;
+    int oldest_slot = 0;
+    TimestampTz oldest = 0;
+
+    if (aav_shared_state == NULL)
+        aav_attach_shared_state();
+    if (aav_shared_state == NULL)
+        return;
+
+    SpinLockAcquire(&aav_shared_state->mutex);
+    for (i = 0; i < AAV_SUMMARY_SLOTS; i++)
+    {
+        AAVDbSummary *s = &aav_shared_state->summaries[i];
+
+        if (s->dboid == summary->dboid)
+        {
+            free_slot = i;
+            break;
+        }
+        if (s->dboid == InvalidOid && free_slot < 0)
+            free_slot = i;
+        if (i == 0 || s->updated_at < oldest)
+        {
+            oldest = s->updated_at;
+            oldest_slot = i;
+        }
+    }
+    if (free_slot < 0)
+        free_slot = oldest_slot;    /* > 64 databases: evict the stalest */
+    aav_shared_state->summaries[free_slot] = *summary;
+    SpinLockRelease(&aav_shared_state->mutex);
+}
+
 static void
 aav_execute_policy_cycle(const AAVHostMetrics *metrics)
 {
-    Oid argtypes[4] = {FLOAT8OID, INT4OID, INT8OID, INT8OID};
-    Datum values[4];
-    char nulls[4] = {' ', ' ', ' ', ' '};
+    Oid argtypes[5] = {FLOAT8OID, INT4OID, INT8OID, INT8OID, TEXTOID};
+    Datum values[5];
+    char nulls[5] = {' ', ' ', ' ', ' ', ' '};
+    AAVClusterAgg agg;
     int spi_rc;
 
     values[0] = Float8GetDatum(metrics->load1);
@@ -1128,13 +1251,45 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
     values[2] = Int64GetDatum(metrics->mem_available_bytes);
     values[3] = Int64GetDatum(metrics->mem_total_bytes);
 
+    if (aav_collect_cluster_summary(MyDatabaseId, &agg) > 0)
+    {
+        char *summary_json = psprintf(
+            "{\"db_count\":%d,"
+            "\"eligible\":" INT64_FORMAT ","
+            "\"overdue\":" INT64_FORMAT ","
+            "\"dead_overdue\":" INT64_FORMAT ","
+            "\"insert_overdue\":" INT64_FORMAT ","
+            "\"fleet_max_target\":" INT64_FORMAT ","
+            "\"w_scale_sum\":%.9g,"
+            "\"w_thresh_sum\":%.9g,"
+            "\"w_ins_scale_sum\":%.9g,"
+            "\"w_ins_thresh_sum\":%.9g}",
+            agg.db_count,
+            agg.eligible,
+            agg.overdue,
+            agg.dead_overdue,
+            agg.insert_overdue,
+            agg.fleet_max_target,
+            agg.w_scale_sum,
+            agg.w_thresh_sum,
+            agg.w_ins_scale_sum,
+            agg.w_ins_thresh_sum);
+
+        values[4] = CStringGetTextDatum(summary_json);
+    }
+    else
+    {
+        values[4] = (Datum) 0;
+        nulls[4] = 'n';
+    }
+
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
     spi_rc = SPI_execute_with_args(
-        "SELECT adaptive_autovacuum._run_cycle($1, $2, $3, $4)",
-        4,
+        "SELECT * FROM adaptive_autovacuum._run_cycle($1, $2, $3, $4, $5::jsonb)",
+        5,
         argtypes,
         values,
         nulls,
@@ -1144,6 +1299,41 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
     if (spi_rc != SPI_OK_SELECT)
         elog(ERROR, "adaptive autovacuum policy cycle returned SPI code %d",
              spi_rc);
+
+    /* Publish this database's summary (zero rows = policy disabled). */
+    if (SPI_processed == 1)
+    {
+        HeapTuple tuple = SPI_tuptable->vals[0];
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        AAVDbSummary summary;
+        bool isnull;
+        Datum datum;
+
+        MemSet(&summary, 0, sizeof(summary));
+        summary.dboid = MyDatabaseId;
+        summary.updated_at = GetCurrentTimestamp();
+
+        datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+        summary.eligible = isnull ? 0 : DatumGetInt32(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+        summary.overdue = isnull ? 0 : DatumGetInt32(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+        summary.dead_overdue = isnull ? 0 : DatumGetInt32(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+        summary.insert_overdue = isnull ? 0 : DatumGetInt32(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+        summary.fleet_max_target = isnull ? 0 : DatumGetInt64(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 6, &isnull);
+        summary.median_scale = isnull ? 0.0 : DatumGetFloat8(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 7, &isnull);
+        summary.median_thresh = isnull ? 0.0 : DatumGetFloat8(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 8, &isnull);
+        summary.median_ins_scale = isnull ? 0.0 : DatumGetFloat8(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 9, &isnull);
+        summary.median_ins_thresh = isnull ? 0.0 : DatumGetFloat8(datum);
+
+        aav_publish_summary(&summary);
+    }
 
     PopActiveSnapshot();
     SPI_finish();
