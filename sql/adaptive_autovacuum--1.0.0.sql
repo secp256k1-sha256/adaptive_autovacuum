@@ -10,6 +10,21 @@ LANGUAGE C
 VOLATILE
 PARALLEL UNSAFE;
 
+/* Shared-memory summary capacity: available=false when the library is not preloaded. */
+CREATE FUNCTION adaptive_autovacuum.cluster_summary_status(
+    OUT available boolean,
+    OUT capacity integer,
+    OUT used integer,
+    OUT overflow boolean,
+    OUT overflow_count bigint,
+    OUT last_overflow_at timestamptz,
+    OUT oldest_summary_at timestamptz)
+RETURNS record
+AS 'MODULE_PATHNAME', 'adaptive_autovacuum_cluster_summary_status'
+LANGUAGE C
+VOLATILE
+PARALLEL UNSAFE;
+
 CREATE TABLE adaptive_autovacuum.policy
 (
     singleton                       boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -300,6 +315,22 @@ AS $$
     LIMIT 1
 $$;
 
+/* relpages when known; exact size only for unanalyzed relations with enough tuples to matter. */
+CREATE FUNCTION adaptive_autovacuum._relation_bytes(
+    relpages integer, live_tuples bigint, dead_tuples bigint,
+    min_table_bytes bigint, block_size bigint, relid oid)
+RETURNS bigint
+LANGUAGE sql
+VOLATILE
+PARALLEL UNSAFE
+AS $$
+    SELECT CASE
+        WHEN relpages > 0 THEN relpages::bigint * block_size
+        WHEN live_tuples + dead_tuples >= min_table_bytes / block_size THEN pg_total_relation_size(relid)
+        ELSE 0::bigint
+    END
+$$;
+
 CREATE FUNCTION adaptive_autovacuum._managed_values_match(
     options text[], managed_values jsonb)
 RETURNS boolean
@@ -469,6 +500,8 @@ DECLARE
 
     /* PG17 compatibility switch; PG18-only surface is skipped below it. */
     server_vnum integer := current_setting('server_version_num')::integer;
+    block_size bigint := current_setting('block_size')::bigint;
+    evidence_complete boolean := true;
 
     host_memory_percent double precision;
     host_load_per_cpu double precision;
@@ -843,6 +876,29 @@ BEGIN
     WHERE state.managed_values ? 'autovacuum_vacuum_cost_limit'
       AND NOT state.ownership_conflict;
 
+    /* Fleet aggregates over every eligible relation; the loop below only sees the interesting ones. */
+    SELECT count(*),
+           COALESCE(max(LEAST(COALESCE(tp.target_dead_tuple_max, p.target_dead_tuple_max),
+                              GREATEST(COALESCE(tp.target_dead_tuple_min, p.target_dead_tuple_min),
+                                       ceil(GREATEST(pg_stat_get_live_tuples(c.oid)::double precision,
+                                                     c.reltuples::double precision, 1)
+                                            * COALESCE(tp.target_dead_tuple_ratio, p.target_dead_tuple_ratio))::bigint))),
+                    0)
+    INTO scanned_relation_count, fleet_max_target
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN adaptive_autovacuum.table_policy tp
+           ON tp.relid = c.oid
+          AND tp.schema_name = n.nspname
+          AND tp.relation_name = c.relname
+    WHERE c.relkind = 'r'
+      AND c.relpersistence <> 't'
+      AND NOT (n.nspname = ANY (p.excluded_schemas))
+      AND COALESCE(tp.enabled, true)
+      AND adaptive_autovacuum._relation_bytes(c.relpages, pg_stat_get_live_tuples(c.oid),
+                                              pg_stat_get_dead_tuples(c.oid), p.min_table_bytes,
+                                              block_size, c.oid) >= p.min_table_bytes;
+
     FOR r IN
         WITH active_vacuum AS
         (
@@ -867,7 +923,9 @@ BEGIN
             WHERE pv.datid = (SELECT d.oid
                               FROM pg_catalog.pg_database d
                               WHERE d.datname = pg_catalog.current_database())
-        )
+        ),
+        cand AS
+        (
         SELECT
             c.oid AS relid,
             format('%I.%I', n.nspname, c.relname) AS fqname,
@@ -884,32 +942,28 @@ BEGIN
             GREATEST(mxid_age(c.relminmxid),
                      COALESCE(mxid_age(tc.relminmxid), 0))::bigint AS mxid_age,
             autovacuum_enabled_global
-                AND COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_enabled')::boolean, true)
+                AND COALESCE(opt.ro_autovacuum_enabled::boolean, true)
                 AS normal_autovacuum_enabled,
             CASE
-                WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age') IS NULL
-                  OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint < 0
+                WHEN opt.ro_freeze_max_age IS NULL OR opt.ro_freeze_max_age::bigint < 0
                 THEN freeze_max_age
-                ELSE LEAST(freeze_max_age,
-                           adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint)
+                ELSE LEAST(freeze_max_age, opt.ro_freeze_max_age::bigint)
             END AS effective_xid_freeze_max_age,
             CASE
-                WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age') IS NULL
-                  OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint < 0
+                WHEN opt.ro_multixact_freeze_max_age IS NULL OR opt.ro_multixact_freeze_max_age::bigint < 0
                 THEN multixact_freeze_max_age
-                ELSE LEAST(multixact_freeze_max_age,
-                           adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint)
+                ELSE LEAST(multixact_freeze_max_age, opt.ro_multixact_freeze_max_age::bigint)
             END AS effective_mxid_freeze_max_age,
-            COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_threshold')::double precision,
+            COALESCE(opt.ro_vacuum_threshold::double precision,
                      current_vacuum_threshold) AS vacuum_threshold,
-            COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_scale_factor')::double precision,
+            COALESCE(opt.ro_vacuum_scale_factor::double precision,
                      current_vacuum_scale_factor) AS vacuum_scale_factor,
-            COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_max_threshold')::double precision,
+            COALESCE(opt.ro_vacuum_max_threshold::double precision,
                      current_vacuum_max_threshold) AS vacuum_max_threshold,
             pg_stat_get_ins_since_vacuum(c.oid)::bigint AS inserts_since_vacuum,
-            COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_threshold')::double precision,
+            COALESCE(opt.ro_insert_threshold::double precision,
                      current_insert_threshold) AS insert_threshold,
-            COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_scale_factor')::double precision,
+            COALESCE(opt.ro_insert_scale_factor::double precision,
                      current_insert_scale_factor) AS insert_scale_factor,
             /* PG18 scales the insert trigger by the unfrozen page share (relallfrozen); 1.0 on PG17. */
             CASE
@@ -961,12 +1015,23 @@ BEGIN
         LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
         LEFT JOIN adaptive_autovacuum.relation_state rs ON rs.relid = c.oid
         CROSS JOIN LATERAL (
-            /* relpages avoids per-relation locks; exact size only while unanalyzed. */
-            SELECT CASE WHEN c.relpages > 0
-                        THEN c.relpages::bigint
-                             * pg_catalog.current_setting('block_size')::bigint
-                        ELSE pg_total_relation_size(c.oid)
-                   END AS total_bytes
+            /* Every reloption the policy reads, parsed in one pass per relation. */
+            SELECT
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_enabled') AS ro_autovacuum_enabled,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_freeze_max_age') AS ro_freeze_max_age,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_multixact_freeze_max_age') AS ro_multixact_freeze_max_age,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_threshold') AS ro_vacuum_threshold,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_scale_factor') AS ro_vacuum_scale_factor,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_max_threshold') AS ro_vacuum_max_threshold,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_insert_threshold') AS ro_insert_threshold,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_insert_scale_factor') AS ro_insert_scale_factor
+            FROM unnest(c.reloptions) AS o
+        ) opt
+        CROSS JOIN LATERAL (
+            /* relpages avoids per-relation locks; exact size only for big unanalyzed relations. */
+            SELECT adaptive_autovacuum._relation_bytes(c.relpages, pg_stat_get_live_tuples(c.oid),
+                                                       pg_stat_get_dead_tuples(c.oid), p.min_table_bytes,
+                                                       block_size, c.oid) AS total_bytes
         ) sz
         LEFT JOIN active_vacuum av ON av.relid = c.oid
         /* Identity-checked: fingerprint mismatch (OID reuse / rename) is ignored. */
@@ -979,48 +1044,42 @@ BEGIN
           AND NOT (n.nspname = ANY (p.excluded_schemas))
           AND COALESCE(tp.enabled, true)
           AND sz.total_bytes >= p.min_table_bytes
-        ORDER BY
-            GREATEST(
-                GREATEST(age(c.relfrozenxid),
-                         COALESCE(age(tc.relfrozenxid), 0))::double precision / NULLIF(
-                    CASE
-                        WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age') IS NULL
-                          OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint < 0
-                        THEN freeze_max_age
-                        ELSE LEAST(freeze_max_age, adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_freeze_max_age')::bigint)
-                    END, 0),
-                GREATEST(mxid_age(c.relminmxid),
-                         COALESCE(mxid_age(tc.relminmxid), 0))::double precision / NULLIF(
-                    CASE
-                        WHEN adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age') IS NULL
-                          OR adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint < 0
-                        THEN multixact_freeze_max_age
-                        ELSE LEAST(multixact_freeze_max_age, adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_multixact_freeze_max_age')::bigint)
-                    END, 0),
-                pg_stat_get_dead_tuples(c.oid)::double precision /
-                    GREATEST(
-                        1,
-                        COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_threshold')::double precision,
-                                 current_vacuum_threshold)
-                        + COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_scale_factor')::double precision,
-                                   current_vacuum_scale_factor)
-                          * GREATEST(c.reltuples, 0)
-                    ),
-                CASE
-                    WHEN COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_threshold')::double precision,
-                                  current_insert_threshold) < 0
-                    THEN 0
-                    ELSE pg_stat_get_ins_since_vacuum(c.oid)::double precision /
-                         GREATEST(
-                             1,
-                             COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_threshold')::double precision,
-                                      current_insert_threshold)
-                             + COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_scale_factor')::double precision,
-                                        current_insert_scale_factor)
-                               * GREATEST(c.reltuples, 0)
-                         )
-                END
-            ) DESC
+        ),
+        scored AS
+        (
+        /* The loop body's pressure formulas, computed once per relation for filter and order. */
+        SELECT cand.*,
+               cand.dead_tuples / GREATEST(1,
+                   CASE WHEN cand.vacuum_max_threshold < 0
+                        THEN cand.vacuum_threshold
+                             + cand.vacuum_scale_factor * GREATEST(cand.reltuples, 0)
+                        ELSE LEAST(cand.vacuum_max_threshold,
+                                   cand.vacuum_threshold
+                                   + cand.vacuum_scale_factor * GREATEST(cand.reltuples, 0))
+                   END) AS pre_backlog_ratio,
+               CASE WHEN cand.insert_threshold IS NULL OR cand.insert_threshold < 0 THEN 0
+                    ELSE cand.inserts_since_vacuum / GREATEST(1,
+                             cand.insert_threshold
+                             + cand.insert_scale_factor * GREATEST(cand.reltuples, 0)
+                               * cand.insert_pcnt_unfrozen)
+               END AS pre_insert_ratio,
+               cand.xid_age / NULLIF(cand.effective_xid_freeze_max_age, 0)::double precision AS pre_xid_ratio,
+               cand.mxid_age / NULLIF(cand.effective_mxid_freeze_max_age, 0)::double precision AS pre_mxid_ratio
+        FROM cand
+        )
+        /* Pre-filter: only relations that can be non-normal, carry state, or have a vacuum running. */
+        SELECT *
+        FROM scored
+        WHERE scored.state_exists
+           OR scored.vacuum_pid IS NOT NULL
+           OR scored.pre_backlog_ratio >= p.backlog_elevated_ratio * 0.5
+           OR scored.pre_insert_ratio >= p.backlog_elevated_ratio * 0.5
+           OR scored.pre_xid_ratio >= p.xid_warning_ratio * 0.5
+           OR scored.pre_mxid_ratio >= p.mxid_warning_ratio * 0.5
+        ORDER BY GREATEST(COALESCE(scored.pre_xid_ratio, 0),
+                          COALESCE(scored.pre_mxid_ratio, 0),
+                          scored.pre_backlog_ratio,
+                          scored.pre_insert_ratio) DESC
     LOOP
         /* PG17: vacuum_max_threshold is NULL, so this degrades to the uncapped formula. */
         IF r.vacuum_max_threshold < 0 THEN
@@ -1031,8 +1090,6 @@ BEGIN
                                     r.vacuum_threshold
                                     + r.vacuum_scale_factor * GREATEST(r.reltuples, 0));
         END IF;
-
-        scanned_relation_count := scanned_relation_count + 1;
 
         vacuum_trigger := GREATEST(vacuum_trigger, 1);
         backlog_ratio := r.dead_tuples / vacuum_trigger;
@@ -1218,8 +1275,6 @@ BEGIN
         );
         desired_max_threshold := GREATEST(desired_threshold, target_dead_tuples)::integer;
 
-        /* Largest per-relation dead-tuple target drives the PG18 trigger ceiling. */
-        fleet_max_target := GREATEST(fleet_max_target, target_dead_tuples);
 
         /* Feed the mistuned-baseline detector with this relation's desired triggers. */
         IF backlog_ratio >= p.backlog_elevated_ratio THEN
@@ -1342,33 +1397,40 @@ BEGIN
             END IF;
         END IF;
 
-        relation_json := jsonb_build_object(
-            'total_bytes', r.total_bytes,
-            'live_tuples', r.live_tuples,
-            'dead_tuples', r.dead_tuples,
-            'vacuum_trigger', vacuum_trigger,
-            'backlog_ratio', backlog_ratio,
-            'inserts_since_vacuum', r.inserts_since_vacuum,
-            'insert_backlog_ratio', insert_ratio,
-            'xid_age', r.xid_age,
-            'xid_ratio', xid_ratio,
-            'mxid_age', r.mxid_age,
-            'mxid_ratio', mxid_ratio,
-            'effective_xid_freeze_max_age', r.effective_xid_freeze_max_age,
-            'effective_mxid_freeze_max_age', r.effective_mxid_freeze_max_age,
-            'normal_autovacuum_enabled', r.normal_autovacuum_enabled,
-            'vacuum_pid', r.vacuum_pid,
-            'vacuum_phase', r.phase,
-            'vacuum_elapsed', r.vacuum_elapsed,
-            'heap_blks_total', r.heap_blks_total,
-            'heap_blks_scanned', r.heap_blks_scanned,
-            'index_vacuum_count', r.index_vacuum_count,
-            'max_dead_tuple_bytes', r.max_dead_tuple_bytes,
-            'dead_tuple_bytes', r.dead_tuple_bytes,
-            'delay_time_ms', r.delay_time,
-            'antiwraparound', r.antiwraparound,
-            'vacuum_stalled_cycles', vacuum_stalled_cycles
-        );
+        /* Built only when a decision row can be written this cycle. */
+        relation_json := NULL;
+        IF relation_state <> 'normal'
+           OR previous.state <> 'normal'
+           OR previous.managed_values <> '{}'::jsonb
+           OR previous.ownership_conflict THEN
+            relation_json := jsonb_build_object(
+                'total_bytes', r.total_bytes,
+                'live_tuples', r.live_tuples,
+                'dead_tuples', r.dead_tuples,
+                'vacuum_trigger', vacuum_trigger,
+                'backlog_ratio', backlog_ratio,
+                'inserts_since_vacuum', r.inserts_since_vacuum,
+                'insert_backlog_ratio', insert_ratio,
+                'xid_age', r.xid_age,
+                'xid_ratio', xid_ratio,
+                'mxid_age', r.mxid_age,
+                'mxid_ratio', mxid_ratio,
+                'effective_xid_freeze_max_age', r.effective_xid_freeze_max_age,
+                'effective_mxid_freeze_max_age', r.effective_mxid_freeze_max_age,
+                'normal_autovacuum_enabled', r.normal_autovacuum_enabled,
+                'vacuum_pid', r.vacuum_pid,
+                'vacuum_phase', r.phase,
+                'vacuum_elapsed', r.vacuum_elapsed,
+                'heap_blks_total', r.heap_blks_total,
+                'heap_blks_scanned', r.heap_blks_scanned,
+                'index_vacuum_count', r.index_vacuum_count,
+                'max_dead_tuple_bytes', r.max_dead_tuple_bytes,
+                'dead_tuple_bytes', r.dead_tuple_bytes,
+                'delay_time_ms', r.delay_time,
+                'antiwraparound', r.antiwraparound,
+                'vacuum_stalled_cycles', vacuum_stalled_cycles
+            );
+        END IF;
 
         cooldown_ok := previous.last_change_at IS NULL
                        OR clock_timestamp() - previous.last_change_at
@@ -1709,11 +1771,9 @@ BEGIN
           AND NOT (c.relkind = 'r'
                    AND NOT (n.nspname = ANY (p.excluded_schemas))
                    AND COALESCE(tp.enabled, true)
-                   AND (CASE WHEN c.relpages > 0
-                             THEN c.relpages::bigint
-                                  * pg_catalog.current_setting('block_size')::bigint
-                             ELSE pg_total_relation_size(c.oid)
-                        END) >= p.min_table_bytes)
+                   AND adaptive_autovacuum._relation_bytes(c.relpages, pg_stat_get_live_tuples(c.oid),
+                                                           pg_stat_get_dead_tuples(c.oid), p.min_table_bytes,
+                                                           block_size, c.oid) >= p.min_table_bytes)
           /* age already past this relation's stall line */
           AND (GREATEST(age(c.relfrozenxid),
                         COALESCE(age(tc.relfrozenxid), 0))::bigint
@@ -2074,6 +2134,13 @@ BEGIN
             cluster_db_count + 1, cl_eligible, cl_overdue);
     END IF;
 
+    /* Incomplete cluster evidence (summary capacity exceeded): record the advice, never apply it. */
+    evidence_complete := COALESCE((others_summary ->> 'evidence_complete')::boolean, true);
+    IF NOT evidence_complete THEN
+        recommendation_reason := recommendation_reason
+            || ' Cluster evidence is incomplete (adaptive_autovacuum.max_tracked_databases exceeded): recorded only, not applied.';
+    END IF;
+
     INSERT INTO adaptive_autovacuum.global_recommendations
         (host_metrics, overdue_relations, long_vacuums,
          delay_bound_long_vacuums, repeated_index_vacuum_cycles,
@@ -2099,6 +2166,7 @@ BEGIN
 
     /* Cluster-first: queue ALTER SYSTEM changes for the C worker (deduplicated, audited). */
     IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global
+       AND evidence_complete
        AND (COALESCE(current_setting('adaptive_autovacuum.global_settings_database', true), '') = ''
             OR current_setting('adaptive_autovacuum.global_settings_database', true)
                = pg_catalog.current_database()::text) THEN
@@ -2386,4 +2454,5 @@ GRANT SELECT ON adaptive_autovacuum.relation_status,
 TO PUBLIC;
 /* Host metrics go to pg_monitor, not PUBLIC. */
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.host_metrics() TO pg_monitor;
+GRANT EXECUTE ON FUNCTION adaptive_autovacuum.cluster_summary_status() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.horizon_blocker() TO PUBLIC;
