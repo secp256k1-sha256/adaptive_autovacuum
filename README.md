@@ -9,15 +9,149 @@
 
 > **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4, 18.6, 17.6, and 17.11), including regression suites, a hot-standby drill, live emergency-vacuum drills, and ~20,000 TPS pgbench runs, but has not yet completed sustained production-scale testing.
 
-Out of the box, autovacuum uses conservative settings. On real systems that means familiar problems:
 
-- Tables bloat faster than autovacuum cleans them, and queries slow down.
-- Autovacuum runs so throttled it never finishes, or all workers are busy and tables wait in line.
-- Big tables wait for millions of dead rows before anything happens, because the trigger is a percentage of table size.
-- Insert-only tables (logs, events, archives) are ignored until a painful freeze storm hits.
-- Someone tunes autovacuum at a table (table-level settings) during an incident, and the leftover settings are still there three years later.
+<div align="center">
 
-`adaptive_autovacuum` watches every table and the server itself (CPU load, memory), and continuously fixes these problems **the same way an experienced DBA would**: get the cluster-wide settings right first, give genuinely special tables temporary custom settings, and clean up after itself. Every action is recorded with what it changed, why, and what the old value was.
+### **Autovacuum that manages itself**
+
+**Built for PostgreSQL installations that don't have a DBA.**
+
+</div>
+
+---
+
+PostgreSQL's autovacuum defaults are intentionally conservative. They are sensible starting points, but they assume someone is watching the database, noticing when maintenance falls behind, and adjusting the configuration as the workload grows.
+
+> ### Increasingly, that person does not exist.
+
+Small teams, startups, solo developers, AI-assisted projects, and vibe-coded applications often run PostgreSQL without dedicated DBA expertise.
+
+Automation and AI agents can also create environments a traditional DBA would rarely design manually:
+
+* 🗄️ **thousands of databases** on one host
+* 📚 **Very large table counts**
+* 🔄 **Rapidly changing schemas**
+* 📊 **Tables that have never get analyzed**
+* ⚙️ **Autovacuum settings copied from defaults, old blog posts, or generated configs**
+* 🧹 **Dead-tuple backlogs that grow unnoticed until they become incidents**
+
+`adaptive_autovacuum` is built for those environments.
+
+> ## Its job is not merely to recommend better settings.
+>
+> ## Its job is to help PostgreSQL keep maintaining itself.
+
+---
+
+## 🔍 What it watches
+
+`adaptive_autovacuum` continuously asks:
+
+### 🧹 Is vacuum keeping up?
+
+Are dead tuples being created faster than autovacuum can remove them?
+
+### 👷 Are there enough workers?
+
+Is `autovacuum_max_workers` large enough for the number of databases, tables, and active maintenance work on the host?
+
+### 🐌 Is vacuum being throttled too heavily?
+
+Are `autovacuum_vacuum_cost_limit` and `autovacuum_vacuum_cost_delay` preventing the backlog from ever disappearing?
+
+### 🚀 Can PostgreSQL safely push harder?
+
+Is there enough CPU, memory, I/O, and WAL capacity available for more aggressive maintenance?
+
+### 📏 Are percentage-based thresholds becoming ineffective?
+
+Are large tables waiting far too long before autovacuum triggers?
+
+### ❄️ Are insert-heavy tables accumulating future freeze work?
+
+Insert-only and append-heavy tables can remain deceptively clean while transaction-ID maintenance debt continues to build.
+
+### 📊 Are tables being queried without ever having been analyzed?
+
+Missing statistics can lead to bad query plans long before someone notices the root cause.
+
+### 🚨 Is anti-wraparound autovacuum genuinely stuck?
+
+Are transaction IDs continuing toward exhaustion while PostgreSQL's normal protection is failing to make progress?
+
+### ♻️ Did emergency tuning leave aggressive settings behind?
+
+Temporary per-table tuning should be restored once the workload has recovered.
+
+---
+
+## ⚙️ What it does
+
+When maintenance falls behind, `adaptive_autovacuum` reacts.
+
+It can:
+
+| Capability                | What it does                                                       |
+| ------------------------- | ------------------------------------------------------------------ |
+| 🧹 **Vacuum tuning**      | Adjusts cluster-wide vacuum cost limits and delays                 |
+| 👷 **Worker capacity**    | Increases autovacuum workers when maintenance demand grows         |
+| 🎯 **Trigger tuning**     | Corrects ineffective vacuum thresholds on large or busy tables     |
+| 🔥 **Hot-table tuning**   | Temporarily applies more aggressive per-table settings             |
+| 📊 **Automatic ANALYZE**  | Detects and analyzes tables with missing statistics                |
+| 🗑️ **Backlog recovery**  | Responds to growing dead-tuple maintenance debt                    |
+| 🧊 **Freeze protection**  | Detects dangerous XID/MXID conditions                              |
+| 🚨 **Emergency vacuum**   | Takes over when anti-wraparound autovacuum is demonstrably failing |
+| ♻️ **Automatic rollback** | Restores temporary tuning after the database recovers              |
+
+---
+
+## 🖥️ Host-aware maintenance
+
+More aggressive maintenance only helps while the machine has capacity for it.
+
+`adaptive_autovacuum` watches signals such as:
+
+* CPU load
+* available memory
+* WAL generation
+* running vacuum activity
+* maintenance backlog
+* active autovacuum workers
+* XID/MXID pressure
+
+and uses them to decide when to:
+
+> **Push harder** when maintenance is falling behind and the host has spare capacity.
+
+or:
+
+> **Back off** when vacuum itself risks becoming the workload.
+
+---
+
+## 🎯 Design goal
+
+The goal is **not maximum benchmark performance**.
+
+The goal is:
+
+> ### **Vacuum faster than the database creates maintenance debt, use as much of the host as is safely available, and intervene before neglected maintenance becomes an outage.**
+
+---
+
+### Healthy database?
+
+`adaptive_autovacuum` should have very little to do.
+
+### Unhealthy or unmanaged database?
+
+It should behave like:
+
+<div align="center">
+
+## **The DBA who isn't there.**
+
+</div>
 
 ---
 
