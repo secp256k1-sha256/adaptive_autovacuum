@@ -100,7 +100,8 @@ SELECT * FROM adaptive_autovacuum.global_apply_queue ORDER BY id DESC;
 -- per-table settings currently in place: original vs current
 SELECT * FROM adaptive_autovacuum.changed_tables;
 
--- health of every table it watches
+-- every table it currently has state for: behind, helped, in conflict, cooling
+-- down, or being watched while a vacuum runs (healthy untouched tables are absent)
 SELECT * FROM adaptive_autovacuum.relation_status ORDER BY last_backlog_ratio DESC NULLS LAST;
 
 -- its current advice for the cluster, in plain words
@@ -110,10 +111,13 @@ SELECT reason FROM adaptive_autovacuum.latest_global_recommendation;
 -- cluster would go read-only, and an ok / watch / alarm verdict
 SELECT * FROM adaptive_autovacuum.wraparound_status;
 
--- complete decision history (every check, every action, every error)
+-- decision history: every state or action transition, every applied change,
+-- every error, and the return to normal that closes an episode
 SELECT decided_at, relation_name, state, action, applied, error
 FROM adaptive_autovacuum.decisions ORDER BY id DESC LIMIT 50;
 ```
+
+The extension keeps its own footprint small. A healthy table it is not helping leaves nothing behind: no `relation_state` row and no decision. State is written only when something the next check needs has changed (or once an hour as a heartbeat), and `decisions` is a transition log rather than a per-check trace, so on a cluster with tens of thousands of tables the controller does not itself become a source of WAL, dead tuples and vacuum work. The two pure history tables, `decisions` and `global_recommendations`, are UNLOGGED: they are never read back to make a decision, so losing them after a crash (or finding them empty after a standby promotion) costs history only. Everything the controller needs to undo its own changes (`policy`, `table_policy`, `relation_state`, `global_apply_queue`) stays fully durable.
 
 Real output from a test cluster that started with badly mistuned settings, corrected in a single pass:
 

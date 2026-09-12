@@ -39,18 +39,13 @@ CREATE TABLE adaptive_autovacuum.policy
     lock_timeout_ms                 integer NOT NULL DEFAULT 250 CHECK (lock_timeout_ms >= 1),
     max_changes_per_cycle           integer NOT NULL DEFAULT 5 CHECK (max_changes_per_cycle >= 0),
 
-    /* A table with live rows that was never analyzed (neither manually nor by
-       autoanalyze) leaves the planner estimating from hardcoded defaults;
-       each cycle the largest few such tables are analyzed one at a time. */
+    /* Never-analyzed tables leave the planner on defaults; analyze the largest few per cycle. */
     analyze_missing_stats           boolean NOT NULL DEFAULT true,
     analyze_missing_stats_per_cycle integer NOT NULL DEFAULT 3 CHECK (analyze_missing_stats_per_cycle >= 0),
 
     manage_table_costs              boolean NOT NULL DEFAULT false,
     max_boosted_relations           integer NOT NULL DEFAULT 2 CHECK (max_boosted_relations >= 0),
-    /* Cost limits are capped at 10000 and delays at 100 ms: the documented
-       maxima of the underlying (auto)vacuum_cost_limit/_cost_delay settings
-       and reloptions, so a mistuned policy can never compute a value the
-       server itself would reject. */
+    /* Caps = documented maxima of (auto)vacuum_cost_limit / _cost_delay. */
     elevated_cost_limit             integer NOT NULL DEFAULT 1000 CHECK (elevated_cost_limit >= 200 AND elevated_cost_limit <= 10000),
     urgent_cost_limit               integer NOT NULL DEFAULT 3000 CONSTRAINT policy_urgent_cost_limit_check CHECK (urgent_cost_limit >= elevated_cost_limit AND urgent_cost_limit <= 10000),
     critical_cost_limit             integer NOT NULL DEFAULT 6000 CONSTRAINT policy_critical_cost_limit_check CHECK (critical_cost_limit >= urgent_cost_limit AND critical_cost_limit <= 10000),
@@ -62,64 +57,30 @@ CREATE TABLE adaptive_autovacuum.policy
 
     xid_warning_ratio               double precision NOT NULL DEFAULT 0.70 CHECK (xid_warning_ratio > 0 AND xid_warning_ratio < 1),
     mxid_warning_ratio              double precision NOT NULL DEFAULT 0.70 CHECK (mxid_warning_ratio > 0 AND mxid_warning_ratio < 1),
-    /* Absolute table ages (in transactions) at which the emergency vacuum may
-       fire.  Modeled on the AWS RDS early-warning guidance: reaching 1 billion
-       while autovacuum_freeze_max_age (default 200M) is in force means the
-       built-in forced autovacuum is failing to control the age, and there is
-       still >1.1 billion transactions of headroom before the cluster goes
-       read-only (~2.1 billion).  Ratio-of-freeze_max_age triggers were
-       rejected: they would fire an unthrottled manual VACUUM in territory the
-       cost-limited built-in anti-wraparound autovacuum handles routinely. */
+    /* Absolute age caps for the emergency vacuum (RDS-style 1B early warning, ~1.1B headroom left). */
     emergency_xid_age               bigint NOT NULL DEFAULT 1000000000 CHECK (emergency_xid_age >= 100000),
     emergency_mxid_age              bigint NOT NULL DEFAULT 1000000000 CHECK (emergency_mxid_age >= 100000),
-    /* The operative "built-in never started" line is
-       LEAST(emergency_xid_age, emergency_stall_multiplier x effective
-       freeze_max_age): 1.5x means the forced autovacuum is 50% of its own
-       trigger overdue and has still not appeared.  Must stay > 1.0 so the
-       emergency can never fire before the built-in trigger point. */
+    /* Stall line = LEAST(emergency_xid_age, multiplier x freeze_max_age); must stay > 1.0. */
     emergency_stall_multiplier      double precision NOT NULL DEFAULT 1.5 CHECK (emergency_stall_multiplier > 1.0),
-    /* Minimum runtime of an anti-wraparound autovacuum before the controller
-       may judge it hopeless (index-bound, projected to finish after the
-       read-only cutoff) and take it over with the index-skipping profile. */
+    /* Minimum runtime before a running anti-wraparound autovacuum may be judged stuck. */
     emergency_takeover_min_runtime_seconds integer NOT NULL DEFAULT 3600 CHECK (emergency_takeover_min_runtime_seconds >= 60),
-    /* relfrozenxid only advances at the END of a vacuum, so a rising age
-       while a vacuum runs proves nothing.  A running anti-wraparound
-       autovacuum may only be cancelled after its progress counters (phase,
-       heap blocks scanned/vacuumed, index passes, indexes processed,
-       dead-tuple bytes) have not moved for this many consecutive controller
-       samples.  With the default naptime that is several minutes of literally
-       zero observable progress on top of the minimum runtime. */
+    /* Consecutive samples with frozen pg_stat_progress_vacuum counters required for takeover. */
     emergency_takeover_stall_samples integer NOT NULL DEFAULT 5 CHECK (emergency_takeover_stall_samples >= 2),
 
     long_vacuum_seconds             integer NOT NULL DEFAULT 1800 CHECK (long_vacuum_seconds >= 60),
     high_delay_fraction             double precision NOT NULL DEFAULT 0.25 CHECK (high_delay_fraction >= 0 AND high_delay_fraction <= 1),
     high_load_per_cpu               double precision NOT NULL DEFAULT 1.50 CHECK (high_load_per_cpu > 0),
     low_memory_percent              double precision NOT NULL DEFAULT 15.0 CHECK (low_memory_percent > 0 AND low_memory_percent < 100),
-    /* Storage guardrail: autovacuum often bottlenecks on storage while CPU
-       and RAM still look idle.  When the measured cluster WAL generation rate
-       (pg_stat_wal delta between cycles, MB/s) exceeds this, the cycle is
-       treated as running under host pressure: no aggression raises, and the
-       walk-back branches engage.  0 disables the guardrail (default), because
-       a sane threshold depends on the storage; size it below the device's
-       known sustained write throughput. */
+    /* Storage guardrail: WAL MB/s above this counts as host pressure; 0 = off. */
     high_wal_mbps                   double precision NOT NULL DEFAULT 0 CHECK (high_wal_mbps >= 0),
 
     recommendation_cost_limit_max   integer NOT NULL DEFAULT 10000 CHECK (recommendation_cost_limit_max >= 200 AND recommendation_cost_limit_max <= 10000),
     recommendation_delay_max_ms     integer NOT NULL DEFAULT 20 CHECK (recommendation_delay_max_ms >= 0 AND recommendation_delay_max_ms <= 100),
-    /* Floor for the automatic cost-delay walk-down: halving stops here
-       instead of converging to an effectively unthrottled ~0 ms (a manual-
-       vacuum aggression level the controller should not reach on its own).
-       A current delay already below the floor is respected, never raised. */
+    /* Floor for the automatic cost-delay walk-down; a lower operator value is respected. */
     recommendation_delay_min_ms     double precision NOT NULL DEFAULT 0.5 CONSTRAINT policy_recommendation_delay_min_ms_check CHECK (recommendation_delay_min_ms >= 0 AND recommendation_delay_min_ms <= recommendation_delay_max_ms),
-    /* 2097151 MB is the largest value expressible in kilobytes as a 32-bit
-       integer (MAX_KILOBYTES), the domain of autovacuum_work_mem and
-       maintenance_work_mem; larger values would overflow the kB conversion. */
+    /* 2097151 MB = MAX_KILOBYTES expressed in MB, the domain of autovacuum_work_mem. */
     recommendation_work_mem_max_mb  integer NOT NULL DEFAULT 4096 CHECK (recommendation_work_mem_max_mb >= 64 AND recommendation_work_mem_max_mb <= 2097151),
-    /* Ceiling for the opportunistic vacuum_buffer_usage_limit raise (16384 MB
-       = the GUC's own 16 GB maximum).  The effective cap is additionally
-       bounded by the server's silent clamp of 1/8 of shared_buffers, divided
-       across the autovacuum worker pool so concurrent rings cannot occupy a
-       disproportionate share of the buffer cache. */
+    /* Ceiling for the vacuum_buffer_usage_limit raise; also capped by shared_buffers/8. */
     recommendation_buffer_usage_limit_max_mb integer NOT NULL DEFAULT 256 CHECK (recommendation_buffer_usage_limit_max_mb >= 2 AND recommendation_buffer_usage_limit_max_mb <= 16384),
     work_mem_available_fraction     double precision NOT NULL DEFAULT 0.10 CHECK (work_mem_available_fraction > 0 AND work_mem_available_fraction <= 0.50),
     recommendation_workers_max      integer NOT NULL DEFAULT 8 CHECK (recommendation_workers_max BETWEEN 1 AND 64),
@@ -141,12 +102,7 @@ INSERT INTO adaptive_autovacuum.policy(singleton) VALUES (true);
 CREATE TABLE adaptive_autovacuum.table_policy
 (
     relid                 oid PRIMARY KEY,
-    /* Identity fingerprint against OID reuse: OIDs are recycled, so a row
-       keyed by relid alone could silently apply operator intent to an
-       unrelated table created later under the same OID.  Filled automatically
-       by trigger on INSERT and UPDATE; the policy ignores rows whose
-       fingerprint no longer matches pg_class (re-adopt by updating the row,
-       e.g. UPDATE ... SET enabled = enabled ... after a rename). */
+    /* Fingerprint against OID reuse; trigger-filled, mismatched rows are ignored until re-adopted. */
     schema_name           name,
     relation_name         name,
     enabled               boolean NOT NULL DEFAULT true,
@@ -189,6 +145,7 @@ CREATE TRIGGER table_policy_fill_identity
 COMMENT ON TABLE adaptive_autovacuum.table_policy IS
 'Per-relation operator overrides. schema_name/relation_name fingerprint the relid against OID reuse: rows whose fingerprint no longer matches pg_class are ignored (touch the row with UPDATE to re-adopt after a rename); rows whose relation was dropped are removed each cycle.';
 
+/* Rows only for relations with control state; rewritten on change or hourly, never per cycle. */
 CREATE TABLE adaptive_autovacuum.relation_state
 (
     relid                 oid PRIMARY KEY,
@@ -198,8 +155,10 @@ CREATE TABLE adaptive_autovacuum.relation_state
     managed_values        jsonb NOT NULL DEFAULT '{}'::jsonb,
     ownership_conflict    boolean NOT NULL DEFAULT false,
     state                 text NOT NULL DEFAULT 'normal',
+    /* Saturate at their policy thresholds so a steady state produces no write. */
     consecutive_overdue   integer NOT NULL DEFAULT 0,
     consecutive_healthy   integer NOT NULL DEFAULT 0,
+    /* Time of the last row write, not of the last scan. */
     last_seen_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
     last_change_at        timestamptz,
     last_dead_tuples      bigint,
@@ -210,18 +169,17 @@ CREATE TABLE adaptive_autovacuum.relation_state
     last_insert_backlog_ratio double precision,
     last_xid_age          bigint,
     last_mxid_age         bigint,
-    /* Vacuum-progress fingerprint from the previous cycle: pid plus a
-       concatenation of every pg_stat_progress_vacuum counter that moves
-       while a vacuum does real work in ANY phase.  An unchanged fingerprint
-       across consecutive cycles is the only accepted evidence that a running
-       anti-wraparound autovacuum is stuck (see emergency takeover). */
+    /* Previous cycle's pg_stat_progress_vacuum fingerprint; unchanged = stuck-vacuum evidence. */
     last_vacuum_pid       integer,
     last_vacuum_progress  text,
     vacuum_stalled_cycles integer NOT NULL DEFAULT 0,
-    last_error            text
+    last_error            text,
+    /* Previous cycle's action; decisions log (state, action) transitions only. */
+    last_action           text
 );
 
-CREATE TABLE adaptive_autovacuum.decisions
+/* UNLOGGED: audit history only, never read back for control; unreadable on a hot standby. */
+CREATE UNLOGGED TABLE adaptive_autovacuum.decisions
 (
     id                    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     decided_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -242,7 +200,8 @@ CREATE INDEX decisions_decided_at_idx
 CREATE INDEX decisions_relid_decided_at_idx
     ON adaptive_autovacuum.decisions(relid, decided_at DESC);
 
-CREATE TABLE adaptive_autovacuum.global_recommendations
+/* UNLOGGED: advisory history only, never read back for control. */
+CREATE UNLOGGED TABLE adaptive_autovacuum.global_recommendations
 (
     id                              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     created_at                      timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -318,17 +277,13 @@ CREATE UNIQUE INDEX emergency_queue_one_active_per_relation_idx
     ON adaptive_autovacuum.emergency_queue(relid)
     WHERE status IN ('pending', 'running');
 
-/* One-row sample of the 64-bit transaction counter, refreshed every cycle.
-   The delta between cycles gives the cluster's XID consumption rate, used to
-   project whether a grinding anti-wraparound autovacuum can finish before the
-   read-only cutoff. */
+/* 64-bit XID sample per cycle; the delta gives the XID consumption rate. */
 CREATE TABLE adaptive_autovacuum.controller_state
 (
     only_row        boolean PRIMARY KEY DEFAULT true CHECK (only_row),
     last_xid8       bigint,
     last_sample_at  timestamptz,
-    /* pg_stat_wal.wal_bytes at the previous cycle; the delta gives the
-       cluster WAL generation rate for the high_wal_mbps storage guardrail. */
+    /* pg_stat_wal.wal_bytes at the previous cycle, for the high_wal_mbps guardrail. */
     last_wal_bytes  bigint
 );
 INSERT INTO adaptive_autovacuum.controller_state (only_row) VALUES (true);
@@ -449,13 +404,7 @@ BEGIN
 END
 $$;
 
-/* The oldest snapshot, prepared transaction, or replication slot holding back
-   the cleanup horizon in this database.  VACUUM can only advance relfrozenxid
-   up to this horizon: when the horizon itself is older than the emergency
-   stall line, an emergency VACUUM would burn one full unthrottled table scan
-   without lowering the age at all, so the controller must report the blocker
-   instead of escalating.  MXID pressure is judged separately: slots and
-   snapshots do not hold back multixact cleanup the same way. */
+/* Oldest snapshot / prepared xact / slot holding the cleanup horizon (XID only, not MXID). */
 CREATE FUNCTION adaptive_autovacuum.horizon_blocker()
 RETURNS TABLE (blocker_age bigint, blocker_kind text, blocker_detail text)
 LANGUAGE sql
@@ -492,15 +441,7 @@ $$;
 COMMENT ON FUNCTION adaptive_autovacuum.horizon_blocker() IS
 'Oldest cleanup-horizon blocker visible from this database: long snapshot/transaction, prepared transaction, or replication slot xmin. NULL row set when nothing holds an xmin.';
 
-/* others_summary: aggregate of the OTHER managed databases' most recent cycle
-   summaries, collected by the C worker from shared memory (NULL when the
-   worker is not involved or no other database has published yet).  Keys:
-   db_count, eligible, overdue, dead_overdue, insert_overdue,
-   fleet_max_target, and dead_overdue-weighted median sums w_scale_sum /
-   w_thresh_sum plus insert-weighted w_ins_scale_sum / w_ins_thresh_sum.
-   Cluster-wide GUC recommendations merge these with this database's fresh
-   numbers, so they rest on cluster-wide evidence rather than one database.
-   The returned row is this database's summary for the same mechanism. */
+/* others_summary: the other databases' aggregated cycle summaries; returns this one's. */
 CREATE FUNCTION adaptive_autovacuum._run_cycle(
     host_load1 double precision,
     host_cpu_count integer,
@@ -660,6 +601,8 @@ DECLARE
     applied boolean;
     action_name text;
     action_error text;
+    state_needed boolean;
+    new_last_change_at timestamptz;
 
     emergency_work_mem_mb integer;
 BEGIN
@@ -686,10 +629,7 @@ BEGIN
     END;
     host_load_per_cpu := host_load1 / host_cpu_count;
 
-    /* XID consumption rate (transactions/second) and WAL generation rate
-       (MB/second) from the deltas since the previous cycle; NULL on the
-       first cycle or when the elapsed window is too small to be
-       meaningful. */
+    /* XID/s and WAL MB/s since the previous cycle; NULL on the first cycle or a tiny window. */
     cur_xid8 := pg_catalog.pg_current_xact_id()::text::bigint;
     SELECT w.wal_bytes::bigint INTO cur_wal_bytes
     FROM pg_catalog.pg_stat_wal w;
@@ -714,11 +654,7 @@ BEGIN
         last_sample_at = clock_timestamp(),
         last_wal_bytes = cur_wal_bytes;
 
-    /* Storage guardrail (opt-in via high_wal_mbps > 0): CPU/RAM pressure
-       misses a saturated storage device; a sustained WAL rate above the
-       operator-set line is treated exactly like host pressure, so the
-       controller never raises vacuum aggression against saturated storage
-       and the walk-back branches engage. */
+    /* Storage guardrail: WAL rate above high_wal_mbps is treated as host pressure. */
     storage_pressure := p.high_wal_mbps > 0
                         AND wal_rate_mbps IS NOT NULL
                         AND wal_rate_mbps >= p.high_wal_mbps;
@@ -749,8 +685,7 @@ BEGIN
     SELECT setting::bigint INTO multixact_freeze_max_age
     FROM pg_settings WHERE name = 'autovacuum_multixact_freeze_max_age';
 
-    /* Oldest cleanup-horizon blocker, fetched once per cycle; NULLs when
-       nothing currently holds an xmin. */
+    /* Oldest cleanup-horizon blocker, fetched once per cycle. */
     SELECT b.blocker_age, b.blocker_kind, b.blocker_detail
     INTO horizon_age, horizon_kind, horizon_detail
     FROM adaptive_autovacuum.horizon_blocker() b;
@@ -810,9 +745,7 @@ BEGIN
         count(*) FILTER (
             WHERE clock_timestamp() - a.query_start
                   >= make_interval(secs => p.long_vacuum_seconds)
-              /* delay_time exists only on PG18+; the jsonb detour keeps this
-                 parseable on PG17, where the filter is simply never true and
-                 delay-bound detection stays inactive. */
+              /* delay_time is PG18+; the jsonb detour keeps PG17 parsing (filter never true there). */
               AND ((to_jsonb(pv) ->> 'delay_time'))::double precision >=
                   extract(epoch FROM clock_timestamp() - a.query_start) * 1000.0
                   * p.high_delay_fraction
@@ -849,10 +782,7 @@ BEGIN
     ELSIF delay_bound_count > 0 THEN
         recommended_cost_limit := LEAST(p.recommendation_cost_limit_max,
                                         GREATEST(200, current_global_cost_limit * 2));
-        /* Halve toward more throughput, but stop at the policy floor:
-           delay 0 is manual-vacuum aggression and is never reached
-           automatically.  LEAST(floor, current) means an operator-chosen
-           delay already below the floor is respected, never raised. */
+        /* Halve toward the policy floor; an operator delay already below it is respected. */
         recommended_cost_delay := GREATEST(
             LEAST(p.recommendation_delay_min_ms, GREATEST(current_global_cost_delay, 0)),
             GREATEST(current_global_cost_delay, 0) / 2.0);
@@ -885,12 +815,7 @@ BEGIN
             recommended_work_mem_kb := LEAST(current_autovacuum_work_mem_kb,
                                              recommended_work_mem_kb);
         ELSIF repeated_index_cycle_count = 0 THEN
-            /* No out-of-memory evidence (repeated index passes).  While
-               autovacuum workers are actually running and host memory is
-               free, raise opportunistically toward the memory-derived value
-               so the running and following vacuums can hold more dead-tuple
-               state; never lower without evidence.  Idle clusters are left
-               untouched. */
+            /* No memory-pressure evidence: raise opportunistically only while workers run; never lower. */
             IF av_workers_running > 0 THEN
                 recommended_work_mem_kb := GREATEST(current_autovacuum_work_mem_kb,
                                                     recommended_work_mem_kb);
@@ -953,8 +878,7 @@ BEGIN
             sz.total_bytes,
             pg_stat_get_live_tuples(c.oid)::bigint AS live_tuples,
             pg_stat_get_dead_tuples(c.oid)::bigint AS dead_tuples,
-            /* TOAST-aware: the TOAST relation has its own relfrozenxid and
-               can lag the main heap; wraparound is driven by the older one. */
+            /* TOAST has its own relfrozenxid; the older one drives wraparound. */
             GREATEST(age(c.relfrozenxid),
                      COALESCE(age(tc.relfrozenxid), 0))::bigint AS xid_age,
             GREATEST(mxid_age(c.relminmxid),
@@ -987,12 +911,7 @@ BEGIN
                      current_insert_threshold) AS insert_threshold,
             COALESCE(adaptive_autovacuum._option_value(c.reloptions, 'autovacuum_vacuum_insert_scale_factor')::double precision,
                      current_insert_scale_factor) AS insert_scale_factor,
-            /* PostgreSQL 18 core multiplies the insert-trigger scale
-               component by the share of pages not yet all-frozen
-               (pg_class.relallfrozen), so append-mostly-frozen tables are
-               insert-vacuumed sooner.  The jsonb detour keeps this parseable
-               on PG17, where the column does not exist and the factor stays
-               1.0 (the PG17 core formula). */
+            /* PG18 scales the insert trigger by the unfrozen page share (relallfrozen); 1.0 on PG17. */
             CASE
                 WHEN c.relpages > 0
                  AND COALESCE(((to_jsonb(c) ->> 'relallfrozen'))::bigint, 0) > 0
@@ -1019,13 +938,30 @@ BEGIN
             tp.target_dead_tuple_min AS table_target_min,
             tp.target_dead_tuple_max AS table_target_max,
             tp.min_scale_factor AS table_scale_min,
-            tp.max_scale_factor AS table_scale_max
+            tp.max_scale_factor AS table_scale_max,
+            /* Previous state joined once here instead of a per-relation lookup; NULL = never persisted. */
+            rs.relid IS NOT NULL AS state_exists,
+            rs.relation_name AS prev_relation_name,
+            rs.original_reloptions AS prev_original_reloptions,
+            rs.original_captured AS prev_original_captured,
+            rs.managed_values AS prev_managed_values,
+            rs.ownership_conflict AS prev_ownership_conflict,
+            rs.state AS prev_state,
+            rs.consecutive_overdue AS prev_consecutive_overdue,
+            rs.consecutive_healthy AS prev_consecutive_healthy,
+            rs.last_seen_at AS prev_last_seen_at,
+            rs.last_change_at AS prev_last_change_at,
+            rs.last_vacuum_pid AS prev_last_vacuum_pid,
+            rs.last_vacuum_progress AS prev_last_vacuum_progress,
+            rs.vacuum_stalled_cycles AS prev_vacuum_stalled_cycles,
+            rs.last_error AS prev_last_error,
+            rs.last_action AS prev_last_action
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
+        LEFT JOIN adaptive_autovacuum.relation_state rs ON rs.relid = c.oid
         CROSS JOIN LATERAL (
-            /* relpages avoids per-relation locks of pg_total_relation_size();
-               fall back to the exact size while the relation is unanalyzed. */
+            /* relpages avoids per-relation locks; exact size only while unanalyzed. */
             SELECT CASE WHEN c.relpages > 0
                         THEN c.relpages::bigint
                              * pg_catalog.current_setting('block_size')::bigint
@@ -1033,8 +969,7 @@ BEGIN
                    END AS total_bytes
         ) sz
         LEFT JOIN active_vacuum av ON av.relid = c.oid
-        /* Identity-checked: a row whose fingerprint no longer matches (OID
-           reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+        /* Identity-checked: fingerprint mismatch (OID reuse / rename) is ignored. */
         LEFT JOIN adaptive_autovacuum.table_policy tp
                ON tp.relid = c.oid
               AND tp.schema_name = n.nspname
@@ -1087,9 +1022,7 @@ BEGIN
                 END
             ) DESC
     LOOP
-        /* On PG17 vacuum_max_threshold is NULL (the GUC and reloption do not
-           exist): NULL < 0 is not true and LEAST ignores NULLs, so this
-           degrades exactly to the uncapped PG17 trigger formula. */
+        /* PG17: vacuum_max_threshold is NULL, so this degrades to the uncapped formula. */
         IF r.vacuum_max_threshold < 0 THEN
             vacuum_trigger := r.vacuum_threshold
                               + r.vacuum_scale_factor * GREATEST(r.reltuples, 0);
@@ -1104,8 +1037,7 @@ BEGIN
         vacuum_trigger := GREATEST(vacuum_trigger, 1);
         backlog_ratio := r.dead_tuples / vacuum_trigger;
 
-        /* A negative effective insert threshold means insert-driven vacuums
-           are deliberately disabled for this relation; respect that. */
+        /* Negative effective insert threshold = insert vacuums disabled for this relation. */
         IF r.insert_threshold IS NULL OR r.insert_threshold < 0 THEN
             insert_ratio := 0;
         ELSE
@@ -1119,23 +1051,7 @@ BEGIN
         xid_ratio := r.xid_age::double precision / NULLIF(r.effective_xid_freeze_max_age, 0);
         mxid_ratio := r.mxid_age::double precision / NULLIF(r.effective_mxid_freeze_max_age, 0);
 
-        /* The emergency triggers on EVIDENCE that the built-in anti-wraparound
-           autovacuum is failing, judged from its own behavior; the absolute
-           emergency_*_age (default 1B, ~50% of the read-only cutoff, per the
-           AWS RDS early-warning model) is the backstop cap.
-
-           never-started: no vacuum is running on the relation although its age
-           is emergency_stall_multiplier x past the point where core would have
-           started a forced vacuum (capped by the absolute backstop).
-
-           takeover: an anti-wraparound autovacuum HAS been running for at
-           least emergency_takeover_min_runtime_seconds, the age is past the
-           stall line, and the vacuum has shown ZERO observable progress for
-           emergency_takeover_stall_samples consecutive samples.  Age alone is
-           deliberately NOT failure evidence for a running vacuum:
-           relfrozenxid is only updated at the very end of a vacuum, so the
-           age keeps rising for the whole runtime of a perfectly healthy one.
-           A manual (non-autovacuum) vacuum is never judged or taken over. */
+        /* Emergency = built-in anti-wraparound autovacuum never started, or running with zero progress. */
         stall_xid_age := LEAST(p.emergency_xid_age,
                                ceil(p.emergency_stall_multiplier
                                     * COALESCE(NULLIF(r.effective_xid_freeze_max_age, 0),
@@ -1145,12 +1061,7 @@ BEGIN
                                      * COALESCE(NULLIF(r.effective_mxid_freeze_max_age, 0),
                                                 multixact_freeze_max_age))::bigint);
 
-        /* Any AUTOVACUUM worker on the relation counts: past the wraparound
-           trigger point every autovacuum runs aggressively and does the
-           freezing work, but a dead-tuple-triggered one is NOT tagged
-           "(to prevent wraparound)" - gating on the tag would miss the common
-           production shape (old age + dead tuples).  Manual vacuums are still
-           excluded and are never judged or cancelled. */
+        /* Any autovacuum worker counts (the wraparound tag is not required); manual vacuums never. */
         av_wraparound_running := r.vacuum_pid IS NOT NULL
                                  AND COALESCE(r.is_autovacuum, false);
         av_elapsed_seconds := extract(epoch FROM COALESCE(r.vacuum_elapsed, interval '0'));
@@ -1161,30 +1072,23 @@ BEGIN
                 GREATEST(2147483648 - 3000000 - r.xid_age, 0)::double precision / xid_rate;
         END IF;
 
+        /* r.prev_* is the before-image for the write-on-change test; previous.* is mutated this cycle. */
         previous := NULL;
-        SELECT * INTO previous
-        FROM adaptive_autovacuum.relation_state
-        WHERE relid = r.relid;
+        previous.relid := r.relid;
+        previous.original_reloptions := r.prev_original_reloptions;
+        previous.original_captured := COALESCE(r.prev_original_captured, false);
+        previous.managed_values := COALESCE(r.prev_managed_values, '{}'::jsonb);
+        previous.ownership_conflict := COALESCE(r.prev_ownership_conflict, false);
+        previous.state := COALESCE(r.prev_state, 'normal');
+        previous.consecutive_overdue := COALESCE(r.prev_consecutive_overdue, 0);
+        previous.consecutive_healthy := COALESCE(r.prev_consecutive_healthy, 0);
+        previous.last_change_at := r.prev_last_change_at;
+        previous.last_vacuum_pid := r.prev_last_vacuum_pid;
+        previous.last_vacuum_progress := r.prev_last_vacuum_progress;
+        previous.vacuum_stalled_cycles := COALESCE(r.prev_vacuum_stalled_cycles, 0);
+        previous.last_action := r.prev_last_action;
 
-        IF NOT FOUND THEN
-            previous.relid := r.relid;
-            previous.original_reloptions := NULL;
-            previous.original_captured := false;
-            previous.managed_values := '{}'::jsonb;
-            previous.ownership_conflict := false;
-            previous.consecutive_overdue := 0;
-            previous.consecutive_healthy := 0;
-            previous.last_change_at := NULL;
-            previous.last_vacuum_pid := NULL;
-            previous.last_vacuum_progress := NULL;
-            previous.vacuum_stalled_cycles := 0;
-        END IF;
-
-        /* Vacuum-progress fingerprint: every pg_stat_progress_vacuum counter
-           that moves while a vacuum does real work in ANY phase (heap scan,
-           heap vacuum, index vacuum, truncate).  The fingerprint staying
-           unchanged across consecutive samples of the SAME backend is the
-           only accepted evidence that the vacuum is stuck. */
+        /* Progress fingerprint; unchanged across samples of the same backend = stuck. */
         IF r.vacuum_pid IS NOT NULL THEN
             cur_vacuum_progress := format('%s|%s|%s|%s|%s|%s|%s',
                                           COALESCE(r.phase, '?'),
@@ -1205,22 +1109,11 @@ BEGIN
             vacuum_stalled_cycles := 0;
         END IF;
 
-        /* When the cleanup horizon itself is past the stall line, no VACUUM
-           (emergency or otherwise) can advance relfrozenxid below that line:
-           suppress the XID-driven emergency paths and report the blocker
-           instead of cancelling a working autovacuum or burning unthrottled
-           scans that cannot lower the age.  MXID-driven paths stay active. */
+        /* Horizon past the stall line: no vacuum can help, report the blocker instead (XID paths only). */
         xid_horizon_blocked := horizon_age IS NOT NULL
                                AND horizon_age >= stall_xid_age;
 
-        /* Takeover of a RUNNING anti-wraparound autovacuum requires all of:
-           wraparound pressure past the stall line (why takeover matters at
-           all), the minimum runtime, and - decisively - zero observable
-           progress for emergency_takeover_stall_samples consecutive
-           controller samples.  Age or a projected finish time alone must
-           never cancel a working vacuum: age rises for the whole runtime of
-           any long healthy vacuum, and heap-scan-based ETAs mispredict
-           index-dominated vacuums. */
+        /* Takeover needs stall-line age + minimum runtime + N frozen samples; age alone never cancels. */
         emergency_takeover := av_wraparound_running
             AND av_elapsed_seconds >= p.emergency_takeover_min_runtime_seconds
             AND vacuum_stalled_cycles >= p.emergency_takeover_stall_samples
@@ -1278,11 +1171,14 @@ BEGIN
             reason := 'Relation is within configured backlog and wraparound limits.';
         END IF;
 
+        /* Counters saturate at the thresholds they are compared with. */
         IF relation_state = 'normal' THEN
             overdue_cycles := 0;
-            healthy_cycles := previous.consecutive_healthy + 1;
+            healthy_cycles := LEAST(previous.consecutive_healthy + 1,
+                                    p.healthy_cycles_before_restore);
         ELSE
-            overdue_cycles := previous.consecutive_overdue + 1;
+            overdue_cycles := LEAST(previous.consecutive_overdue + 1,
+                                    p.overdue_cycles_before_change);
             healthy_cycles := 0;
             overdue_relation_count := overdue_relation_count + 1;
         END IF;
@@ -1322,12 +1218,10 @@ BEGIN
         );
         desired_max_threshold := GREATEST(desired_threshold, target_dead_tuples)::integer;
 
-        /* The fleet's largest per-relation dead-tuple target drives the
-           cluster-wide PG18 trigger ceiling (autovacuum_vacuum_max_threshold). */
+        /* Largest per-relation dead-tuple target drives the PG18 trigger ceiling. */
         fleet_max_target := GREATEST(fleet_max_target, target_dead_tuples);
 
-        /* Feed the mistuned-baseline detector: what would this relation want
-           as its trigger settings if the dead-tuple side is overdue? */
+        /* Feed the mistuned-baseline detector with this relation's desired triggers. */
         IF backlog_ratio >= p.backlog_elevated_ratio THEN
             dead_overdue_count := dead_overdue_count + 1;
             overdue_scale_factors := overdue_scale_factors || desired_scale_factor;
@@ -1389,8 +1283,7 @@ BEGIN
                               - 'autovacuum_vacuum_cost_limit'
                               - 'autovacuum_vacuum_cost_delay';
         ELSIF relation_state = 'horizon_blocked' THEN
-            /* Hold everything as-is: more vacuum aggression cannot advance
-               the horizon, and a restore now would flap once it clears. */
+            /* Horizon blocked: hold as-is, aggression cannot help and a restore would flap. */
             desired_values := previous.managed_values;
         ELSE
             desired_values := '{}'::jsonb;
@@ -1417,13 +1310,7 @@ BEGIN
                 tier_cost_delay := p.elevated_cost_delay_ms;
             END IF;
 
-            /*
-             * Ramp instead of jumping to the tier maximum: a boost enters at
-             * the elevated tier and multiplies by boost_ramp_factor once per
-             * change window while the relation stays overdue, capped by the
-             * current severity tier (which also ramps a boost back down when
-             * severity drops).
-             */
+            /* Ramp: enter at the elevated tier, multiply per change window, capped by the severity tier. */
             prev_boost := NULLIF(previous.managed_values ->> 'autovacuum_vacuum_cost_limit', '')::integer;
             IF prev_boost IS NULL THEN
                 desired_cost_limit := LEAST(tier_cost_limit, p.elevated_cost_limit);
@@ -1434,12 +1321,7 @@ BEGIN
             END IF;
             desired_cost_delay := tier_cost_delay;
 
-            /*
-             * Cluster-wide admission budget: the sum of boosted per-table
-             * cost limits stays within boost_total_cost_limit_budget so that
-             * several simultaneous boosts cannot overwhelm the host with
-             * vacuum I/O.
-             */
+            /* Cluster-wide admission budget for simultaneous cost boosts. */
             budget_headroom := p.boost_total_cost_limit_budget - cost_budget_used
                                + COALESCE(prev_boost, 0);
             IF desired_cost_limit > budget_headroom THEN
@@ -1526,12 +1408,18 @@ BEGIN
                 END;
             END IF;
 
-            INSERT INTO adaptive_autovacuum.decisions
-                (relid, relation_name, state, action, reason, host_metrics,
-                 relation_metrics, proposed_reloptions, applied, error)
-            VALUES
-                (r.relid, r.fqname, relation_state, action_name, reason, host_json,
-                 relation_json, desired_values, applied, action_error);
+            /* Transition log: attempted changes always, repeated dry-run proposals once per (state, action). */
+            IF applied
+               OR action_error IS NOT NULL
+               OR previous.state IS DISTINCT FROM relation_state
+               OR previous.last_action IS DISTINCT FROM action_name THEN
+                INSERT INTO adaptive_autovacuum.decisions
+                    (relid, relation_name, state, action, reason, host_metrics,
+                     relation_metrics, proposed_reloptions, applied, error)
+                VALUES
+                    (r.relid, r.fqname, relation_state, action_name, reason, host_json,
+                     relation_json, desired_values, applied, action_error);
+            END IF;
         ELSIF relation_state <> 'normal' OR previous.ownership_conflict THEN
             action_name := CASE
                 WHEN previous.ownership_conflict THEN 'ownership_conflict'
@@ -1542,15 +1430,29 @@ BEGIN
                 ELSE 'observe'
             END;
 
+            /* Observation-only: logged on entering this (state, action) pair. */
+            IF previous.state IS DISTINCT FROM relation_state
+               OR previous.last_action IS DISTINCT FROM action_name THEN
+                INSERT INTO adaptive_autovacuum.decisions
+                    (relid, relation_name, state, action, reason, host_metrics,
+                     relation_metrics, proposed_reloptions, applied, error)
+                VALUES
+                    (r.relid, r.fqname, relation_state, action_name, reason, host_json,
+                     relation_json, desired_values, false,
+                     CASE WHEN previous.ownership_conflict
+                          THEN 'A managed reloption changed outside the controller; automatic writes are suspended.'
+                          ELSE NULL END);
+            END IF;
+        ELSIF previous.state <> 'normal' THEN
+            /* Return to normal closes the episode. */
+            action_name := 'recovered';
             INSERT INTO adaptive_autovacuum.decisions
                 (relid, relation_name, state, action, reason, host_metrics,
-                 relation_metrics, proposed_reloptions, applied, error)
+                 relation_metrics, proposed_reloptions, applied)
             VALUES
-                (r.relid, r.fqname, relation_state, action_name, reason, host_json,
-                 relation_json, desired_values, false,
-                 CASE WHEN previous.ownership_conflict
-                      THEN 'A managed reloption changed outside the controller; automatic writes are suspended.'
-                      ELSE NULL END);
+                (r.relid, r.fqname, relation_state, action_name,
+                 format('Relation returned to normal (was %s).', previous.state),
+                 host_json, relation_json, NULL, false);
         END IF;
 
         IF relation_state = 'normal'
@@ -1583,13 +1485,19 @@ BEGIN
                 END;
             END IF;
 
-            INSERT INTO adaptive_autovacuum.decisions
-                (relid, relation_name, state, action, reason, host_metrics,
-                 relation_metrics, proposed_reloptions, applied, error)
-            VALUES
-                (r.relid, r.fqname, relation_state, action_name,
-                 'Relation remained healthy for the configured restore window.',
-                 host_json, relation_json, previous.managed_values, applied, action_error);
+            /* Same transition rule: real restores always, repeated dry-run proposals once. */
+            IF applied
+               OR action_error IS NOT NULL
+               OR previous.state IS DISTINCT FROM relation_state
+               OR previous.last_action IS DISTINCT FROM action_name THEN
+                INSERT INTO adaptive_autovacuum.decisions
+                    (relid, relation_name, state, action, reason, host_metrics,
+                     relation_metrics, proposed_reloptions, applied, error)
+                VALUES
+                    (r.relid, r.fqname, relation_state, action_name,
+                     'Relation remained healthy for the configured restore window.',
+                     host_json, relation_json, previous.managed_values, applied, action_error);
+            END IF;
 
             IF applied THEN
                 previous.original_reloptions := NULL;
@@ -1619,8 +1527,7 @@ BEGIN
                 WHERE q.relid = r.relid
                   AND q.status = 'failed'
                   AND q.next_retry_at > clock_timestamp())
-           /* Hard daily cap: with the escalating per-failure backoff this is
-              a backstop against any remaining retry-storm shape. */
+           /* Hard daily cap against any remaining retry-storm shape. */
            AND (SELECT count(*)
                 FROM adaptive_autovacuum.emergency_queue q
                 WHERE q.relid = r.relid
@@ -1640,9 +1547,7 @@ BEGIN
                 ELSE p.emergency_work_mem_min_mb
             END;
 
-            /* Takeover: cancel the hopeless autovacuum so the emergency
-               worker can acquire the relation lock.  Never cancels a manual
-               vacuum (emergency_takeover requires is_autovacuum). */
+            /* Takeover: cancel the stuck autovacuum (never a manual vacuum). */
             IF emergency_takeover THEN
                 PERFORM pg_catalog.pg_cancel_backend(r.vacuum_pid);
             END IF;
@@ -1652,8 +1557,7 @@ BEGIN
                  cost_limit, cost_delay_ms, lock_timeout_ms, is_wraparound)
             VALUES
                 (r.relid, r.fqname, reason,
-                 /* Worst tables first: priority = age in millions of
-                    transactions, so a 1.8B-age table outranks a 1.0B one. */
+                 /* Worst tables first: priority = age in millions of XIDs. */
                  1000 + (GREATEST(r.xid_age, r.mxid_age) / 1000000)::integer,
                  emergency_work_mem_mb,
                  CASE WHEN host_pressure THEN GREATEST(200, p.emergency_cost_limit / 2)
@@ -1674,63 +1578,89 @@ BEGIN
                  reason, host_json, relation_json, NULL, true);
         END IF;
 
-        INSERT INTO adaptive_autovacuum.relation_state AS target
-            (relid, relation_name, original_reloptions, original_captured, managed_values,
-             ownership_conflict, state, consecutive_overdue, consecutive_healthy,
-             last_seen_at, last_change_at, last_dead_tuples, last_live_tuples,
-             last_trigger, last_backlog_ratio,
-             last_inserts_since_vacuum, last_insert_backlog_ratio,
-             last_xid_age, last_mxid_age,
-             last_vacuum_pid, last_vacuum_progress, vacuum_stalled_cycles,
-             last_error)
-        VALUES
-            (r.relid, r.fqname, previous.original_reloptions, previous.original_captured, previous.managed_values,
-             previous.ownership_conflict, relation_state, overdue_cycles, healthy_cycles,
-             clock_timestamp(),
-             CASE WHEN applied THEN clock_timestamp() ELSE previous.last_change_at END,
-             r.dead_tuples, r.live_tuples, vacuum_trigger, backlog_ratio,
-             r.inserts_since_vacuum, insert_ratio,
-             r.xid_age, r.mxid_age,
-             r.vacuum_pid, cur_vacuum_progress, vacuum_stalled_cycles,
-             action_error)
-        ON CONFLICT (relid) DO UPDATE
-        SET relation_name = EXCLUDED.relation_name,
-            original_reloptions = EXCLUDED.original_reloptions,
-            original_captured = EXCLUDED.original_captured,
-            managed_values = EXCLUDED.managed_values,
-            ownership_conflict = EXCLUDED.ownership_conflict,
-            state = EXCLUDED.state,
-            consecutive_overdue = EXCLUDED.consecutive_overdue,
-            consecutive_healthy = EXCLUDED.consecutive_healthy,
-            last_seen_at = EXCLUDED.last_seen_at,
-            last_change_at = EXCLUDED.last_change_at,
-            last_dead_tuples = EXCLUDED.last_dead_tuples,
-            last_live_tuples = EXCLUDED.last_live_tuples,
-            last_trigger = EXCLUDED.last_trigger,
-            last_backlog_ratio = EXCLUDED.last_backlog_ratio,
-            last_inserts_since_vacuum = EXCLUDED.last_inserts_since_vacuum,
-            last_insert_backlog_ratio = EXCLUDED.last_insert_backlog_ratio,
-            last_xid_age = EXCLUDED.last_xid_age,
-            last_mxid_age = EXCLUDED.last_mxid_age,
-            last_vacuum_pid = EXCLUDED.last_vacuum_pid,
-            last_vacuum_progress = EXCLUDED.last_vacuum_progress,
-            vacuum_stalled_cycles = EXCLUDED.vacuum_stalled_cycles,
-            last_error = EXCLUDED.last_error;
+        new_last_change_at := CASE WHEN applied THEN clock_timestamp()
+                                   ELSE previous.last_change_at END;
+
+        /* Persist only what a later cycle needs; rewrite on control change or hourly heartbeat. */
+        state_needed := relation_state <> 'normal'
+                        OR previous.managed_values <> '{}'::jsonb
+                        OR previous.ownership_conflict
+                        OR previous.original_captured
+                        OR r.vacuum_pid IS NOT NULL
+                        OR action_error IS NOT NULL
+                        OR (new_last_change_at IS NOT NULL
+                            AND clock_timestamp() - new_last_change_at
+                                < make_interval(secs => p.change_cooldown_seconds));
+
+        IF NOT state_needed THEN
+            IF r.state_exists THEN
+                DELETE FROM adaptive_autovacuum.relation_state
+                WHERE relid = r.relid;
+            END IF;
+        ELSIF NOT r.state_exists
+              OR r.prev_relation_name IS DISTINCT FROM r.fqname
+              OR r.prev_original_reloptions IS DISTINCT FROM previous.original_reloptions
+              OR r.prev_original_captured IS DISTINCT FROM previous.original_captured
+              OR r.prev_managed_values IS DISTINCT FROM previous.managed_values
+              OR r.prev_ownership_conflict IS DISTINCT FROM previous.ownership_conflict
+              OR r.prev_state IS DISTINCT FROM relation_state
+              OR r.prev_consecutive_overdue IS DISTINCT FROM overdue_cycles
+              OR r.prev_consecutive_healthy IS DISTINCT FROM healthy_cycles
+              OR r.prev_last_change_at IS DISTINCT FROM new_last_change_at
+              OR r.prev_last_vacuum_pid IS DISTINCT FROM r.vacuum_pid
+              OR r.prev_last_vacuum_progress IS DISTINCT FROM cur_vacuum_progress
+              OR r.prev_vacuum_stalled_cycles IS DISTINCT FROM vacuum_stalled_cycles
+              OR r.prev_last_error IS DISTINCT FROM action_error
+              OR r.prev_last_action IS DISTINCT FROM action_name
+              OR r.prev_last_seen_at < clock_timestamp() - interval '1 hour'
+        THEN
+            INSERT INTO adaptive_autovacuum.relation_state AS target
+                (relid, relation_name, original_reloptions, original_captured, managed_values,
+                 ownership_conflict, state, consecutive_overdue, consecutive_healthy,
+                 last_seen_at, last_change_at, last_dead_tuples, last_live_tuples,
+                 last_trigger, last_backlog_ratio,
+                 last_inserts_since_vacuum, last_insert_backlog_ratio,
+                 last_xid_age, last_mxid_age,
+                 last_vacuum_pid, last_vacuum_progress, vacuum_stalled_cycles,
+                 last_error, last_action)
+            VALUES
+                (r.relid, r.fqname, previous.original_reloptions, previous.original_captured, previous.managed_values,
+                 previous.ownership_conflict, relation_state, overdue_cycles, healthy_cycles,
+                 clock_timestamp(),
+                 new_last_change_at,
+                 r.dead_tuples, r.live_tuples, vacuum_trigger, backlog_ratio,
+                 r.inserts_since_vacuum, insert_ratio,
+                 r.xid_age, r.mxid_age,
+                 r.vacuum_pid, cur_vacuum_progress, vacuum_stalled_cycles,
+                 action_error, action_name)
+            ON CONFLICT (relid) DO UPDATE
+            SET relation_name = EXCLUDED.relation_name,
+                original_reloptions = EXCLUDED.original_reloptions,
+                original_captured = EXCLUDED.original_captured,
+                managed_values = EXCLUDED.managed_values,
+                ownership_conflict = EXCLUDED.ownership_conflict,
+                state = EXCLUDED.state,
+                consecutive_overdue = EXCLUDED.consecutive_overdue,
+                consecutive_healthy = EXCLUDED.consecutive_healthy,
+                last_seen_at = EXCLUDED.last_seen_at,
+                last_change_at = EXCLUDED.last_change_at,
+                last_dead_tuples = EXCLUDED.last_dead_tuples,
+                last_live_tuples = EXCLUDED.last_live_tuples,
+                last_trigger = EXCLUDED.last_trigger,
+                last_backlog_ratio = EXCLUDED.last_backlog_ratio,
+                last_inserts_since_vacuum = EXCLUDED.last_inserts_since_vacuum,
+                last_insert_backlog_ratio = EXCLUDED.last_insert_backlog_ratio,
+                last_xid_age = EXCLUDED.last_xid_age,
+                last_mxid_age = EXCLUDED.last_mxid_age,
+                last_vacuum_pid = EXCLUDED.last_vacuum_pid,
+                last_vacuum_progress = EXCLUDED.last_vacuum_progress,
+                vacuum_stalled_cycles = EXCLUDED.vacuum_stalled_cycles,
+                last_error = EXCLUDED.last_error,
+                last_action = EXCLUDED.last_action;
+        END IF;
     END LOOP;
 
-    /*
-     * Wraparound safety scan.  Age-based protection must not depend on the
-     * performance scan's size/schema/table-policy filters: a tiny or excluded
-     * (e.g. pg_catalog) relation ages exactly like a large one and holds the
-     * database's datfrozenxid back on its own.  This pass covers every
-     * permanent heap relation and materialized view the performance scan did
-     * NOT evaluate, filtered down to the (normally empty) set whose age is
-     * already past the emergency stall line, and runs only the
-     * emergency/wraparound branch: no reloption management, no cost boosts.
-     * The safety scan never cancels a running vacuum (it has no per-relation
-     * progress state, so takeover evidence cannot exist here); it only
-     * escalates the never-started case.
-     */
+    /* Safety scan: relations the performance scan skipped; emergency branch only, never cancels. */
     FOR r IN
         WITH active_vacuum AS
         (
@@ -1767,8 +1697,7 @@ BEGIN
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_class tc ON tc.oid = c.reltoastrelid
         LEFT JOIN active_vacuum av ON av.relid = c.oid
-        /* Identity-checked: a row whose fingerprint no longer matches (OID
-           reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+        /* Identity-checked: fingerprint mismatch (OID reuse / rename) is ignored. */
         LEFT JOIN adaptive_autovacuum.table_policy tp
                ON tp.relid = c.oid
               AND tp.schema_name = n.nspname
@@ -1821,12 +1750,7 @@ BEGIN
         xid_horizon_blocked := horizon_age IS NOT NULL
                                AND horizon_age >= stall_xid_age;
 
-        /* The safety scan never takes over a running vacuum: it has no
-           per-relation state (these relations are invisible to the
-           performance scan), so it cannot observe progress across samples,
-           and cancelling without progress evidence is exactly the failure
-           mode takeover must avoid.  A running vacuum here is left alone;
-           only the never-started case escalates. */
+        /* No per-relation progress state here, so never take over a running vacuum. */
         emergency_due := r.vacuum_pid IS NULL
             AND (r.mxid_age >= stall_mxid_age
                  OR (NOT xid_horizon_blocked
@@ -1924,9 +1848,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    /* Local medians of the per-relation desired trigger settings (used both
-       for this database's published summary and, weighted, for the cluster
-       merge below). */
+    /* Local medians of the desired trigger settings (published and used in the cluster merge). */
     local_median_scale := NULL;
     local_median_thresh := NULL;
     local_median_ins_scale := NULL;
@@ -1948,14 +1870,7 @@ BEGIN
         FROM unnest(overdue_insert_thresholds) AS v;
     END IF;
 
-    /* Cluster merge: cluster-wide GUC decisions below rest on cluster-wide
-       evidence.  others_summary is the aggregate of the OTHER managed
-       databases' latest cycle summaries (shared memory, via the C worker);
-       this database's fresh numbers are added here.  Medians are combined as
-       overdue-count-weighted averages of the per-database medians - an
-       approximation of the true cluster median, but weighted toward where
-       the debt actually is.  Without a summary the local numbers stand
-       alone (single database, manual invocation, or first sweep). */
+    /* Cluster merge: fold others_summary in; medians = overdue-weighted averages. */
     cluster_db_count := COALESCE((others_summary ->> 'db_count')::integer, 0);
     cl_eligible := scanned_relation_count
                    + COALESCE((others_summary ->> 'eligible')::integer, 0);
@@ -1988,14 +1903,7 @@ BEGIN
         recommendation_reason := format('%s overdue relations were found without host pressure.', cl_overdue);
     END IF;
 
-    /*
-     * Worker-count recommendation.  Deliberately NOT gated on host pressure:
-     * PostgreSQL splits the shared vacuum_cost_limit across running workers,
-     * so more workers add parallelism without raising total un-boosted vacuum
-     * I/O.  When every worker slot is busy and relations are overdue, more
-     * workers is the fix regardless of cost settings; cost boosts can follow
-     * once a relaxed window arrives.
-     */
+    /* Worker-count recommendation, not gated on host pressure (cost_limit is shared across workers). */
     IF NOT autovacuum_enabled_global
        OR (cl_overdue <= current_autovacuum_workers
            AND NOT (av_workers_running >= current_autovacuum_workers
@@ -2004,9 +1912,7 @@ BEGIN
     ELSE
         recommended_workers := GREATEST(cl_overdue,
                                         current_autovacuum_workers + 1);
-        /* PG18 caps reloadable raises at autovacuum_worker_slots; PG17 has no
-           slots concept (the GUC itself needs a restart there), so the
-           recommendation is bounded by policy alone and stays record-only. */
+        /* PG18 caps at autovacuum_worker_slots; PG17 stays record-only (restart GUC). */
         recommended_workers := LEAST(recommended_workers,
                                      GREATEST(1, host_cpu_count / 4),
                                      p.recommendation_workers_max,
@@ -2040,13 +1946,7 @@ BEGIN
         END IF;
     END IF;
 
-    /*
-     * Mistuned-baseline detector: per-table reloptions are meant for outlier
-     * relations.  When a large share of eligible relations is overdue at once
-     * the global trigger settings are wrong, and the DBA should fix the
-     * baseline instead; recommend the median of the per-relation desired
-     * settings as the new cluster-wide baseline.
-     */
+    /* Mistuned baseline: many overdue relations = wrong global triggers; recommend the median. */
     recommended_scale := NULL;
     recommended_thresh := NULL;
     recommended_max_thresh := NULL;
@@ -2059,9 +1959,7 @@ BEGIN
         recommended_scale := cl_w_scale / cl_dead_overdue;
         recommended_thresh := round(cl_w_thresh / cl_dead_overdue)::integer;
 
-        /* Keep planner statistics in step with the corrected vacuum baseline:
-           analyze at half the vacuum scale factor (PostgreSQL's default
-           ratio), with sane floors. */
+        /* Analyze at half the vacuum scale factor (PostgreSQL's default ratio). */
         recommended_an_scale := GREATEST(0.005, recommended_scale * 0.5);
         recommended_an_thresh := GREATEST(50, recommended_thresh / 2);
 
@@ -2078,19 +1976,7 @@ BEGIN
             recommended_an_thresh);
     END IF;
 
-    /*
-     * PostgreSQL 18 trigger formula:
-     *   MIN(max_threshold, threshold + scale_factor * reltuples).
-     * The ceiling is what lets one sane percentage scale factor coexist with
-     * very large tables, so derive it from the fleet instead of a constant:
-     * the dead-tuple target of the LARGEST eligible relation
-     * (target_dead_tuple_ratio x its rows, clamped to the policy bounds).
-     * Smaller relations keep triggering via the scale factor because their
-     * computed trigger stays below the ceiling.  Hysteresis: tighten when the
-     * current ceiling is disabled or >10% looser than derived; raise only
-     * when it is grossly over-tight (< half of derived); anything in between
-     * is respected as operator intent.
-     */
+    /* PG18 trigger ceiling derived from the largest relation's dead-tuple target, with hysteresis. */
     IF server_vnum >= 180000
        AND cl_fleet_max > 0
        AND (current_vacuum_max_threshold < 0
@@ -2127,9 +2013,7 @@ BEGIN
             recommended_ins_thresh);
     END IF;
 
-    /* autovacuum_freeze_max_age sanity check.  Record-only: the GUC has
-       postmaster context, so it cannot be applied via ALTER SYSTEM + reload
-       and a DBA must change it deliberately. */
+    /* autovacuum_freeze_max_age sanity check; record-only (postmaster GUC). */
     IF freeze_max_age < 50000000 THEN
         recommendation_reason := recommendation_reason || format(
             ' WARNING: autovacuum_freeze_max_age is abnormally low (%s);'
@@ -2145,22 +2029,7 @@ BEGIN
             || ' automatically).', freeze_max_age);
     END IF;
 
-    /*
-     * vacuum_buffer_usage_limit (PG16+): the size of the Buffer Access
-     * Strategy ring VACUUM and ANALYZE use inside shared_buffers.  A larger
-     * ring CAN speed maintenance up, but every ring page displaces a regular
-     * shared-buffers page, and host free memory says nothing about
-     * shared-buffers cache pressure - so this heuristic is deliberately
-     * conservative and the caps do the real work: the policy ceiling, and
-     * 1/8 of shared_buffers divided across the worker pool, so concurrent
-     * rings can never occupy a disproportionate share of the buffer cache.
-     * Raised (at most doubled per cycle) only while autovacuum workers are
-     * actually running; halved back toward the built-in default under host
-     * pressure.  A setting of 0 ("no ring limit") is operator intent and
-     * never touched.  Note this is a separate signal from autovacuum_work_mem:
-     * repeated index passes indicate dead-tuple memory pressure and feed the
-     * work_mem heuristic above, not this one.
-     */
+    /* vacuum_buffer_usage_limit: cautious raise while workers run; policy and shared_buffers/8 caps. */
     recommended_buffer_usage_limit_kb := current_buffer_usage_limit_kb;
     IF current_buffer_usage_limit_kb > 0 THEN
         buffer_ring_cap_kb := LEAST(
@@ -2228,30 +2097,7 @@ BEGIN
          recommended_an_scale, recommended_an_thresh,
          recommendation_reason);
 
-    /*
-     * Cluster-first management: autovacuum is a cluster-wide phenomenon (one
-     * worker pool, one cost budget), so when enabled the recommendations are
-     * queued for the C worker to APPLY via ALTER SYSTEM + reload.  Per-table
-     * reloptions remain the tool for outlier relations only.  Changes are
-     * deduplicated (one pending row per GUC, no-op values filtered) and
-     * audited with their pre-change value.  DIFFERENT settings deliberately
-     * move together in one cycle: raising autovacuum_max_workers alone splits
-     * the same cost_limit across more workers, so the cost side has to be
-     * able to follow immediately.  The SAME setting, however, is applied at
-     * most once per two naptimes across ALL databases (enforced in the C
-     * worker via shared memory): every database recommends from its own
-     * tables only, and without that brake several busy databases could each
-     * double one value within a single launcher sweep.
-     * autovacuum_max_workers only ratchets up automatically; lowering it is
-     * left to the DBA.
-     *
-     * Every database still recommends from its own tables only, so on
-     * clusters with several busy databases the applied result is scan-order
-     * dependent.  Setting adaptive_autovacuum.global_settings_database names
-     * ONE database whose worker owns the cluster settings: all others record
-     * recommendations but neither queue nor apply them (the C worker enforces
-     * the apply side too).
-     */
+    /* Cluster-first: queue ALTER SYSTEM changes for the C worker (deduplicated, audited). */
     IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global
        AND (COALESCE(current_setting('adaptive_autovacuum.global_settings_database', true), '') = ''
             OR current_setting('adaptive_autovacuum.global_settings_database', true)
@@ -2266,9 +2112,7 @@ BEGIN
              trim(trailing '.' from to_char(recommended_cost_delay, 'FM999990.99')),
              trim(trailing '.' from to_char(current_global_cost_delay, 'FM999990.99'))),
             ('autovacuum_max_workers',
-             /* Reloadable only on PG18+ (worker slots); on PG17 the GUC is
-                PGC_POSTMASTER, so it stays a recorded recommendation and is
-                never queued for ALTER SYSTEM. */
+             /* Reloadable only on PG18+; on PG17 it stays a recorded recommendation. */
              CASE WHEN server_vnum >= 180000
                        AND recommended_workers > current_autovacuum_workers
                   THEN recommended_workers::text END,
@@ -2310,10 +2154,7 @@ BEGIN
         ) AS cand(guc_name, desired_value, current_value)
         WHERE cand.desired_value IS NOT NULL
           AND cand.desired_value::numeric IS DISTINCT FROM cand.current_value::numeric
-          /* Never enqueue a value outside the GUC's own documented bounds
-             (pg_settings min_val/max_val): ALTER SYSTEM would reject it in
-             the C worker, and the row would sit failing until expiry.  This
-             also drops GUCs the running server version does not have. */
+          /* Never enqueue outside pg_settings min/max (also drops GUCs this version lacks). */
           AND EXISTS (SELECT 1
                       FROM pg_settings s
                       WHERE s.name = cand.guc_name
@@ -2333,22 +2174,7 @@ BEGIN
     WHERE status = 'pending'
       AND requested_at < clock_timestamp() - interval '1 hour';
 
-    /*
-     * Missing planner statistics: a table that has live rows but was never
-     * analyzed in its whole life (no manual ANALYZE, no autoanalyze) leaves
-     * the planner estimating from hardcoded defaults.  Analyze the largest
-     * offenders directly, one at a time - unlike VACUUM, ANALYZE is legal
-     * inside a function's transaction.  Deliberately NOT gated on
-     * min_table_bytes: missing statistics mislead the planner regardless of
-     * table size, and n_live_tup > 0 already proves there is something to
-     * sample.  Once a table has been analyzed its last_analyze timestamp is
-     * set and it never qualifies again, so the feature self-limits to new or
-     * freshly stats-reset tables; a failed attempt (lock timeout) is simply
-     * retried on a later cycle.  This runs LAST among the cycle's actions
-     * because each ANALYZE holds a ShareUpdateExclusive lock until the cycle
-     * transaction commits.  Skipped under host pressure: sampling large
-     * tables is real I/O.
-     */
+    /* Never-analyzed tables: ANALYZE the largest, last in the cycle, not under host pressure. */
     IF p.analyze_missing_stats
        AND p.analyze_missing_stats_per_cycle > 0
        AND NOT host_pressure THEN
@@ -2358,8 +2184,7 @@ BEGIN
                    pg_stat_get_live_tuples(c.oid)::bigint AS live_tuples
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            /* Identity-checked: a row whose fingerprint no longer matches (OID
-               reuse after DROP, or a rename awaiting re-adoption) is ignored. */
+            /* Identity-checked: fingerprint mismatch (OID reuse / rename) is ignored. */
             LEFT JOIN adaptive_autovacuum.table_policy tp
                    ON tp.relid = c.oid
                   AND tp.schema_name = n.nspname
@@ -2405,10 +2230,7 @@ BEGIN
     WHERE state.last_seen_at < clock_timestamp() - interval '7 days'
       AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = state.relid);
 
-    /* Operator intent must not outlive its relation: a dropped relation's
-       OID can be reused by an unrelated table later.  Identity-mismatched
-       rows (rename, or an OID already reused) are NOT deleted - they are
-       ignored by the scans above and wait for explicit re-adoption. */
+    /* Drop table_policy rows for dropped relations; mismatched rows wait for re-adoption. */
     DELETE FROM adaptive_autovacuum.table_policy tp
     WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = tp.relid);
 
@@ -2427,8 +2249,7 @@ BEGIN
       AND coalesce(applied_at, requested_at)
           < clock_timestamp() - make_interval(days => p.history_retention_days);
 
-    /* This database's cycle summary, published by the C worker to shared
-       memory so the other databases' cluster merges can see it. */
+    /* This database's cycle summary, published to shared memory by the C worker. */
     o_eligible := scanned_relation_count;
     o_overdue := overdue_relation_count;
     o_dead_overdue := dead_overdue_count;
@@ -2462,8 +2283,12 @@ SELECT
     state.original_captured,
     state.managed_values,
     state.ownership_conflict,
-    state.last_error
+    state.last_error,
+    state.last_action
 FROM adaptive_autovacuum.relation_state state;
+
+COMMENT ON VIEW adaptive_autovacuum.relation_status IS
+'Relations the controller currently has state for: non-normal, managed, in conflict, being vacuumed, cooling down, or with a failed action. Healthy unmanaged relations are absent by design. The last_* metric columns are as of the last row write (control change or hourly heartbeat), not of the last scan.';
 
 CREATE VIEW adaptive_autovacuum.changed_tables AS
 SELECT
@@ -2482,11 +2307,7 @@ WHERE state.managed_values <> '{}'::jsonb;
 COMMENT ON VIEW adaptive_autovacuum.changed_tables IS
 'One row per (relation, reloption) currently set by the controller: original value (NULL = was inherited from the global default) vs controller-set value.';
 
-/* Cluster-wide wraparound early-warning board (one row per database),
-   modeled on the AWS RDS MaximumUsedTransactionIDs alarm:
-   watch at half the emergency threshold (500M by default), alarm at the
-   threshold itself (1B by default).  PostgreSQL stops accepting writes
-   ~3M transactions before the 2^31 wrap point. */
+/* Per-database wraparound board: watch at half the emergency age, alarm at the age itself. */
 CREATE VIEW adaptive_autovacuum.wraparound_status AS
 SELECT
     d.datname,
@@ -2534,8 +2355,7 @@ SELECT
     progress.index_vacuum_count,
     progress.max_dead_tuple_bytes,
     progress.dead_tuple_bytes,
-    /* PG18+ column, NULL on PG17; the jsonb detour lets one view definition
-       parse on both versions. */
+    /* PG18+ column, NULL on PG17 via the jsonb detour. */
     ((to_jsonb(progress) ->> 'delay_time'))::double precision AS delay_time,
     activity.query LIKE '%(to prevent wraparound)' AS antiwraparound,
     activity.backend_type = 'autovacuum worker' AS is_autovacuum
@@ -2545,7 +2365,9 @@ JOIN pg_stat_activity activity ON activity.pid = progress.pid;
 COMMENT ON TABLE adaptive_autovacuum.policy IS
 'One-row policy table. enabled and dry_run are independent safety gates.';
 COMMENT ON TABLE adaptive_autovacuum.relation_state IS
-'Controller ownership, hysteresis counters, and reversible reloption state.';
+'Controller ownership, hysteresis counters, and reversible reloption state. Rows exist only for relations with something to remember (non-normal, managed, conflict, vacuum fingerprint, cooldown, error) and are rewritten only on a control change or hourly.';
+COMMENT ON TABLE adaptive_autovacuum.decisions IS
+'Transition log (UNLOGGED): one row when a relation enters a (state, action) pair, when a change is applied or fails, and when it returns to normal. Not a per-cycle trace.';
 COMMENT ON TABLE adaptive_autovacuum.global_recommendations IS
 'Cluster-level ALTER SYSTEM recommendations; the extension does not apply them automatically.';
 COMMENT ON TABLE adaptive_autovacuum.emergency_queue IS
@@ -2562,8 +2384,6 @@ GRANT SELECT ON adaptive_autovacuum.relation_status,
                 adaptive_autovacuum.active_vacuums,
                 adaptive_autovacuum.wraparound_status
 TO PUBLIC;
-/* host_metrics() reports host-level CPU/memory/load figures; on locked-down
-   multi-tenant systems that is not for every role, so it goes to the
-   monitoring role instead of PUBLIC. */
+/* Host metrics go to pg_monitor, not PUBLIC. */
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.host_metrics() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION adaptive_autovacuum.horizon_blocker() TO PUBLIC;

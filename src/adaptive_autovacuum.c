@@ -1,13 +1,4 @@
-/*
- * adaptive_autovacuum.c
- *
- * PostgreSQL 17+ adaptive autovacuum controller (full feature set on 18).
- *
- * The C layer deliberately owns only process orchestration, host metric
- * collection, and the guarded manual VACUUM execution path.  The control
- * policy and reversible table-reloption changes live in the extension SQL
- * script so they can evolve without relying on additional PostgreSQL internals.
- */
+/* adaptive_autovacuum.c: orchestration, host metrics, guarded emergency VACUUM; policy is SQL. */
 
 #include "postgres.h"
 
@@ -50,12 +41,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-/* PostgreSQL 17 is the floor: pg_stat_progress_vacuum gained the
-   *_dead_tuple_bytes columns in 17.  On 17 the PG18-only surface degrades
-   gracefully: no eager-freeze tuning on emergency vacuums (below), and the
-   SQL policy skips autovacuum_vacuum_max_threshold, autovacuum_worker_slots,
-   delay_time accounting, and the automatic autovacuum_max_workers apply
-   (PGC_POSTMASTER on 17). */
+/* PG17 floor (dead_tuple_bytes columns); PG18-only surface degrades gracefully. */
 #if PG_VERSION_NUM < 170000
 #error "adaptive_autovacuum requires PostgreSQL 17 or later"
 #endif
@@ -113,10 +99,7 @@ typedef struct AAVEmergencyRequest
 /* Fixed capacity for per-GUC apply timestamps; must cover the whitelist. */
 #define AAV_GLOBAL_GUC_SLOTS 16
 
-/* One managed database's most recent cycle summary, published after every
-   policy cycle so the other databases' cluster merges can see it.  This is
-   what makes cluster-wide GUC recommendations rest on cluster-wide evidence
-   instead of one database's tables. */
+/* One database's latest cycle summary, published for the other databases' cluster merges. */
 typedef struct AAVDbSummary
 {
     Oid dboid;
@@ -154,9 +137,7 @@ typedef struct AAVSharedState
     slock_t mutex;
     pid_t emergency_worker_pid;
     Oid emergency_database_oid;
-    /* Last successful cluster-wide apply per whitelisted GUC, indexed by the
-       GUC's position in aav_allowed_global_gucs; limits any one GUC to one
-       apply per cooldown window cluster-wide. */
+    /* Last cluster-wide apply per whitelisted GUC (one apply per cooldown window). */
     TimestampTz global_applied_at[AAV_GLOBAL_GUC_SLOTS];
     /* Latest per-database cycle summaries (see AAVDbSummary). */
     AAVDbSummary summaries[AAV_SUMMARY_SLOTS];
@@ -216,11 +197,7 @@ _PG_init(void)
                              NULL,
                              NULL);
 
-    /* PGC_SIGHUP, not PGC_POSTMASTER: _PG_init also runs when the library is
-       loaded on demand (CREATE EXTENSION without shared_preload_libraries),
-       and defining a PGC_POSTMASTER custom variable after startup is FATAL.
-       The launcher reads this at startup; changes take effect when it
-       restarts. */
+    /* PGC_SIGHUP: a PGC_POSTMASTER custom GUC is FATAL when loaded on demand; read at launcher start. */
     DefineCustomStringVariable("adaptive_autovacuum.control_database",
                                "Database used by the cluster launcher.",
                                "The launcher reads pg_database here and starts one database worker at a time.",
@@ -232,13 +209,7 @@ _PG_init(void)
                                NULL,
                                NULL);
 
-    /* Each database with manage_global_settings enabled recommends and
-       applies cluster-wide settings from its own tables only.  On clusters
-       with several busy databases that is scan-order dependent; naming one
-       designated database here makes exactly one worker own the globals
-       (both the queueing in the SQL policy and the ALTER SYSTEM apply).
-       Empty keeps the legacy behavior: every database may apply, throttled
-       by the shared per-GUC cooldown. */
+    /* Optional designated database that alone queues and applies cluster settings; empty = legacy. */
     DefineCustomStringVariable("adaptive_autovacuum.global_settings_database",
                                "Only this database's worker manages cluster-wide settings.",
                                "Empty means every database with manage_global_settings enabled may queue and apply them.",
@@ -250,8 +221,7 @@ _PG_init(void)
                                NULL,
                                NULL);
 
-    /* The real revisit period of one database is the scan runtime of the
-       databases ahead of it plus this naptime, not the naptime alone. */
+    /* Real revisit period = runtime of the databases ahead plus this naptime. */
     DefineCustomIntVariable("adaptive_autovacuum.naptime_seconds",
                             "Seconds the launcher sleeps after finishing one scan of all databases.",
                             NULL,
@@ -265,12 +235,7 @@ _PG_init(void)
                             NULL,
                             NULL);
 
-    /* One slow database (large policy scan, lock waits, or the in-cycle
-       ANALYZE of a big never-analyzed table) must not delay the wraparound
-       checks of every database scheduled after it.  Emergency VACUUMs
-       already run in their own dedicated worker; the default of 2 keeps the
-       routine checks flowing past one busy database as well.  1 gives the
-       strictly serial scan. */
+    /* Concurrent database workers so one slow database cannot delay the others; 1 = serial. */
     DefineCustomIntVariable("adaptive_autovacuum.max_database_workers",
                             "Database workers the launcher may run concurrently.",
                             NULL,
@@ -298,10 +263,7 @@ _PG_init(void)
                             NULL,
                             NULL);
 
-    /* A long emergency VACUUM must never be killed by the database-worker
-       supervision timeout (that produced an abort/retry livelock on tables
-       whose freeze pass exceeds one hour), so the dedicated emergency worker
-       carries its own, much longer budget.  0 disables the timeout. */
+    /* Own, longer budget for emergency VACUUMs (worker timeout livelocked them); 0 = off. */
     DefineCustomIntVariable("adaptive_autovacuum.emergency_timeout_seconds",
                             "Maximum runtime of one guarded emergency VACUUM.",
                             "Applies per queued relation inside the dedicated emergency worker; 0 disables the limit.",
@@ -594,11 +556,7 @@ aav_apply_cgroup_memory_limit(AAVHostMetrics *metrics)
 #endif
 
 #ifdef WIN32
-/*
- * Windows has no load average.  Sample the system-wide CPU busy fraction
- * over a short window instead.  GetSystemTimes() kernel time includes idle
- * time, so busy = (kernel + user - idle) / (kernel + user).
- */
+/* Windows has no load average: use the CPU busy fraction (kernel time includes idle). */
 static double
 aav_windows_cpu_busy_fraction(void)
 {
@@ -661,12 +619,7 @@ aav_collect_host_metrics(AAVHostMetrics *metrics)
             metrics->mem_available_bytes = (int64) memory_status.ullAvailPhys;
         }
 
-        /*
-         * CPU busy fraction scaled by CPU count approximates a load average.
-         * Unlike a Unix load average it has no run-queue component and so
-         * cannot exceed the CPU count; Windows deployments should size
-         * policy.high_load_per_cpu accordingly (e.g. 0.85 instead of 1.5).
-         */
+        /* Busy fraction x CPU count approximates load but cannot exceed the CPU count. */
         metrics->load1 = aav_windows_cpu_busy_fraction() * metrics->cpu_count;
     }
 #else
@@ -788,12 +741,7 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        /*
-         * Explicit standby guard (defense in depth): the launcher and its
-         * workers use BgWorkerStart_RecoveryFinished, so on a hot standby
-         * none of this ever starts until promotion.  Should this process
-         * nevertheless observe recovery, it stays strictly observational.
-         */
+        /* Standby guard (defense in depth): stay observational during recovery. */
         if (aav_enabled && RecoveryInProgress())
         {
             elog(LOG,
@@ -820,11 +768,7 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
         if (rc & WL_POSTMASTER_DEATH)
             proc_exit(1);
 
-        /*
-         * Absorb pending interrupts, notably ProcSignalBarriers: DROP
-         * DATABASE waits on every process in the cluster, so a wait loop
-         * without this blocks it indefinitely.
-         */
+        /* Absorb interrupts (ProcSignalBarriers) or DROP DATABASE waits forever. */
         CHECK_FOR_INTERRUPTS();
     }
 
@@ -931,13 +875,7 @@ typedef struct AAVWorkerSlot
     bool in_use;
 } AAVWorkerSlot;
 
-/*
- * Run one database worker per listed database, at most max_database_workers
- * concurrently (default 2, so one slow database cannot delay the wraparound
- * checks of every database scheduled after it; 1 gives the historical
- * strictly serial scan).  Each worker still gets its own
- * database_worker_timeout_seconds budget.
- */
+/* Run database workers, at most max_database_workers concurrently, each with its own timeout. */
 static void
 aav_run_database_workers(List *databases)
 {
@@ -1057,13 +995,7 @@ adaptive_autovacuum_database_main(Datum main_arg)
         aav_execute_policy_cycle(&metrics);
         aav_apply_global_settings();
 
-        /*
-         * Emergency VACUUMs run in a dedicated worker (fire-and-forget):
-         * executing them here put the vacuum under the launcher's
-         * database_worker_timeout_seconds, so a freeze pass longer than that
-         * was killed and retried forever, and it stalled the launcher's scan
-         * of the remaining databases for up to the whole timeout.
-         */
+        /* Emergency VACUUMs run in a dedicated worker; under the worker timeout they livelocked. */
         if (!aav_got_sigterm && aav_has_pending_emergency_request())
             started_emergency = aav_start_emergency_worker(dboid);
 
@@ -1154,11 +1086,7 @@ aav_extension_enabled_in_database(void)
     return installed && enabled;
 }
 
-/*
- * Sum the other managed databases' latest cycle summaries.  Slots older than
- * ten naptimes are ignored (their database is gone, disabled, or the cluster
- * was just restarted).  Returns the number of contributing databases.
- */
+/* Sum the other databases' summaries (slots older than ten naptimes ignored); returns the count. */
 static int
 aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
 {
@@ -1340,10 +1268,7 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
     CommitTransactionCommand();
 }
 
-/*
- * GUCs the policy is allowed to change cluster-wide.  Everything else queued
- * in global_apply_queue is rejected and marked failed.
- */
+/* GUCs the policy may change cluster-wide; anything else is marked failed. */
 static const char *const aav_allowed_global_gucs[] = {
     "autovacuum_vacuum_cost_limit",
     "autovacuum_vacuum_cost_delay",
@@ -1411,15 +1336,7 @@ aav_mark_global_change(int64 id, const char *status,
         4, argtypes, values, nulls, false, 0);
 }
 
-/*
- * Apply pending cluster-wide setting changes queued by the SQL policy.
- *
- * ALTER SYSTEM cannot be executed through SPI (PreventInTransactionBlock
- * rejects utility statements coming from functions), so this calls the
- * exported AlterSystemSetConfigFile() entry point directly and then signals
- * the postmaster to reload.  Autovacuum settings changed here are all
- * PGC_SIGHUP in PostgreSQL 18, so they take effect without a restart.
- */
+/* Apply queued cluster settings via AlterSystemSetConfigFile() + reload (SPI cannot). */
 static void
 aav_apply_global_settings(void)
 {
@@ -1436,9 +1353,7 @@ aav_apply_global_settings(void)
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* When a designated global-settings database is configured, only its
-       worker may run ALTER SYSTEM; the SQL policy in other databases also
-       stops queueing, so this guard mostly covers leftover queue rows. */
+    /* Only the designated database's worker may run ALTER SYSTEM. */
     if (aav_global_settings_database != NULL &&
         aav_global_settings_database[0] != '\0')
     {
@@ -1518,13 +1433,7 @@ aav_apply_global_settings(void)
             continue;
         }
 
-        /*
-         * Cross-database cooldown: each database recommends cluster settings
-         * from its own tables only, so several busy databases could each
-         * double the same GUC within one launcher sweep (2^N escalation).
-         * Allow one cluster-wide apply per GUC per two naptimes; a skipped
-         * row simply stays pending and is retried on a later cycle.
-         */
+        /* Cross-database cooldown: one apply per GUC per two naptimes; skipped rows stay pending. */
         if (aav_shared_state == NULL)
             aav_attach_shared_state();
         if (aav_shared_state != NULL)
@@ -1551,17 +1460,7 @@ aav_apply_global_settings(void)
             continue;
         }
 
-        /*
-         * autovacuum_max_workers must not exceed autovacuum_worker_slots:
-         * the server ACCEPTS a larger value (it only warns and caps the
-         * effective worker count at runtime), so neither the GUC bounds
-         * validation below nor the SQL policy's queue-time pg_settings check
-         * would reject it.  The policy caps its own recommendation, but a
-         * queued row can outlive a restart that lowered the slot count
-         * (autovacuum_worker_slots is postmaster-context), and manual queue
-         * inserts bypass the policy entirely.  The slots GUC does not exist
-         * before PostgreSQL 18, so this check is inert there.
-         */
+        /* autovacuum_max_workers must not exceed autovacuum_worker_slots; inert before PG18. */
         if (strcmp(names[i], "autovacuum_max_workers") == 0)
         {
             const char *slots = GetConfigOption("autovacuum_worker_slots",
@@ -1594,14 +1493,7 @@ aav_apply_global_settings(void)
         stmt = makeNode(AlterSystemStmt);
         stmt->setstmt = setstmt;
 
-        /*
-         * AlterSystemSetConfigFile() runs the GUC's own parse/bounds
-         * validation and ERRORs on a value the server would not accept.
-         * Isolate each row in a subtransaction so one bad value is marked
-         * failed and the remaining rows still apply; without this the whole
-         * apply transaction aborts, every row stays pending, and the worker
-         * re-hits the same error each cycle until the one-hour queue expiry.
-         */
+        /* Subtransaction per row so one rejected value does not block the rest. */
         oldcontext = CurrentMemoryContext;
         oldowner = CurrentResourceOwner;
         BeginInternalSubTransaction(NULL);
@@ -1702,13 +1594,7 @@ aav_has_pending_emergency_request(void)
     return pending;
 }
 
-/*
- * Fire-and-forget: the database worker only registers the emergency worker
- * and exits.  Serialization happens inside the emergency worker via the
- * shared-memory slot; if another emergency VACUUM is already running
- * cluster-wide the new worker exits immediately and the queued request is
- * retried on a later cycle.
- */
+/* Fire-and-forget: register the emergency worker and exit; the shmem slot serializes. */
 static bool
 aav_start_emergency_worker(Oid dboid)
 {
@@ -1740,11 +1626,7 @@ aav_start_emergency_worker(Oid dboid)
     return true;
 }
 
-/*
- * SIGALRM context: flags only.  QueryCancelPending makes the next
- * CHECK_FOR_INTERRUPTS() inside vacuum() throw a cancel error, which the
- * per-request PG_CATCH turns into a 'failed' queue row.
- */
+/* SIGALRM context: flags only; the cancel surfaces at the next CHECK_FOR_INTERRUPTS(). */
 static void
 aav_emergency_timeout_handler(void)
 {
@@ -1768,8 +1650,7 @@ adaptive_autovacuum_emergency_main(Datum main_arg)
 
     BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
-    /* One emergency VACUUM cluster-wide; the slot is released by the
-       before_shmem_exit hook even on abnormal exit. */
+    /* One emergency VACUUM cluster-wide; slot released by the before_shmem_exit hook. */
     if (!aav_try_acquire_emergency_slot(dboid))
         proc_exit(0);
 
@@ -1790,8 +1671,7 @@ adaptive_autovacuum_emergency_main(Datum main_arg)
             disable_timeout(timeout_id, false);
             if (aav_emergency_timed_out)
             {
-                /* The vacuum finished in the same instant the timeout fired;
-                   do not let the stale cancel abort the bookkeeping. */
+                /* Vacuum finished as the timeout fired; ignore the stale cancel. */
                 aav_emergency_timed_out = false;
                 QueryCancelPending = false;
             }
@@ -1928,9 +1808,7 @@ aav_finish_emergency_request(const AAVEmergencyRequest *request,
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* Escalating backoff: the Nth recent failure for the same relation waits
-       N x 5 minutes (capped at 2 hours) before the policy may requeue it, so
-       a vacuum that keeps failing cannot become a fixed-cadence retry storm. */
+    /* Escalating backoff: Nth recent failure waits N x 5 min (cap 2 h). */
     spi_rc = SPI_execute_with_args(
         "UPDATE adaptive_autovacuum.emergency_queue q "
         "SET status = $2, "
@@ -1989,15 +1867,7 @@ aav_run_emergency_vacuum(const AAVEmergencyRequest *request)
     SetConfigOption("vacuum_cost_delay", cost_delay, PGC_USERSET, PGC_S_SESSION);
     SetConfigOption("lock_timeout", lock_timeout, PGC_USERSET, PGC_S_SESSION);
 
-    /*
-     * Emergency profile, matching PostgreSQL's own wraparound failsafe: the
-     * goal is advancing relfrozenxid, not reclaiming space.  Freeze
-     * everything visible (min ages 0), force an aggressive scan (table ages
-     * 0), skip index vacuuming (the most expensive phase, irrelevant to
-     * freezing; a later normal vacuum cleans the indexes), and skip the
-     * tail-truncation phase (needs ACCESS EXCLUSIVE).  TOAST is still
-     * processed because it carries its own relfrozenxid.
-     */
+    /* Failsafe-style profile: freeze everything, skip index vacuuming and truncation, TOAST included. */
     MemSet(&params, 0, sizeof(params));
     params.options = VACOPT_VACUUM |
                      VACOPT_PROCESS_MAIN |
@@ -2023,11 +1893,7 @@ aav_run_emergency_vacuum(const AAVEmergencyRequest *request)
     relations = list_make1(makeVacuumRelation(NULL, request->relid, NIL));
     MemoryContextSwitchTo(old_context);
 
-    /*
-     * vacuum() is PostgreSQL's exported internal entry point.  Like the core
-     * utility command, it expects an outer command transaction and manages
-     * per-relation transactions itself.
-     */
+    /* vacuum() expects an outer command transaction and manages per-relation ones itself. */
     StartTransactionCommand();
     vacuum(relations, &params, NULL, vac_context, true);
     CommitTransactionCommand();
