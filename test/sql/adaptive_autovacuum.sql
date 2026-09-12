@@ -118,6 +118,18 @@ FROM adaptive_autovacuum.changed_tables;
 SELECT count(*) = 0 AS global_apply_queue_empty
 FROM adaptive_autovacuum.global_apply_queue;
 
+-- Summary-slot status works with and without preload (capacity 0 = not preloaded).
+SELECT available = (capacity > 0) AND used >= 0 AND NOT overflow
+       AS cluster_summary_status_sane
+FROM adaptive_autovacuum.cluster_summary_status();
+
+-- Size estimate: relpages when known; exact size only for unanalyzed relations with enough tuples.
+SELECT adaptive_autovacuum._relation_bytes(10, 0, 0, 67108864, 8192, 'aav_test'::regclass) = 81920
+       AND adaptive_autovacuum._relation_bytes(0, 100, 0, 67108864, 8192, 'aav_test'::regclass) = 0
+       AND adaptive_autovacuum._relation_bytes(0, 9000, 0, 67108864, 8192, 'aav_test'::regclass)
+           = pg_total_relation_size('aav_test'::regclass)
+       AS relation_bytes_estimate;
+
 SELECT emergency_xid_age = 1000000000
        AND emergency_mxid_age = 1000000000
        AND emergency_stall_multiplier = 1.5

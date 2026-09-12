@@ -664,6 +664,48 @@ Not yet exercised: the hosted CI run for this revision, and a lab-scale run
 with tens of thousands of relations (the benchmark above is a
 proportionality check, not a scale test).
 
+## Validation performed 2026-09-12 (review: summary slots, catalog scan cost, size fallback)
+
+Changes under test: (1) the per-database summary slot array is sized by the
+new postmaster GUC `adaptive_autovacuum.max_tracked_databases` (default
+256); only stale slots are reused, an overflow drops the summary, warns
+once, is reported by `cluster_summary_status()` and flips
+`evidence_complete` to false in the aggregate, which makes cluster-wide
+changes record-only; (2) the candidate query parses reloptions once per
+relation in a LATERAL instead of ~17 `_option_value()` calls, the loop only
+receives relations that can be non-normal (pressure at half the elevated
+ratio, age at half the warning ratio, a state row, or a running vacuum)
+while the fleet count and largest target come from one aggregate query, and
+the relation jsonb is built only when a decision can be written; (3) the
+exact `pg_total_relation_size()` fallback runs only for never-analyzed
+relations whose tuple statistics reach `min_table_bytes / block_size`
+(`_relation_bytes()`, confirmed inlined by EXPLAIN VERBOSE).
+
+- `make installcheck` green on WSL AlmaLinux 9 against PGDG 17.11 and 18.6,
+  twice each (on demand and preloaded), with two new checks: the status
+  function returns a sane row with and without shared memory, and the size
+  estimate picks relpages, zero, or the exact size as specified. The DLL
+  builds with MSVC 2022 against PG 18.4 on Windows.
+- Scale benchmark on WSL PG 18.6 (24 CPU, 4 GB shared_buffers): one
+  database with 100,000 small tables (1,000 of them overdue) and one with
+  20,000 never-analyzed tables, dry run, three cycles each, steady-state
+  wall time per cycle before and after this revision:
+
+  | scenario | before | after |
+  |---|---|---|
+  | 100,000 tables, `min_table_bytes = 0` (every table eligible, 1,000 overdue) | 5.3 s | 1.7 s |
+  | 100,000 tables, default `min_table_bytes` (64 MB, all filtered by size) | 0.58 s | 0.57 s |
+  | 20,000 never-analyzed tables, default `min_table_bytes` | 0.65 s | 0.15 s |
+
+  The default-filter case is bounded by the catalog scans themselves (three
+  passes over a 300,000-row `pg_class` including TOAST relations), which is
+  the same order of work core's autovacuum launcher does per naptime. The
+  eligible-everything case was dominated by per-relation `_option_value()`
+  calls and the loop body for healthy relations; both are gone.
+- Not exercised: an overflow drill with more than 256 managed databases
+  (the eviction and record-only paths are covered by code review and the
+  status function only), and the hosted CI run for this revision.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:

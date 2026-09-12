@@ -111,6 +111,9 @@ SELECT reason FROM adaptive_autovacuum.latest_global_recommendation;
 -- cluster would go read-only, and an ok / watch / alarm verdict
 SELECT * FROM adaptive_autovacuum.wraparound_status;
 
+-- shared-memory summary slots: capacity, in use, and whether evidence overflowed
+SELECT * FROM adaptive_autovacuum.cluster_summary_status();
+
 -- decision history: every state or action transition, every applied change,
 -- every error, and the return to normal that closes an episode
 SELECT decided_at, relation_name, state, action, applied, error
@@ -261,6 +264,7 @@ Server settings (`postgresql.conf`):
 | `adaptive_autovacuum.naptime_seconds` | `60` | sleep after one full pass over all databases (the revisit period of a database is the pass time plus this) |
 | `adaptive_autovacuum.control_database` | `postgres` | where the coordinator connects |
 | `adaptive_autovacuum.max_database_workers` | `2` | how many databases may be checked at the same time. The default of 2 keeps one busy database (for example one running its in-cycle ANALYZE of a large table) from delaying the checks of the others; set 1 for a strictly serial scan |
+| `adaptive_autovacuum.max_tracked_databases` | `256` | shared-memory capacity for per-database cycle summaries (postmaster setting, needs a restart). With more managed databases than this, the cluster evidence is incomplete: a warning is logged, `cluster_summary_status()` reports the overflow, and cluster-wide changes are recorded but not applied until it is raised |
 | `adaptive_autovacuum.global_settings_database` | empty | name one database as the sole owner of cluster-wide setting changes; empty lets every managed database apply them (throttled by the shared once-per-two-cycles rule) |
 | `adaptive_autovacuum.database_worker_timeout_seconds` | `3600` | give-up time for one database's check (emergency vacuums are exempt - they run in their own worker) |
 | `adaptive_autovacuum.emergency_timeout_seconds` | `86400` | give-up time for one emergency vacuum; `0` = unlimited |

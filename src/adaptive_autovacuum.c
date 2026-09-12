@@ -18,6 +18,8 @@
 #include "commands/vacuum.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "funcapi.h"
+#include "access/htup_details.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -54,6 +56,7 @@ PGDLLEXPORT void adaptive_autovacuum_database_main(Datum main_arg);
 PGDLLEXPORT void adaptive_autovacuum_emergency_main(Datum main_arg);
 
 PG_FUNCTION_INFO_V1(adaptive_autovacuum_host_metrics);
+PG_FUNCTION_INFO_V1(adaptive_autovacuum_cluster_summary_status);
 
 static bool aav_enabled = false;
 static char *aav_control_database = NULL;
@@ -115,12 +118,11 @@ typedef struct AAVDbSummary
     double median_ins_thresh;
 } AAVDbSummary;
 
-#define AAV_SUMMARY_SLOTS 64
-
 /* Aggregate of the other databases' summaries handed to the SQL policy. */
 typedef struct AAVClusterAgg
 {
     int db_count;
+    bool complete;
     int64 eligible;
     int64 overdue;
     int64 dead_overdue;
@@ -139,10 +141,19 @@ typedef struct AAVSharedState
     Oid emergency_database_oid;
     /* Last cluster-wide apply per whitelisted GUC (one apply per cooldown window). */
     TimestampTz global_applied_at[AAV_GLOBAL_GUC_SLOTS];
-    /* Latest per-database cycle summaries (see AAVDbSummary). */
-    AAVDbSummary summaries[AAV_SUMMARY_SLOTS];
+    /* Summary capacity (adaptive_autovacuum.max_tracked_databases) and overflow bookkeeping. */
+    int summary_capacity;
+    int64 summary_overflow_count;
+    TimestampTz summary_overflow_at;
+    /* Latest per-database cycle summaries, summary_capacity entries. */
+    AAVDbSummary summaries[FLEXIBLE_ARRAY_MEMBER];
 } AAVSharedState;
 
+#define AAV_SHARED_STATE_SIZE(n) \
+    (offsetof(AAVSharedState, summaries) + sizeof(AAVDbSummary) * (n))
+
+static int aav_max_tracked_databases = 256;
+static bool aav_preloaded = false;
 static AAVSharedState *aav_shared_state = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -288,6 +299,22 @@ _PG_init(void)
                              NULL,
                              NULL);
 
+    /* Sizes shared memory, so postmaster-only; defining it on demand-load would be FATAL. */
+    aav_preloaded = process_shared_preload_libraries_in_progress;
+    if (aav_preloaded)
+        DefineCustomIntVariable("adaptive_autovacuum.max_tracked_databases",
+                                "Shared-memory capacity for per-database cycle summaries.",
+                                "Above this many managed databases the cluster evidence is incomplete and cluster-wide changes are recorded only.",
+                                &aav_max_tracked_databases,
+                                256,
+                                1,
+                                65536,
+                                PGC_POSTMASTER,
+                                0,
+                                NULL,
+                                NULL,
+                                NULL);
+
     MarkGUCPrefixReserved("adaptive_autovacuum");
 
     if (!process_shared_preload_libraries_in_progress)
@@ -320,7 +347,7 @@ aav_shmem_request(void)
     if (prev_shmem_request_hook != NULL)
         prev_shmem_request_hook();
 
-    RequestAddinShmemSpace(MAXALIGN(sizeof(AAVSharedState)));
+    RequestAddinShmemSpace(MAXALIGN(AAV_SHARED_STATE_SIZE(aav_max_tracked_databases)));
 }
 
 static void
@@ -339,14 +366,77 @@ aav_attach_shared_state(void)
 
     LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
     aav_shared_state = ShmemInitStruct("adaptive autovacuum shared state",
-                                      sizeof(AAVSharedState),
+                                      AAV_SHARED_STATE_SIZE(aav_max_tracked_databases),
                                       &found);
     if (!found)
     {
-        MemSet(aav_shared_state, 0, sizeof(AAVSharedState));
+        MemSet(aav_shared_state, 0, AAV_SHARED_STATE_SIZE(aav_max_tracked_databases));
         SpinLockInit(&aav_shared_state->mutex);
+        aav_shared_state->summary_capacity = aav_max_tracked_databases;
     }
     LWLockRelease(AddinShmemInitLock);
+}
+
+/* SQL: adaptive_autovacuum.cluster_summary_status() - summary slot capacity, usage and overflow. */
+Datum
+adaptive_autovacuum_cluster_summary_status(PG_FUNCTION_ARGS)
+{
+    TupleDesc tupdesc;
+    Datum values[7];
+    bool nulls[7];
+    bool available = false;
+    int capacity = 0;
+    int used = 0;
+    bool overflow = false;
+    int64 overflow_count = 0;
+    TimestampTz overflow_at = 0;
+    TimestampTz oldest = 0;
+
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        elog(ERROR, "return type must be a row type");
+
+    /* Without preload there is no shared state to attach to. */
+    if (aav_shared_state == NULL && aav_preloaded)
+        aav_attach_shared_state();
+
+    if (aav_shared_state != NULL)
+    {
+        TimestampTz now = GetCurrentTimestamp();
+        int i;
+
+        available = true;
+        SpinLockAcquire(&aav_shared_state->mutex);
+        capacity = aav_shared_state->summary_capacity;
+        overflow_count = aav_shared_state->summary_overflow_count;
+        overflow_at = aav_shared_state->summary_overflow_at;
+        for (i = 0; i < capacity; i++)
+        {
+            const AAVDbSummary *s = &aav_shared_state->summaries[i];
+
+            if (s->dboid == InvalidOid)
+                continue;
+            used++;
+            if (oldest == 0 || s->updated_at < oldest)
+                oldest = s->updated_at;
+        }
+        SpinLockRelease(&aav_shared_state->mutex);
+        overflow = overflow_at != 0
+                   && !TimestampDifferenceExceeds(overflow_at, now,
+                                                  10 * aav_naptime_seconds * 1000);
+    }
+
+    MemSet(nulls, 0, sizeof(nulls));
+    values[0] = BoolGetDatum(available);
+    values[1] = Int32GetDatum(capacity);
+    values[2] = Int32GetDatum(used);
+    values[3] = BoolGetDatum(overflow);
+    values[4] = Int64GetDatum(overflow_count);
+    values[5] = TimestampTzGetDatum(overflow_at);
+    nulls[5] = overflow_at == 0;
+    values[6] = TimestampTzGetDatum(oldest);
+    nulls[6] = oldest == 0;
+
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 static bool
@@ -1094,6 +1184,7 @@ aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
     int i;
 
     MemSet(agg, 0, sizeof(*agg));
+    agg->complete = true;
 
     if (aav_shared_state == NULL)
         aav_attach_shared_state();
@@ -1101,7 +1192,11 @@ aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
         return 0;
 
     SpinLockAcquire(&aav_shared_state->mutex);
-    for (i = 0; i < AAV_SUMMARY_SLOTS; i++)
+    /* Complete unless a summary was dropped for lack of a slot within the staleness window. */
+    agg->complete = (aav_shared_state->summary_overflow_at == 0
+                     || TimestampDifferenceExceeds(aav_shared_state->summary_overflow_at, now,
+                                                   10 * aav_naptime_seconds * 1000));
+    for (i = 0; i < aav_shared_state->summary_capacity; i++)
     {
         const AAVDbSummary *s = &aav_shared_state->summaries[i];
 
@@ -1131,10 +1226,14 @@ aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
 static void
 aav_publish_summary(const AAVDbSummary *summary)
 {
+    static bool overflow_warned = false;
     int i;
     int free_slot = -1;
     int oldest_slot = 0;
     TimestampTz oldest = 0;
+    TimestampTz now = GetCurrentTimestamp();
+    int capacity;
+    int64 overflow_count = 0;
 
     if (aav_shared_state == NULL)
         aav_attach_shared_state();
@@ -1142,7 +1241,8 @@ aav_publish_summary(const AAVDbSummary *summary)
         return;
 
     SpinLockAcquire(&aav_shared_state->mutex);
-    for (i = 0; i < AAV_SUMMARY_SLOTS; i++)
+    capacity = aav_shared_state->summary_capacity;
+    for (i = 0; i < capacity; i++)
     {
         AAVDbSummary *s = &aav_shared_state->summaries[i];
 
@@ -1159,10 +1259,28 @@ aav_publish_summary(const AAVDbSummary *summary)
             oldest_slot = i;
         }
     }
-    if (free_slot < 0)
-        free_slot = oldest_slot;    /* > 64 databases: evict the stalest */
-    aav_shared_state->summaries[free_slot] = *summary;
+    /* Only a stale slot (database gone or disabled) is reused; live evidence is never evicted. */
+    if (free_slot < 0
+        && TimestampDifferenceExceeds(oldest, now, 10 * aav_naptime_seconds * 1000))
+        free_slot = oldest_slot;
+    if (free_slot >= 0)
+        aav_shared_state->summaries[free_slot] = *summary;
+    else
+    {
+        aav_shared_state->summary_overflow_count++;
+        aav_shared_state->summary_overflow_at = now;
+        overflow_count = aav_shared_state->summary_overflow_count;
+    }
     SpinLockRelease(&aav_shared_state->mutex);
+
+    if (free_slot < 0 && !overflow_warned)
+    {
+        overflow_warned = true;
+        ereport(WARNING,
+                (errmsg("adaptive autovacuum: no free summary slot for database %u (capacity %d, %ld drops so far)",
+                        summary->dboid, capacity, (long) overflow_count),
+                 errhint("Raise adaptive_autovacuum.max_tracked_databases; cluster-wide changes are recorded only while the evidence is incomplete.")));
+    }
 }
 
 static void
@@ -1179,10 +1297,11 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
     values[2] = Int64GetDatum(metrics->mem_available_bytes);
     values[3] = Int64GetDatum(metrics->mem_total_bytes);
 
-    if (aav_collect_cluster_summary(MyDatabaseId, &agg) > 0)
+    if (aav_collect_cluster_summary(MyDatabaseId, &agg) > 0 || !agg.complete)
     {
         char *summary_json = psprintf(
             "{\"db_count\":%d,"
+            "\"evidence_complete\":%s,"
             "\"eligible\":" INT64_FORMAT ","
             "\"overdue\":" INT64_FORMAT ","
             "\"dead_overdue\":" INT64_FORMAT ","
@@ -1193,6 +1312,7 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
             "\"w_ins_scale_sum\":%.9g,"
             "\"w_ins_thresh_sum\":%.9g}",
             agg.db_count,
+            agg.complete ? "true" : "false",
             agg.eligible,
             agg.overdue,
             agg.dead_overdue,
