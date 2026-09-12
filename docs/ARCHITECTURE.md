@@ -121,8 +121,8 @@ The policy layer contains the tunable logic and durable state:
 
 - `policy`: one database-wide policy row.
 - `table_policy`: optional per-relation overrides or exclusion. Rows carry a schema/name fingerprint (filled by trigger) so a recycled relation OID can never silently inherit old operator intent: a mismatched row is ignored until the operator re-adopts it by touching the row, and rows whose relation was dropped are removed each cycle.
-- `relation_state`: hysteresis, ownership, original reloptions, and recent metrics (dead and insert backlog).
-- `decisions`: an append-only explanation log within the retention window; every row carries the host metrics the decision was made under.
+- `relation_state`: hysteresis, ownership, original reloptions, and the metrics as of the last write. Rows exist only for relations with something to remember (non-normal, managed, in conflict, vacuum fingerprint, active cooldown, failed action); a healthy unmanaged relation has no row. The previous state is joined into the candidate query once per cycle (no per-relation lookup), and a row is rewritten only when a control field changes or hourly as a heartbeat, so the controller's own write volume is O(relations that need attention), not O(all relations).
+- `decisions`: an append-only transition log within the retention window - a row when a relation enters a (state, action) pair, when a change is applied or fails, and a `recovered` row when it returns to normal; not a per-cycle trace. Every row carries the host metrics the decision was made under. UNLOGGED (as is `global_recommendations`): nothing reads either table back for control, so a crash or a standby promotion costs history only, while their WAL is skipped. On a hot standby they cannot be queried at all.
 - `global_recommendations`: computed cluster-level values with a human-readable reason (always recorded, regardless of whether they are applied).
 - `global_apply_queue`: cluster-setting changes awaiting or completed application, with old value, status, and error.
 - `emergency_queue`: guarded manual-vacuum requests.

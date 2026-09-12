@@ -16,9 +16,7 @@ SELECT recommendation_delay_min_ms = 0.5 AS delay_floor_default,
        high_wal_mbps = 0 AS wal_guardrail_off_by_default
 FROM adaptive_autovacuum.policy;
 t|t|t
--- Absurd policy values (outside the documented bounds of the settings they
--- feed) are rejected by CHECK constraints.  Terse verbosity: the DETAIL line
--- would print the whole failing row, which contains timestamps.
+-- Out-of-bounds policy values are rejected by CHECK constraints (terse: DETAIL has timestamps).
 \set VERBOSITY terse
 UPDATE adaptive_autovacuum.policy SET recommendation_cost_limit_max = 50000;
 ERROR:  new row for relation "policy" violates check constraint "policy_recommendation_cost_limit_max_check"
@@ -163,8 +161,7 @@ t
 SELECT count(*) = 1 AS recommendation_recorded
 FROM adaptive_autovacuum.global_recommendations;
 t
--- table_policy identity fingerprint: filled by trigger, refreshed when the
--- operator touches the row, and rows for dropped relations are cleaned up.
+-- table_policy fingerprint: trigger-filled, refreshed on touch, dropped relations cleaned up.
 CREATE TABLE aav_policy_target(id integer);
 INSERT INTO adaptive_autovacuum.table_policy(relid) VALUES ('aav_policy_target'::regclass);
 SELECT schema_name = 'public' AND relation_name = 'aav_policy_target'
@@ -237,9 +234,7 @@ FROM adaptive_autovacuum.decisions
 WHERE relid = 'aav_no_stats'::regclass
   AND action = 'analyze';
 t
--- Cluster-evidence merge: with no local relations eligible, an injected
--- summary of two other databases must drive the cluster recommendation.
--- Also exercises the PG17/PG18 branches around the trigger ceiling.
+-- Cluster-evidence merge: an injected summary of two other databases drives the recommendation.
 UPDATE adaptive_autovacuum.policy
 SET manage_global_settings = true,
     min_table_bytes = 9223372036854775807;
@@ -271,6 +266,101 @@ WHERE guc_name = 'autovacuum_vacuum_scale_factor'
 t
 DELETE FROM adaptive_autovacuum.global_apply_queue;
 UPDATE adaptive_autovacuum.policy SET manage_global_settings = false;
+-- Write discipline: a healthy table leaves nothing, an overdue one logs transitions only.
+CREATE TABLE aav_healthy(id integer, payload text) WITH (autovacuum_enabled = false);
+INSERT INTO aav_healthy SELECT g, g::text FROM generate_series(1, 10000) g;
+CREATE TABLE aav_overdue(id integer, payload text) WITH (autovacuum_enabled = false);
+INSERT INTO aav_overdue SELECT g, g::text FROM generate_series(1, 10000) g;
+-- Flush BEFORE the VACUUM so it resets the insert counters.
+SELECT pg_stat_force_next_flush();
+
+VACUUM ANALYZE aav_healthy;
+VACUUM ANALYZE aav_overdue;
+DELETE FROM aav_overdue WHERE id > 1000;
+SELECT pg_stat_force_next_flush();
+
+UPDATE adaptive_autovacuum.policy SET min_table_bytes = 0;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT count(*) = 0 AS healthy_relation_has_no_state_row
+FROM adaptive_autovacuum.relation_state
+WHERE relid = 'aav_healthy'::regclass;
+t
+SELECT count(*) = 0 AS healthy_relation_has_no_decisions
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_healthy'::regclass;
+t
+SELECT state LIKE 'backlog_%'
+       AND consecutive_overdue = 2
+       AND last_action = 'autovacuum_disabled'
+       AS overdue_relation_state_row
+FROM adaptive_autovacuum.relation_state
+WHERE relid = 'aav_overdue'::regclass;
+t
+SELECT count(*) = 1 AS overdue_episode_logged_once
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_overdue'::regclass
+  AND state LIKE 'backlog_%'
+  AND action = 'autovacuum_disabled';
+t
+VACUUM aav_overdue;
+SELECT pg_stat_force_next_flush();
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT count(*) = 0 AS recovered_relation_row_removed
+FROM adaptive_autovacuum.relation_state
+WHERE relid = 'aav_overdue'::regclass;
+t
+SELECT count(*) = 2 AS overdue_relation_two_decisions_total
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_overdue'::regclass;
+t
+SELECT state = 'normal' AND action = 'recovered' AS recovery_closes_episode
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_overdue'::regclass
+ORDER BY id DESC
+LIMIT 1;
+t
+SELECT pg_stat_force_next_flush();
+
+SELECT n_tup_ins = 1 AND n_tup_upd = 1 AND n_tup_del = 1
+       AS state_row_written_only_on_transitions
+FROM pg_stat_all_tables
+WHERE relid = 'adaptive_autovacuum.relation_state'::regclass;
+t
+SELECT bool_and(relpersistence = 'u') AS audit_tables_unlogged
+FROM pg_class
+WHERE oid IN ('adaptive_autovacuum.decisions'::regclass,
+              'adaptive_autovacuum.global_recommendations'::regclass);
+t
+SELECT bool_and(relpersistence = 'p') AS control_tables_logged
+FROM pg_class
+WHERE oid IN ('adaptive_autovacuum.policy'::regclass,
+              'adaptive_autovacuum.table_policy'::regclass,
+              'adaptive_autovacuum.relation_state'::regclass,
+              'adaptive_autovacuum.global_apply_queue'::regclass,
+              'adaptive_autovacuum.emergency_queue'::regclass,
+              'adaptive_autovacuum.controller_state'::regclass);
+t
+DROP TABLE aav_healthy;
+DROP TABLE aav_overdue;
 DROP TABLE aav_no_stats;
 DROP TABLE aav_test;
 DROP EXTENSION adaptive_autovacuum;

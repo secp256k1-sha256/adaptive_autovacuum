@@ -1,17 +1,5 @@
 @echo off
-rem ---------------------------------------------------------------------------
-rem Build adaptive_autovacuum.dll against an existing PostgreSQL installation
-rem (for example the EDB installer's default location).
-rem
-rem Run from an "x64 Native Tools Command Prompt for VS"
-rem (Visual Studio 2019/2022 Build Tools are sufficient).
-rem
-rem Usage (from anywhere; the script locates the repository root itself):
-rem   windows\build_windows.bat                    (assumes C:\Program Files\PostgreSQL\18)
-rem   windows\build_windows.bat "D:\PostgreSQL\18" (custom installation root)
-rem
-rem The DLL is written to the repository root (ignored by git).
-rem ---------------------------------------------------------------------------
+rem Build adaptive_autovacuum.dll from an x64 Native Tools Command Prompt; optional arg = PostgreSQL root (default C:\Program Files\PostgreSQL\18).
 setlocal
 
 rem Work from the repository root regardless of the invocation directory.
@@ -39,8 +27,7 @@ if errorlevel 1 (
     popd & exit /b 1
 )
 
-rem All build outputs (dll, obj, exp, lib) stay inside the windows folder;
-rem the source tree root holds sources only.
+rem All build outputs stay inside the windows folder.
 cl /nologo /LD /MD /O2 /W3 ^
    /D WIN32 /D _WINDOWS /D _CRT_SECURE_NO_WARNINGS ^
    /I"%PGROOT%\include\server\port\win32_msvc" ^

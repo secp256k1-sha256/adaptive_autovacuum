@@ -621,6 +621,49 @@ Not yet exercised: the hosted CI matrix run on GitHub Actions, aggregation
 with more than two databases, and a lab-scale soak of the new takeover
 logic.
 
+## Validation performed 2026-09-12 (controller write amplification)
+
+Change under test: the performance review's two structural findings. The
+previous relation state is now LEFT JOINed into the candidate query (no
+per-relation `relation_state` lookup inside the loop), a `relation_state`
+row exists only for relations with something to remember and is rewritten
+only when a control field changes (hourly heartbeat otherwise; hysteresis
+counters saturate at their thresholds), `decisions` became a transition log
+(one row per (state, action) episode, every applied or failed change, and a
+`recovered` row when a relation returns to normal), and the two pure history
+tables `decisions` and `global_recommendations` are UNLOGGED. All control
+tables stay logged.
+
+- `pg_regress` green on Windows PG 18.4 (isolated scratch instance via
+  `extension_control_path`), and via `make installcheck` on WSL AlmaLinux 9
+  against PGDG 17.11 and 18.6, each twice (loaded on demand, preloaded). The
+  regression suite gained a scenario asserting: no row and no decision for a
+  healthy unmanaged table; exactly one insert, one update and one delete of
+  the overdue table's row across four cycles (`pg_stat_all_tables`
+  counters); one decision for the overdue episode plus one `recovered`
+  decision; `decisions`/`global_recommendations` unlogged, the six control
+  tables permanent.
+- Old (previous commit) vs new script on the same WSL PG 18.6 instance,
+  3,000 small tables of which 100 overdue, dry run, five cycles, measured
+  per cycle with `pg_wal_lsn_diff` and `pg_stat_all_tables`:
+
+  | | old, steady state | new, steady state |
+  |---|---|---|
+  | `relation_state` rows | 3,000 | 100 |
+  | `relation_state` writes per cycle | 3,000 updates | 0 (100 inserts once, 100 updates once) |
+  | `decisions` rows per cycle | 100 | 0 after the first cycle (100 total) |
+  | WAL per cycle | ~1.26 MB | 0 KB (155 KB first cycle, 40 KB second) |
+  | cycle wall time | ~190 ms | ~155 ms |
+
+- Regression gotcha found while writing the new scenario: insert counters
+  pending in the backend must be flushed (`pg_stat_force_next_flush()`)
+  BEFORE the `VACUUM` that is supposed to reset them, otherwise they land on
+  top of the vacuum's report and the table looks insert-overdue.
+
+Not yet exercised: the hosted CI run for this revision, and a lab-scale run
+with tens of thousands of relations (the benchmark above is a
+proportionality check, not a scale test).
+
 ## Required release gate
 
 For each supported PostgreSQL major version:
