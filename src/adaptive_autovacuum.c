@@ -116,6 +116,9 @@ typedef struct AAVDbSummary
     double median_thresh;
     double median_ins_scale;
     double median_ins_thresh;
+    /* Maintenance debt (dead + inserted-since-vacuum tuples) and its smoothed rate in tuples/s. */
+    int64 debt_tuples;
+    double debt_velocity;
 } AAVDbSummary;
 
 /* Aggregate of the other databases' summaries handed to the SQL policy. */
@@ -132,6 +135,8 @@ typedef struct AAVClusterAgg
     double w_thresh_sum;
     double w_ins_scale_sum;
     double w_ins_thresh_sum;
+    int64 debt_tuples;
+    double debt_velocity;
 } AAVClusterAgg;
 
 typedef struct AAVSharedState
@@ -878,12 +883,13 @@ aav_list_databases(void)
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
+    /* Oldest databases first: the ones nearest wraparound get the earliest check of every sweep. */
     spi_rc = SPI_execute(
         "SELECT oid, datname "
         "FROM pg_catalog.pg_database "
         "WHERE datallowconn "
         "  AND NOT datistemplate "
-        "ORDER BY oid",
+        "ORDER BY GREATEST(age(datfrozenxid), mxid_age(datminmxid)) DESC, oid",
         true,
         0);
 
@@ -1217,6 +1223,8 @@ aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
         agg->w_thresh_sum += s->median_thresh * s->dead_overdue;
         agg->w_ins_scale_sum += s->median_ins_scale * s->insert_overdue;
         agg->w_ins_thresh_sum += s->median_ins_thresh * s->insert_overdue;
+        agg->debt_tuples += s->debt_tuples;
+        agg->debt_velocity += s->debt_velocity;
     }
     SpinLockRelease(&aav_shared_state->mutex);
 
@@ -1310,7 +1318,9 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
             "\"w_scale_sum\":%.9g,"
             "\"w_thresh_sum\":%.9g,"
             "\"w_ins_scale_sum\":%.9g,"
-            "\"w_ins_thresh_sum\":%.9g}",
+            "\"w_ins_thresh_sum\":%.9g,"
+            "\"debt_tuples\":" INT64_FORMAT ","
+            "\"debt_velocity\":%.9g}",
             agg.db_count,
             agg.complete ? "true" : "false",
             agg.eligible,
@@ -1321,7 +1331,9 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
             agg.w_scale_sum,
             agg.w_thresh_sum,
             agg.w_ins_scale_sum,
-            agg.w_ins_thresh_sum);
+            agg.w_ins_thresh_sum,
+            agg.debt_tuples,
+            agg.debt_velocity);
 
         values[4] = CStringGetTextDatum(summary_json);
     }
@@ -1379,6 +1391,10 @@ aav_execute_policy_cycle(const AAVHostMetrics *metrics)
         summary.median_ins_scale = isnull ? 0.0 : DatumGetFloat8(datum);
         datum = SPI_getbinval(tuple, tupdesc, 9, &isnull);
         summary.median_ins_thresh = isnull ? 0.0 : DatumGetFloat8(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 10, &isnull);
+        summary.debt_tuples = isnull ? 0 : DatumGetInt64(datum);
+        datum = SPI_getbinval(tuple, tupdesc, 11, &isnull);
+        summary.debt_velocity = isnull ? 0.0 : DatumGetFloat8(datum);
 
         aav_publish_summary(&summary);
     }
@@ -1402,6 +1418,8 @@ static const char *const aav_allowed_global_gucs[] = {
     "autovacuum_vacuum_insert_threshold",
     "autovacuum_analyze_scale_factor",
     "autovacuum_analyze_threshold",
+    /* Repair only: the policy queues 'on' and the apply path refuses any other value. */
+    "autovacuum",
 };
 
 StaticAssertDecl(lengthof(aav_allowed_global_gucs) <= AAV_GLOBAL_GUC_SLOTS,
@@ -1571,9 +1589,19 @@ aav_apply_global_settings(void)
                 continue;
         }
 
-        if (values[i] == NULL || values[i][0] == '\0' ||
-            strlen(values[i]) >= 32 ||
-            strspn(values[i], "0123456789.-") != strlen(values[i]))
+        /* autovacuum is repair-only: 'on' is the single accepted value. */
+        if (strcmp(names[i], "autovacuum") == 0)
+        {
+            if (values[i] == NULL || strcmp(values[i], "on") != 0)
+            {
+                aav_mark_global_change(ids[i], "failed", NULL,
+                                       "autovacuum may only be set to 'on' by the extension.");
+                continue;
+            }
+        }
+        else if (values[i] == NULL || values[i][0] == '\0' ||
+                 strlen(values[i]) >= 32 ||
+                 strspn(values[i], "0123456789.-") != strlen(values[i]))
         {
             aav_mark_global_change(ids[i], "failed", NULL,
                                    "Value is not a plain numeric literal.");
@@ -1862,7 +1890,7 @@ aav_claim_emergency_request(AAVEmergencyRequest *request)
         "  FROM adaptive_autovacuum.emergency_queue "
         "  WHERE status = 'pending' "
         "    AND next_retry_at <= clock_timestamp() "
-        "  ORDER BY priority DESC, requested_at "
+        "  ORDER BY deadline_seconds ASC NULLS LAST, priority DESC, requested_at "
         "  LIMIT 1 "
         "  FOR UPDATE SKIP LOCKED"
         ") "

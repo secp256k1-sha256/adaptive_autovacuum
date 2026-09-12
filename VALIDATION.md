@@ -706,6 +706,55 @@ relations whose tuple statistics reach `min_table_bytes / block_size`
   (the eviction and record-only paths are covered by code review and the
   status function only), and the hosted CI run for this revision.
 
+## Validation performed 2026-09-12 (maintenance-capacity control)
+
+Changes under test: (1) the cluster cost controller keys on maintenance-debt
+velocity (dead + inserted-since-vacuum tuples, sampled per cycle, EMA-smoothed,
+merged across databases): growing/flat/unknown raises as before, shrinking
+holds, and ten consecutive backlog-free checks step the cost settings halfway
+back toward the operator baseline kept in `controller_state`; (2) `autovacuum
+= off` is repaired (queued as `autovacuum = on`, the only value the C applier
+accepts for that GUC) after `repair_disabled_autovacuum_cycles` consecutive
+checks, default on; (3) the worker recommendation fires on a saturated pool
+with non-shrinking debt, doubles at most per step, and is capped by CPU
+count, free memory / `autovacuum_work_mem`, `autovacuum_worker_slots` and
+`recommendation_workers_max` (now 16), with host pressure as a gate except
+under `wraparound_critical`; (4) emergency requests carry a projected
+seconds-to-read-only deadline and are claimed deadline-first, and the launcher
+sweeps databases oldest-age-first; (5) never-analyzed remediation runs on a
+time budget (`analyze_missing_stats_budget_ms`, default 10 s, a quarter under
+moderate host load, none under pressure) instead of three tables per cycle,
+and dry run proposes each table once.
+
+- `make installcheck` green on WSL AlmaLinux 9 against PGDG 17.11 and 18.6,
+  twice each (on demand and preloaded), and on Windows against PG 18.4 in a
+  scratch instance, twice (on demand and preloaded), with the MSVC 2022 DLL.
+  New checks: a synthetic previous sample makes the same overdue backlog read
+  as growing (cost limit doubled, trend and velocity recorded) and then as
+  shrinking (cost limit held, reason says so); a backlog-free cycle at the
+  decay threshold recommends exactly half the distance back to an injected
+  baseline for both cost limit and delay and resets the counter; a dry-run
+  never-analyzed proposal is not repeated on the next check; policy and
+  controller-state defaults.
+- Live drill on the Windows scratch instance (preloaded, `naptime_seconds =
+  5`, `autovacuum = off` in `postgresql.auto.conf`, `dry_run = false`,
+  `repair_disabled_autovacuum_cycles = 2`): the first check recorded
+  "off for 1 of the 2 consecutive checks required", the second queued the
+  repair, the C applier logged `set autovacuum = on cluster-wide (was off)`,
+  the queue row shows `on` / old value `off` / `applied`, and `SHOW
+  autovacuum` returned `on` after the reload.
+- Cost of the new debt sums (two more per-relation statistics lookups in the
+  existing aggregate pass): the 100,000-table benchmark from the previous
+  section, re-run on the same WSL PG 18.6 instance, is unchanged within noise:
+  1.65 s (was 1.7 s) with every table eligible, 0.59 s (was 0.57 s) with the
+  default size filter, 0.15-0.19 s (was 0.15 s) for 20,000 never-analyzed
+  tables, steady state, dry run.
+- Not exercised: a live worker-count raise (needs a saturated worker pool
+  under load) and a live deadline-ordered emergency pair; both paths are
+  covered by the regression checks on the recorded recommendation and by
+  code review of the claim query. The hosted CI run for this revision is
+  pending.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:

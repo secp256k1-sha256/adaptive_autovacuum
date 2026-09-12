@@ -10,7 +10,11 @@ SELECT enabled = false AS disabled_by_default,
        emergency_vacuum_enabled = true AS emergency_on_by_default,
        manage_global_settings = true AS globals_managed_by_default,
        analyze_missing_stats = true AS analyze_missing_stats_by_default,
-       analyze_missing_stats_per_cycle = 3 AS analyze_missing_stats_top3
+       analyze_missing_stats_budget_ms = 10000 AS analyze_budget_default,
+       repair_disabled_autovacuum = true AS autovacuum_repair_on_by_default,
+       repair_disabled_autovacuum_cycles = 10 AS autovacuum_repair_after_ten_checks,
+       recommendation_workers_max = 16 AS workers_max_default,
+       recovery_cycles_before_decay = 10 AS decay_after_ten_clean_checks
 FROM adaptive_autovacuum.policy;
 
 SELECT recommendation_delay_min_ms = 0.5 AS delay_floor_default,
@@ -138,7 +142,10 @@ SELECT emergency_xid_age = 1000000000
        AS emergency_trigger_defaults
 FROM adaptive_autovacuum.policy;
 
-SELECT count(*) = 1 AND bool_and(last_xid8 IS NULL) AS controller_state_seeded
+SELECT count(*) = 1 AND bool_and(last_xid8 IS NULL)
+       AND bool_and(last_debt_tuples IS NULL AND backlog_free_cycles = 0
+                    AND autovacuum_off_cycles = 0 AND baseline_settings = '{}'::jsonb)
+       AS controller_state_seeded
 FROM adaptive_autovacuum.controller_state;
 
 SELECT count(*) >= 1
@@ -225,6 +232,18 @@ FROM adaptive_autovacuum.decisions
 WHERE relid = 'aav_no_stats'::regclass
   AND action = 'propose_analyze'
   AND NOT applied;
+
+-- Dry run proposes each never-analyzed table once, not once per check.
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 1 AS analyze_proposal_not_repeated
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_no_stats'::regclass
+  AND action = 'propose_analyze';
 
 UPDATE adaptive_autovacuum.policy
 SET dry_run = false,
@@ -371,6 +390,79 @@ SELECT n_tup_ins = 1 AND n_tup_upd = 1 AND n_tup_del = 1
        AS state_row_written_only_on_transitions
 FROM pg_stat_all_tables
 WHERE relid = 'adaptive_autovacuum.relation_state'::regclass;
+
+-- Debt trend: a synthetic previous sample makes the same backlog read as growing, then shrinking.
+DELETE FROM aav_overdue WHERE id > 100;
+SELECT pg_stat_force_next_flush();
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT backlog_trend = 'growing'
+       AND maintenance_debt_tuples >= 900
+       AND maintenance_debt_velocity > 0
+       AND recommended_cost_limit = 2 * current_setting('vacuum_cost_limit')::integer
+       AND reason LIKE '%maintenance debt is growing%'
+       AS growing_debt_raises_cost_limit
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = last_debt_tuples * 100,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT backlog_trend = 'shrinking'
+       AND maintenance_debt_velocity < 0
+       AND recommended_cost_limit = current_setting('vacuum_cost_limit')::integer
+       AND reason LIKE '%debt is shrinking%holding%'
+       AS shrinking_debt_holds_cost_limit
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Decay: no backlog for the configured checks steps cost settings halfway back to the baseline.
+VACUUM aav_overdue;
+SELECT pg_stat_force_next_flush();
+INSERT INTO adaptive_autovacuum.global_apply_queue (guc_name, desired_value, status, applied_at)
+SELECT s.name, s.setting, 'applied', clock_timestamp()
+FROM pg_settings s
+WHERE s.name IN ('autovacuum_vacuum_cost_limit', 'autovacuum_vacuum_cost_delay');
+UPDATE adaptive_autovacuum.global_apply_queue
+SET desired_value = current_setting('vacuum_cost_limit')
+WHERE guc_name = 'autovacuum_vacuum_cost_limit' AND desired_value = '-1';
+UPDATE adaptive_autovacuum.controller_state
+SET backlog_free_cycles = 9,
+    baseline_settings = jsonb_build_object(
+        'autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit')::integer / 4,
+        'autovacuum_vacuum_cost_delay', 20);
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT r.overdue_relations = 0
+       AND r.recommended_cost_limit = current_setting('vacuum_cost_limit')::integer / 2
+       AND r.recommended_cost_delay_ms = LEAST(20, GREATEST(0.5, 2 * s.setting::double precision))
+       AND r.reason LIKE 'No overdue relations for 10 consecutive checks%'
+       AS clean_checks_decay_toward_baseline
+FROM adaptive_autovacuum.latest_global_recommendation r,
+     pg_settings s
+WHERE s.name = 'autovacuum_vacuum_cost_delay';
+
+SELECT backlog_free_cycles = 0 AS decay_step_resets_counter
+FROM adaptive_autovacuum.controller_state;
+
+DELETE FROM adaptive_autovacuum.global_apply_queue;
 
 SELECT bool_and(relpersistence = 'u') AS audit_tables_unlogged
 FROM pg_class
