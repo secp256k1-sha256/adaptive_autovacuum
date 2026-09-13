@@ -181,8 +181,8 @@ A background worker checks every database in turn (oldest transaction age first,
 
 | Setting | Fixed when |
 |---|---|
-| `autovacuum_vacuum_cost_limit` / `cost_delay` | tables are behind and the cluster's maintenance debt (dead rows plus rows inserted since the last vacuum, summed over every watched table in every database) is growing or flat between checks. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) - full manual-vacuum aggression is never set automatically. If the debt is already **shrinking**, the current settings are working and are held. Lowered if the server is overloaded. Once no table has been behind for `recovery_cycles_before_decay` checks (default 10), the settings step halfway back toward the values you had before the first automatic change, one step per ten clean checks, so incident tuning does not stay in place forever |
-| `autovacuum_max_workers` | every worker is busy while tables wait **and** the maintenance debt is not shrinking, so the pool is structurally too small. Raised toward the number of overdue tables (doubled at most per step), capped by the CPU count, by the free memory divided by `autovacuum_work_mem`, by `autovacuum_worker_slots`, and by `recommendation_workers_max` (default 16); not raised while the host is overloaded unless a table is in wraparound danger. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
+| `autovacuum_vacuum_cost_limit` / `cost_delay` | tables are behind and the cluster's maintenance debt (dead rows plus rows inserted since the last vacuum, summed over every watched table in every database) is growing or flat between checks. Raised step by step (doubled at most per check), never in one jump, and the delay never drops below `recommendation_delay_min_ms` (default 0.5 ms) - full manual-vacuum aggression is never set automatically. If the debt is already **shrinking** fast enough to clear within `max_backlog_drain_seconds` (default 180 s at the measured rate), the current settings are working and are held; a backlog that is shrinking but would take longer than that is still stepped up. Lowered if the server is overloaded. Two brakes keep the raises honest. First, a raise is never allowed to lift the theoretical vacuum throughput, `(1000 / cost_delay ms) × (cost_limit / vacuum_cost_page_hit) × block size`, above `recommendation_max_vacuum_mbps` (default 3200 MiB/s, about four times the 781 MiB/s of the PostgreSQL defaults 200 / 2 ms); when the doubled pair would exceed it, the delay is kept and only as much of the limit raise as fits is taken (`adaptive_autovacuum.vacuum_cost_ceiling_mbps()` computes the figure for any pair). Second, every applied raise has to prove itself: the controller measures autovacuum-worker throughput from `pg_stat_io` (pages read, written, extended or hit per second) over a check interval that started after the raise was applied, and only raises again if throughput grew by at least `cost_raise_min_io_gain_percent` (default 10 %). If it did not, the storage rather than the cost budget is the limit and the settings are held; the reason says so, with the before and after MiB/s. Once no table has been behind for `recovery_cycles_before_decay` checks (default 10), the settings step halfway back toward the values you had before the first automatic change, one step per ten clean checks, so incident tuning does not stay in place forever |
+| `autovacuum_max_workers` | the pool is structurally too small: either every worker is busy while tables wait, or the overdue queue is at least twice the pool (and at least two tables longer), **and** the maintenance debt is not shrinking fast enough to clear within `max_backlog_drain_seconds`. Raised toward the number of overdue tables (doubled at most per step), capped by the free memory divided by `autovacuum_work_mem`, by `autovacuum_worker_slots`, and by `recommendation_workers_max` (default 16); not raised while the host is overloaded unless a table is in wraparound danger. The CPU count is not a ceiling: vacuum is mostly I/O and the shared cost budget is split across workers, so a 2-CPU host can run 4 or 8 of them; CPU enters only through the load-per-CPU pressure gate. Only ever raised automatically; lowering is your call. (PostgreSQL 18 made this reloadable, no restart needed; on PostgreSQL 17 it needs a restart, so there the advice is only recorded, never applied) |
 | `autovacuum` | it is **off**. An installation without a DBA that has autovacuum disabled is one bulk load away from an outage, so after `repair_disabled_autovacuum_cycles` consecutive checks (default 10) the extension turns it back on and records the old value like any other change. Set `repair_disabled_autovacuum = false` if you really run without autovacuum. The extension never turns autovacuum off |
 | `autovacuum_work_mem` | a running vacuum is seen making repeated passes over the indexes, the sign it ran out of memory; also raised toward the free-memory-derived value while maintenance is actually running (never lowered without host pressure).|
 | `vacuum_buffer_usage_limit` | maintenance is actually running and the host has free memory. This stays deliberately conservative: doubled at most per check, capped by `recommendation_buffer_usage_limit_max_mb` (default 256 MB) and by 1/8 of shared buffers per worker; walked back under load; a value of 0 you set yourself is never touched |
@@ -218,7 +218,7 @@ For tables getting dangerously close to transaction-ID wraparound (the failure m
 
 ## What it never does
 
-- Never acts until you enable it.
+- Never acts until the cluster switch `adaptive_autovacuum.enabled` is on; a fresh `CREATE EXTENSION` is otherwise active (see [Turning it on safely](#turning-it-on-safely) for the watch-only start).
 - Never touches a setting outside its fixed allow-list, never turns autovacuum off, and never touches table data.
 - Never fights you: your per-table changes freeze its automation for that table; your stricter global values are respected.
 - Never adds vacuum load to an already overloaded server (it watches load and memory before boosting anything).
@@ -240,7 +240,7 @@ SELECT * FROM adaptive_autovacuum.changed_tables;
 SELECT * FROM adaptive_autovacuum.relation_status ORDER BY last_backlog_ratio DESC NULLS LAST;
 
 -- its current advice for the cluster, in plain words, with the debt trend it acted on
-SELECT backlog_trend, maintenance_debt_tuples, round(maintenance_debt_velocity) AS tuples_per_second, reason
+SELECT backlog_trend, maintenance_debt_tuples, round(maintenance_debt_velocity), round(autovacuum_io_mbps), round(cost_ceiling_mbps) AS tuples_per_second, reason
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- wraparound early warning: age of every database, headroom until the
@@ -371,11 +371,13 @@ Databases without the extension are simply skipped.
 
 ## Turning it on safely
 
-Step-by-step rollout. Watch the audit tables between steps.
+Installing is opting in: a fresh `CREATE EXTENSION` creates an **active** policy (`enabled = true`, `dry_run = false`, `manage_global_settings = true`), so once `adaptive_autovacuum.enabled = on` is in `postgresql.conf` the extension manages cluster settings and per-table triggers without further setup. That is the intended path for a server nobody tunes by hand; the guardrails (bounded steps, host-pressure gate, allow-list, audit with old values, baseline recovery) are what make it acceptable. Set `enabled = false` to pause a database, or `dry_run = true` to watch only. An extension upgrade never changes the values you have set.
+
+If you prefer to stage it, watch first. Watch the audit tables between steps.
 
 ```sql
 -- Step 1: watch only. It logs what it WOULD do, changes nothing.
-UPDATE adaptive_autovacuum.policy SET enabled = true;   -- dry_run is already true
+UPDATE adaptive_autovacuum.policy SET dry_run = true;
 -- and in postgresql.conf: adaptive_autovacuum.enabled = on   (+ reload)
 
 -- Step 2: let it act: fix cluster settings and per-table triggers.
@@ -410,7 +412,8 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `dry_run` | `true` | log intended actions instead of doing them |
+| `enabled` | `true` | pause switch for this database |
+| `dry_run` | `false` | log intended actions instead of doing them |
 | `manage_global_settings` | `true` | fix cluster settings, or only record advice |
 | `manage_table_costs` | `false` | allow per-table vacuum speed boosts |
 | `target_dead_tuple_ratio` | `0.01` | aim: vacuum a table when ~1% of it is dead rows |
@@ -418,8 +421,12 @@ Behavior knobs live in `adaptive_autovacuum.policy` (one row per database). The 
 | `min_table_bytes` | 64 MB | ignore tables smaller than this (does not apply to the never-analyzed check) |
 | `analyze_missing_stats` | `true` | analyze tables that have live rows but were never analyzed at all |
 | `analyze_missing_stats_budget_ms` | `10000` | time per check spent analyzing never-analyzed tables, largest first; a quarter of it under moderate host load, none when overloaded |
+| `recommendation_max_vacuum_mbps` | `3200` | ceiling for automatic cost raises, as theoretical vacuum MiB/s of the cost_limit / cost_delay pair; `0` = no cap. Never lowers a pair you set above it |
+| `cost_raise_min_io_gain_percent` | `10` | throughput gain (autovacuum workers, `pg_stat_io`) the previous applied raise must show before the next raise is allowed |
+| `recommendation_workers_max` | `16` | hard ceiling for the `autovacuum_max_workers` recommendation |
 | `repair_disabled_autovacuum` / `repair_disabled_autovacuum_cycles` | `true` / `10` | turn `autovacuum` back on after it has been seen off for this many consecutive checks |
 | `backlog_trend_deadband` | `0.05` | debt change per check (as a fraction of the debt) below which the trend counts as flat rather than growing or shrinking |
+| `max_backlog_drain_seconds` | `180` | a shrinking backlog only holds the cost and worker raises if it is projected to clear within this time at the measured rate |
 | `recovery_cycles_before_decay` | `10` | consecutive checks with no table behind before the cost settings take one step back toward your original values |
 | `change_cooldown_seconds` | `1800` | minimum gap between changes to the same table |
 | `recommendation_delay_min_ms` | `0.5` | floor for the automatic cost-delay walk-down; delay 0 (manual-vacuum aggression) is never set cluster-wide automatically. A delay you set below the floor yourself is respected, never raised |
@@ -510,7 +517,17 @@ make installcheck PG_CONFIG=/usr/pgsql-18/bin/pg_config
 
 CI builds and runs the regression suite against PostgreSQL 17 and 18 on every push, each twice: once with the library loaded on demand and once preloaded.
 
-`VALIDATION.md` records the hands-on validation, most recently (2026-09-12, Windows 18.4, Linux 18.6 and 17.11):
+`VALIDATION.md` records the hands-on validation, most recently (2026-09-14, Linux 18.6 and 17.11, Windows 18.4):
+
+- Cost-raise brakes, same drill as below re-run with the throughput cap, the `pg_stat_io` feedback and the drain-time target: the cost pair went 10 / 100 ms → 200 / 50 → 400 / 25 → 800 / 12.5 → 1600 / 6.25 ms, one raise per check while each previous raise had visibly grown autovacuum throughput (0 → 3 → 17 → 60 MB/s), then held at 1600 / 6.25 ms (2000 MiB/s ceiling) once the debt was shrinking fast enough to clear within the 180 s target; observed throughput ran at 130 to 170 MB/s and the backlog cleared 2 min 5 s after the load started (4 min 22 s with the shrinking-means-hold rule, 2 min 11 s with no brakes at all, which had ended at 10000 / 0.78 ms, a 100 GB/s theoretical ceiling). A later small backlog was raised only to the cap: 2560 / 6.25 ms = 3200 MiB/s.
+- Regression checks for the cap (delay kept, limit raised only as far as fits; hold when nothing fits) and for the feedback (hold on no gain, hold until a full post-raise interval, raise on gain, stale record ignored).
+
+Earlier (2026-09-13, same platforms):
+
+- Worker-pool drill on WSL, mirroring a constrained Ubuntu setup (`autovacuum_max_workers = 1`, `cost_limit = 10`, `cost_delay = 100ms`, 100 tables of 100K rows, pgbench 16 clients): with only one autovacuum worker ever running at the sampling instants, the overdue queue alone drove `autovacuum_max_workers` 1 → 2 → 4 → 8 → 12 → 16 within 90 seconds, all through `ALTER SYSTEM` + reload with old values recorded; once the debt turned shrinking the pool held, and after the load stopped nothing was lowered. Zero server-log errors.
+- Regression checks: eight overdue tables against a pool of three, sampled with one CPU, recommend six workers (queue pressure, no CPU ceiling); load 10 on that CPU, a memory budget for one extra worker, `recommendation_workers_max`, and a shrinking debt each cap or hold the recommendation as designed.
+
+Earlier (2026-09-12, Windows 18.4, Linux 18.6 and 17.11):
 
 - Debt-trend controller: the same overdue backlog, presented with a growing and then a shrinking previous sample, produced a doubled cost limit and then a hold; ten backlog-free checks stepped the settings halfway back to the baseline.
 - `autovacuum = off` repair drill: with autovacuum disabled in the config, the extension counted two consecutive checks, queued `autovacuum = on`, applied it through `ALTER SYSTEM` and reload, and `SHOW autovacuum` came back `on`.

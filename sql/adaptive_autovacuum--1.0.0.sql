@@ -28,8 +28,8 @@ PARALLEL UNSAFE;
 CREATE TABLE adaptive_autovacuum.policy
 (
     singleton                       boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-    enabled                         boolean NOT NULL DEFAULT false,
-    dry_run                         boolean NOT NULL DEFAULT true,
+    enabled                         boolean NOT NULL DEFAULT true,
+    dry_run                         boolean NOT NULL DEFAULT false,
     manage_global_settings          boolean NOT NULL DEFAULT true,
 
     min_table_bytes                 bigint NOT NULL DEFAULT 67108864 CHECK (min_table_bytes >= 0),
@@ -66,6 +66,8 @@ CREATE TABLE adaptive_autovacuum.policy
     backlog_trend_deadband          double precision NOT NULL DEFAULT 0.05 CHECK (backlog_trend_deadband > 0 AND backlog_trend_deadband < 1),
     /* Backlog-free checks in a row before one cost step back toward the baseline. */
     recovery_cycles_before_decay    integer NOT NULL DEFAULT 10 CHECK (recovery_cycles_before_decay >= 1),
+    /* A shrinking backlog only holds the raises if it is projected to clear within this time. */
+    max_backlog_drain_seconds       integer NOT NULL DEFAULT 180 CHECK (max_backlog_drain_seconds >= 1),
 
     manage_table_costs              boolean NOT NULL DEFAULT false,
     max_boosted_relations           integer NOT NULL DEFAULT 2 CHECK (max_boosted_relations >= 0),
@@ -102,6 +104,10 @@ CREATE TABLE adaptive_autovacuum.policy
     recommendation_delay_max_ms     integer NOT NULL DEFAULT 20 CHECK (recommendation_delay_max_ms >= 0 AND recommendation_delay_max_ms <= 100),
     /* Floor for the automatic cost-delay walk-down; a lower operator value is respected. */
     recommendation_delay_min_ms     double precision NOT NULL DEFAULT 0.5 CONSTRAINT policy_recommendation_delay_min_ms_check CHECK (recommendation_delay_min_ms >= 0 AND recommendation_delay_min_ms <= recommendation_delay_max_ms),
+    /* Ceiling for automatic cost raises, in MB/s of vacuum_cost_ceiling_mbps(); 0 = no cap. */
+    recommendation_max_vacuum_mbps  integer NOT NULL DEFAULT 3200 CHECK (recommendation_max_vacuum_mbps >= 0),
+    /* Observed throughput gain a raise must show before the next raise is allowed. */
+    cost_raise_min_io_gain_percent  integer NOT NULL DEFAULT 10 CHECK (cost_raise_min_io_gain_percent BETWEEN 0 AND 1000),
     /* 2097151 MB = MAX_KILOBYTES expressed in MB, the domain of autovacuum_work_mem. */
     recommendation_work_mem_max_mb  integer NOT NULL DEFAULT 4096 CHECK (recommendation_work_mem_max_mb >= 64 AND recommendation_work_mem_max_mb <= 2097151),
     /* Ceiling for the vacuum_buffer_usage_limit raise; also capped by shared_buffers/8. */
@@ -250,6 +256,9 @@ CREATE UNLOGGED TABLE adaptive_autovacuum.global_recommendations
     maintenance_debt_tuples         bigint,
     maintenance_debt_velocity       double precision,
     backlog_trend                   text,
+    /* Observed autovacuum-worker MB/s (pg_stat_io) and the ceiling of the recommended pair. */
+    autovacuum_io_mbps              double precision,
+    cost_ceiling_mbps               double precision,
     reason                          text NOT NULL
 );
 
@@ -309,6 +318,25 @@ CREATE UNIQUE INDEX emergency_queue_one_active_per_relation_idx
     WHERE status IN ('pending', 'running');
 
 /* Per-cycle samples: XID and WAL counters give rates; debt totals give the backlog trend. */
+/* Theoretical vacuum throughput of a cost pair: pages/s at page-hit cost times the block size. */
+CREATE FUNCTION adaptive_autovacuum.vacuum_cost_ceiling_mbps(
+    cost_limit integer,
+    cost_delay_ms double precision,
+    page_hit_cost double precision DEFAULT 1,
+    block_size bigint DEFAULT 8192)
+RETURNS double precision
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+RETURN CASE
+    WHEN cost_delay_ms IS NULL OR cost_delay_ms <= 0 THEN 'infinity'::double precision
+    ELSE (1000.0 / cost_delay_ms) * (cost_limit / GREATEST(page_hit_cost, 1))
+         * block_size / 1048576.0
+END;
+
+COMMENT ON FUNCTION adaptive_autovacuum.vacuum_cost_ceiling_mbps(integer, double precision, double precision, bigint) IS
+'Upper bound on vacuum I/O for a cost_limit / cost_delay pair: (1000 / delay ms) * (limit / vacuum_cost_page_hit) * block size, in MiB/s. PostgreSQL defaults (200 / 2 ms) give 781.25 (the familiar 800 uses 8 KB x 1000).';
+
 CREATE TABLE adaptive_autovacuum.controller_state
 (
     only_row        boolean PRIMARY KEY DEFAULT true CHECK (only_row),
@@ -324,7 +352,15 @@ CREATE TABLE adaptive_autovacuum.controller_state
     /* Consecutive checks that saw autovacuum = off (drives the repair). */
     autovacuum_off_cycles integer NOT NULL DEFAULT 0,
     /* Operator values of the cost settings before the first automatic change; the decay target. */
-    baseline_settings jsonb NOT NULL DEFAULT '{}'::jsonb
+    baseline_settings jsonb NOT NULL DEFAULT '{}'::jsonb,
+    /* Autovacuum-worker bytes touched (pg_stat_io, cumulative) and bytes/s over the last interval. */
+    last_vacuum_io_bytes bigint,
+    vacuum_io_rate  double precision,
+    /* The last applied cost raise and the throughput before it; the next raise must beat it. */
+    last_cost_raise_at timestamptz,
+    last_raise_cost_limit integer,
+    last_raise_cost_delay double precision,
+    io_rate_before_raise double precision
 );
 INSERT INTO adaptive_autovacuum.controller_state (only_row) VALUES (true);
 
@@ -597,6 +633,21 @@ DECLARE
     last_applied_cost_limit text;
     last_applied_cost_delay text;
     workers_saturated boolean;
+    worker_queue_pressure boolean;
+    cur_vac_io_bytes bigint;
+    prev_vac_io_bytes bigint;
+    cur_vac_io_rate double precision;
+    raise_at timestamptz;
+    raise_limit integer;
+    raise_delay double precision;
+    rate_before_raise double precision;
+    page_hit_cost double precision;
+    cost_raise boolean := false;
+    drain_seconds double precision;
+    backlog_under_control boolean := false;
+    raise_applied_at timestamptz;
+    capped_limit integer;
+    globals_applied_here boolean;
     worker_mem_cap integer;
     critical_seen boolean := false;
     moderate_pressure boolean;
@@ -717,15 +768,36 @@ BEGIN
     cur_xid8 := pg_catalog.pg_current_xact_id()::text::bigint;
     SELECT w.wal_bytes::bigint INTO cur_wal_bytes
     FROM pg_catalog.pg_stat_wal w;
+    /* Autovacuum-worker pages touched (physical I/O plus cache hits): the observed throughput. */
+    IF server_vnum >= 180000 THEN
+        SELECT COALESCE(sum(COALESCE(io.read_bytes, 0) + COALESCE(io.write_bytes, 0)
+                            + COALESCE(io.extend_bytes, 0)
+                            + COALESCE(io.hits, 0) * block_size), 0)::bigint
+        INTO cur_vac_io_bytes
+        FROM pg_catalog.pg_stat_io io
+        WHERE io.backend_type = 'autovacuum worker' AND io.object = 'relation';
+    ELSE
+        SELECT COALESCE(sum((COALESCE(io.reads, 0) + COALESCE(io.writes, 0)
+                             + COALESCE(io.extends, 0) + COALESCE(io.hits, 0))
+                            * COALESCE(io.op_bytes, block_size)), 0)::bigint
+        INTO cur_vac_io_bytes
+        FROM pg_catalog.pg_stat_io io
+        WHERE io.backend_type = 'autovacuum worker' AND io.object = 'relation';
+    END IF;
     SELECT cs.last_xid8, cs.last_sample_at, cs.last_wal_bytes,
            cs.last_debt_tuples, cs.debt_velocity, cs.backlog_free_cycles,
-           cs.autovacuum_off_cycles, cs.baseline_settings
+           cs.autovacuum_off_cycles, cs.baseline_settings,
+           cs.last_vacuum_io_bytes, cs.last_cost_raise_at, cs.last_raise_cost_limit,
+           cs.last_raise_cost_delay, cs.io_rate_before_raise
     INTO prev_xid8, prev_sample_at, prev_wal_bytes,
          prev_debt_tuples, prev_debt_velocity, free_cycles,
-         av_off_cycles, baseline_json
+         av_off_cycles, baseline_json,
+         prev_vac_io_bytes, raise_at, raise_limit,
+         raise_delay, rate_before_raise
     FROM adaptive_autovacuum.controller_state cs;
     xid_rate := NULL;
     wal_rate_mbps := NULL;
+    cur_vac_io_rate := NULL;
     sample_interval := NULL;
     IF prev_sample_at IS NOT NULL
        AND clock_timestamp() > prev_sample_at + interval '1 second' THEN
@@ -735,6 +807,9 @@ BEGIN
         END IF;
         IF prev_wal_bytes IS NOT NULL AND cur_wal_bytes >= prev_wal_bytes THEN
             wal_rate_mbps := (cur_wal_bytes - prev_wal_bytes) / 1048576.0 / sample_interval;
+        END IF;
+        IF prev_vac_io_bytes IS NOT NULL AND cur_vac_io_bytes >= prev_vac_io_bytes THEN
+            cur_vac_io_rate := (cur_vac_io_bytes - prev_vac_io_bytes) / sample_interval;
         END IF;
     END IF;
 
@@ -811,6 +886,9 @@ BEGIN
     SELECT setting::integer INTO autovacuum_worker_slots_cfg
     FROM pg_settings WHERE name = 'autovacuum_worker_slots';
 
+    SELECT setting::double precision INTO page_hit_cost
+    FROM pg_settings WHERE name = 'vacuum_cost_page_hit';
+
     SELECT setting::integer INTO current_buffer_usage_limit_kb
     FROM pg_settings WHERE name = 'vacuum_buffer_usage_limit';
 
@@ -886,6 +964,7 @@ BEGIN
         recommended_cost_delay := GREATEST(
             LEAST(p.recommendation_delay_min_ms, GREATEST(current_global_cost_delay, 0)),
             GREATEST(current_global_cost_delay, 0) / 2.0);
+        cost_raise := true;
         recommendation_reason := 'Long-running vacuums are spending a material fraction of time in cost delay.';
     ELSE
         recommended_cost_limit := current_global_cost_limit;
@@ -984,7 +1063,9 @@ BEGIN
         last_wal_bytes = cur_wal_bytes,
         last_debt_tuples = total_debt_tuples,
         debt_velocity = cur_debt_velocity,
-        autovacuum_off_cycles = av_off_cycles;
+        autovacuum_off_cycles = av_off_cycles,
+        last_vacuum_io_bytes = cur_vac_io_bytes,
+        vacuum_io_rate = cur_vac_io_rate;
 
     FOR r IN
         WITH active_vacuum AS
@@ -2059,6 +2140,11 @@ BEGIN
                               WHEN backlog_growth < -p.backlog_trend_deadband THEN 'shrinking'
                               ELSE 'flat' END;
     END IF;
+    /* Shrinking is only "under control" if the debt is projected to clear within the target. */
+    drain_seconds := CASE WHEN cl_debt_velocity < 0
+                          THEN cl_debt_tuples / -cl_debt_velocity END;
+    backlog_under_control := backlog_trend = 'shrinking'
+                             AND drain_seconds <= p.max_backlog_drain_seconds;
 
     /* Baseline = operator value: refreshed when the live value is not the one last applied here. */
     SELECT q.desired_value INTO last_applied_cost_limit
@@ -2092,12 +2178,13 @@ BEGIN
     IF NOT host_pressure AND cl_overdue > 0
        AND recommendation_reason = 'No cluster-level cost change is currently justified.'
     THEN
-        IF backlog_trend = 'shrinking' THEN
+        IF backlog_under_control THEN
             recommendation_reason := format(
                 '%s overdue relations, but cluster maintenance debt is shrinking'
-                || ' (%s%% per check): holding the current cost settings.',
-                cl_overdue, to_char(-100.0 * backlog_growth, 'FM9990.0'));
+                || ' (%s%% per check, clear in about %s s): holding the current cost settings.',
+                cl_overdue, to_char(-100.0 * backlog_growth, 'FM9990.0'), round(drain_seconds));
         ELSE
+            cost_raise := true;
             recommended_cost_limit := LEAST(p.recommendation_cost_limit_max,
                                             GREATEST(200, current_global_cost_limit * 2));
             /* Same floored walk-down as the delay-bound branch above. */
@@ -2106,10 +2193,14 @@ BEGIN
                 GREATEST(current_global_cost_delay, 0) / 2.0);
             recommendation_reason := format(
                 '%s overdue relations were found without host pressure; cluster maintenance'
-                || ' debt is %s%s.',
+                || ' debt is %s%s%s.',
                 cl_overdue, backlog_trend,
                 CASE WHEN backlog_growth IS NOT NULL
                      THEN format(' (%s%% per check)', to_char(100.0 * backlog_growth, 'FMS9990.0'))
+                     ELSE '' END,
+                CASE WHEN backlog_trend = 'shrinking'
+                     THEN format(' but would take about %s s to clear (max_backlog_drain_seconds = %s)',
+                                 round(drain_seconds), p.max_backlog_drain_seconds)
                      ELSE '' END);
         END IF;
     ELSIF cl_overdue = 0 AND NOT host_pressure AND autovacuum_enabled_global
@@ -2136,16 +2227,97 @@ BEGIN
             trim(trailing '.' from to_char(baseline_cost_delay, 'FM999990.99')));
     END IF;
 
+    /* A raise must first prove itself: the previous applied raise has to show more throughput. */
+    IF cost_raise AND raise_at IS NOT NULL
+       AND raise_limit = current_global_cost_limit
+       AND abs(raise_delay - current_global_cost_delay) < 0.001 THEN
+        /* The interval counts as post-raise when the raise was applied within its first tenth. */
+        SELECT max(q.applied_at) INTO raise_applied_at
+        FROM adaptive_autovacuum.global_apply_queue q
+        WHERE ((q.guc_name = 'autovacuum_vacuum_cost_limit'
+                AND q.desired_value = raise_limit::text)
+               OR (q.guc_name = 'autovacuum_vacuum_cost_delay'
+                   AND q.desired_value::double precision = raise_delay))
+          AND q.status = 'applied'
+          AND q.requested_at >= raise_at - interval '1 second';
+        IF prev_sample_at IS NULL OR cur_vac_io_rate IS NULL OR raise_applied_at IS NULL
+           OR raise_applied_at > prev_sample_at + sample_interval * interval '0.1 second' THEN
+            recommended_cost_limit := current_global_cost_limit;
+            recommended_cost_delay := current_global_cost_delay;
+            recommendation_reason := recommendation_reason || format(
+                ' The last cost raise (to %s / %s ms) has not yet been observed over a full'
+                || ' check interval: holding.',
+                raise_limit, trim(trailing '.' from to_char(raise_delay, 'FM999990.99')));
+        ELSIF cur_vac_io_rate <= rate_before_raise
+                                 * (1 + p.cost_raise_min_io_gain_percent / 100.0) THEN
+            recommended_cost_limit := current_global_cost_limit;
+            recommended_cost_delay := current_global_cost_delay;
+            recommendation_reason := recommendation_reason || format(
+                ' The last cost raise (to %s / %s ms) did not increase observed autovacuum'
+                || ' throughput (%s MB/s before, %s MB/s after): storage, not the cost budget,'
+                || ' is the limit; holding.',
+                raise_limit, trim(trailing '.' from to_char(raise_delay, 'FM999990.99')),
+                round((rate_before_raise / 1048576.0)::numeric, 1),
+                round((cur_vac_io_rate / 1048576.0)::numeric, 1));
+        END IF;
+    END IF;
+    /* Throughput cap: keep the delay (it smooths I/O), take only the limit raise that fits. */
+    IF cost_raise AND p.recommendation_max_vacuum_mbps > 0
+       AND (recommended_cost_limit > current_global_cost_limit
+            OR recommended_cost_delay < current_global_cost_delay)
+       AND adaptive_autovacuum.vacuum_cost_ceiling_mbps(recommended_cost_limit,
+                                                        recommended_cost_delay,
+                                                        page_hit_cost, block_size)
+           > p.recommendation_max_vacuum_mbps THEN
+        capped_limit := CASE
+            WHEN current_global_cost_delay > 0
+            THEN floor(p.recommendation_max_vacuum_mbps * 1048576.0 * page_hit_cost
+                       * current_global_cost_delay / 1000.0 / block_size)::integer
+            ELSE current_global_cost_limit END;
+        recommended_cost_delay := current_global_cost_delay;
+        recommended_cost_limit := LEAST(recommended_cost_limit,
+                                        GREATEST(capped_limit, current_global_cost_limit));
+        recommendation_reason := recommendation_reason || format(
+            ' Throughput cap %s MB/s (recommendation_max_vacuum_mbps): %s.',
+            p.recommendation_max_vacuum_mbps,
+            CASE WHEN recommended_cost_limit > current_global_cost_limit
+                 THEN format('the delay stays at %s ms and cost_limit goes to %s (%s MB/s)',
+                             trim(trailing '.' from to_char(current_global_cost_delay, 'FM999990.99')),
+                             recommended_cost_limit,
+                             round(adaptive_autovacuum.vacuum_cost_ceiling_mbps(
+                                       recommended_cost_limit, recommended_cost_delay,
+                                       page_hit_cost, block_size)::numeric))
+                 ELSE format('the current %s / %s ms (%s MB/s) is held',
+                             current_global_cost_limit,
+                             trim(trailing '.' from to_char(current_global_cost_delay, 'FM999990.99')),
+                             round(adaptive_autovacuum.vacuum_cost_ceiling_mbps(
+                                       current_global_cost_limit, current_global_cost_delay,
+                                       page_hit_cost, block_size)::numeric))
+            END);
+    END IF;
+
     UPDATE adaptive_autovacuum.controller_state
     SET backlog_free_cycles = free_cycles,
         baseline_settings = baseline_json;
+    /* A backlog-free check closes the episode: the next incident's first raise is judged fresh. */
+    IF cl_overdue = 0 AND raise_at IS NOT NULL THEN
+        UPDATE adaptive_autovacuum.controller_state
+        SET last_cost_raise_at = NULL,
+            last_raise_cost_limit = NULL,
+            last_raise_cost_delay = NULL,
+            io_rate_before_raise = NULL;
+        raise_at := NULL;
+    END IF;
 
-    /* Workers: saturated pool + non-shrinking debt; CPU is a pressure gate, not the formula. */
+    /* Workers: busy pool or a queue far longer than the pool, with non-shrinking debt. */
     workers_saturated := av_workers_running >= current_autovacuum_workers;
+    /* One pg_stat_activity sample misses saturation; a long overdue queue is the same evidence. */
+    worker_queue_pressure := cl_overdue >= GREATEST(current_autovacuum_workers * 2,
+                                                    current_autovacuum_workers + 2);
     IF NOT autovacuum_enabled_global
        OR cl_overdue = 0
-       OR NOT workers_saturated
-       OR backlog_trend = 'shrinking'
+       OR (NOT workers_saturated AND NOT worker_queue_pressure)
+       OR backlog_under_control
        OR (host_pressure AND NOT critical_seen) THEN
         recommended_workers := current_autovacuum_workers;
     ELSE
@@ -2159,9 +2331,9 @@ BEGIN
                  + floor(host_mem_available_bytes / 2.0
                          / (current_autovacuum_work_mem_kb::double precision * 1024))::integer
             ELSE recommended_workers END;
+        /* CPU count only gates via load per CPU; no 1-worker-per-CPU ceiling. */
         /* PG18 caps at autovacuum_worker_slots; PG17 stays record-only (restart GUC). */
         recommended_workers := LEAST(recommended_workers,
-                                     GREATEST(1, host_cpu_count),
                                      worker_mem_cap,
                                      p.recommendation_workers_max,
                                      CASE WHEN server_vnum >= 180000
@@ -2174,20 +2346,20 @@ BEGIN
         IF recommended_workers > current_autovacuum_workers THEN
             IF server_vnum >= 180000 THEN
                 recommendation_reason := recommendation_reason || format(
-                    ' All %s autovacuum workers are busy while %s relations are'
+                    ' %s of %s autovacuum workers are busy while %s relations are'
                     || ' overdue and maintenance debt is %s; raise autovacuum_max_workers'
                     || ' to %s (reloadable; the shared vacuum_cost_limit is split across'
                     || ' workers, so this does not raise total un-boosted vacuum I/O;'
                     || ' capped by autovacuum_worker_slots=%s which needs a restart to raise).',
-                    current_autovacuum_workers, cl_overdue, backlog_trend,
+                    av_workers_running, current_autovacuum_workers, cl_overdue, backlog_trend,
                     recommended_workers, autovacuum_worker_slots_cfg);
             ELSE
                 recommendation_reason := recommendation_reason || format(
-                    ' All %s autovacuum workers are busy while %s relations are'
+                    ' %s of %s autovacuum workers are busy while %s relations are'
                     || ' overdue and maintenance debt is %s; raise autovacuum_max_workers'
                     || ' to %s (on PostgreSQL 17 this requires a server restart, so it is'
                     || ' recorded here and never applied automatically).',
-                    current_autovacuum_workers, cl_overdue, backlog_trend,
+                    av_workers_running, current_autovacuum_workers, cl_overdue, backlog_trend,
                     recommended_workers);
             END IF;
         END IF;
@@ -2339,6 +2511,7 @@ BEGIN
          recommended_insert_scale_factor, recommended_insert_threshold,
          recommended_analyze_scale_factor, recommended_analyze_threshold,
          maintenance_debt_tuples, maintenance_debt_velocity, backlog_trend,
+         autovacuum_io_mbps, cost_ceiling_mbps,
          reason)
     VALUES
         (host_json, overdue_relation_count, long_vacuum_count,
@@ -2351,6 +2524,9 @@ BEGIN
          recommended_ins_scale, recommended_ins_thresh,
          recommended_an_scale, recommended_an_thresh,
          cl_debt_tuples, cl_debt_velocity, backlog_trend,
+         cur_vac_io_rate / 1048576.0,
+         adaptive_autovacuum.vacuum_cost_ceiling_mbps(recommended_cost_limit, recommended_cost_delay,
+                                                      page_hit_cost, block_size),
          recommendation_reason);
 
     /* autovacuum=off repair: the one non-numeric change; queued separately, only ever 'on'. */
@@ -2370,11 +2546,12 @@ BEGIN
     END IF;
 
     /* Cluster-first: queue ALTER SYSTEM changes for the C worker (deduplicated, audited). */
-    IF p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global
+    globals_applied_here := p.manage_global_settings AND NOT p.dry_run AND autovacuum_enabled_global
        AND evidence_complete
        AND (COALESCE(current_setting('adaptive_autovacuum.global_settings_database', true), '') = ''
             OR current_setting('adaptive_autovacuum.global_settings_database', true)
-               = pg_catalog.current_database()::text) THEN
+               = pg_catalog.current_database()::text);
+    IF globals_applied_here THEN
         INSERT INTO adaptive_autovacuum.global_apply_queue(guc_name, desired_value, reason)
         SELECT cand.guc_name, cand.desired_value, recommendation_reason
         FROM (VALUES
@@ -2439,6 +2616,22 @@ BEGIN
                           FROM adaptive_autovacuum.global_apply_queue q
                           WHERE q.guc_name = cand.guc_name
                             AND q.status = 'pending');
+    END IF;
+
+    /* Remember a queued raise with the throughput seen before it; the next check judges it. */
+    /* A pair still waiting in the queue is re-recommended each check: keep its first record. */
+    IF globals_applied_here AND cost_raise
+       AND (recommended_cost_limit > current_global_cost_limit
+            OR recommended_cost_delay < current_global_cost_delay)
+       AND (raise_limit IS DISTINCT FROM recommended_cost_limit
+            OR raise_delay IS DISTINCT FROM
+               trim(trailing '.' from to_char(recommended_cost_delay, 'FM999990.99'))::double precision) THEN
+        UPDATE adaptive_autovacuum.controller_state
+        SET last_cost_raise_at = clock_timestamp(),
+            last_raise_cost_limit = recommended_cost_limit,
+            last_raise_cost_delay = trim(trailing '.' from
+                                         to_char(recommended_cost_delay, 'FM999990.99'))::double precision,
+            io_rate_before_raise = COALESCE(cur_vac_io_rate, 0);
     END IF;
 
     UPDATE adaptive_autovacuum.global_apply_queue

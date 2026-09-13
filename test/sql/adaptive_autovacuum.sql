@@ -4,8 +4,8 @@ SET client_min_messages = warning;
 
 CREATE EXTENSION adaptive_autovacuum;
 
-SELECT enabled = false AS disabled_by_default,
-       dry_run = true AS dry_run_by_default,
+SELECT enabled = true AS active_by_default,
+       dry_run = false AS applies_by_default,
        manage_table_costs = false AS cost_changes_opt_in,
        emergency_vacuum_enabled = true AS emergency_on_by_default,
        manage_global_settings = true AS globals_managed_by_default,
@@ -19,8 +19,14 @@ FROM adaptive_autovacuum.policy;
 
 SELECT recommendation_delay_min_ms = 0.5 AS delay_floor_default,
        recommendation_buffer_usage_limit_max_mb = 256 AS buffer_ring_cap_default,
-       high_wal_mbps = 0 AS wal_guardrail_off_by_default
+       high_wal_mbps = 0 AS wal_guardrail_off_by_default,
+       recommendation_max_vacuum_mbps = 3200 AS throughput_cap_default,
+       cost_raise_min_io_gain_percent = 10 AS io_gain_default,
+       max_backlog_drain_seconds = 180 AS drain_target_default
 FROM adaptive_autovacuum.policy;
+
+SELECT adaptive_autovacuum.vacuum_cost_ceiling_mbps(200, 2) = 781.25 AS pg_default_ceiling_is_781_mib_s,
+       adaptive_autovacuum.vacuum_cost_ceiling_mbps(200, 0) = 'infinity' AS zero_delay_is_unbounded;
 
 -- Out-of-bounds policy values are rejected by CHECK constraints (terse: DETAIL has timestamps).
 \set VERBOSITY terse
@@ -425,9 +431,171 @@ $$;
 SELECT backlog_trend = 'shrinking'
        AND maintenance_debt_velocity < 0
        AND recommended_cost_limit = current_setting('vacuum_cost_limit')::integer
-       AND reason LIKE '%debt is shrinking%holding%'
+       AND reason LIKE '%debt is shrinking%clear in about%holding%'
        AS shrinking_debt_holds_cost_limit
 FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Shrinking 10% per 60 s check projects a 600 s drain, above the 180 s target: keep raising.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = round(last_debt_tuples * 1.1),
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT backlog_trend = 'shrinking'
+       AND recommended_cost_limit = 2 * current_setting('vacuum_cost_limit')::integer
+       AND reason LIKE '%but would take about%to clear (max_backlog_drain_seconds = 180)%'
+       AS slow_shrinking_debt_still_raises
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Throughput cap: the delay is kept and only the part of the limit raise that fits is taken.
+SELECT current_setting('vacuum_cost_limit')::integer AS aav_limit \gset
+SELECT setting::double precision AS aav_delay FROM pg_settings
+WHERE name = 'autovacuum_vacuum_cost_delay' \gset
+UPDATE adaptive_autovacuum.policy SET recommendation_max_vacuum_mbps = 1600;
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT backlog_trend = 'growing'
+       AND recommended_cost_limit = 2 * :aav_limit
+       AND recommended_cost_delay_ms = :aav_delay
+       AND cost_ceiling_mbps = adaptive_autovacuum.vacuum_cost_ceiling_mbps(2 * :aav_limit, :aav_delay)
+       AND reason LIKE '%Throughput cap 1600 MB/s%delay stays at%'
+       AS throughput_cap_keeps_delay_raises_limit
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+UPDATE adaptive_autovacuum.policy SET recommendation_max_vacuum_mbps = 780;
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = :aav_limit
+       AND recommended_cost_delay_ms = :aav_delay
+       AND reason LIKE '%Throughput cap 780 MB/s%is held%'
+       AS throughput_cap_holds_when_nothing_fits
+FROM adaptive_autovacuum.latest_global_recommendation;
+UPDATE adaptive_autovacuum.policy SET recommendation_max_vacuum_mbps = 3200;
+
+-- Observed-throughput feedback: an applied raise that did not raise pg_stat_io throughput holds.
+INSERT INTO adaptive_autovacuum.global_apply_queue
+    (guc_name, desired_value, status, requested_at, applied_at)
+VALUES ('autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit'), 'applied',
+        clock_timestamp() - interval '120 seconds', clock_timestamp() - interval '119 seconds');
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL,
+    last_vacuum_io_bytes = 0,
+    last_cost_raise_at = clock_timestamp() - interval '120 seconds',
+    last_raise_cost_limit = :aav_limit,
+    last_raise_cost_delay = :aav_delay,
+    io_rate_before_raise = 1e15;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = :aav_limit
+       AND recommended_cost_delay_ms = :aav_delay
+       AND autovacuum_io_mbps IS NOT NULL
+       AND reason LIKE '%did not increase observed autovacuum throughput%holding%'
+       AS no_io_gain_holds_cost_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- A raise younger than the previous sample has not been observed over a full interval yet.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL,
+    last_cost_raise_at = clock_timestamp() - interval '30 seconds';
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = :aav_limit
+       AND reason LIKE '%has not yet been observed over a full check interval%'
+       AS post_raise_interval_awaited
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- A raise applied within the first tenth of the interval is judged on that interval.
+INSERT INTO adaptive_autovacuum.global_apply_queue
+    (guc_name, desired_value, status, requested_at, applied_at)
+VALUES ('autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit'), 'applied',
+        clock_timestamp() - interval '59.5 seconds', clock_timestamp() - interval '59 seconds');
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL,
+    last_vacuum_io_bytes = 0,
+    last_cost_raise_at = clock_timestamp() - interval '59.5 seconds',
+    io_rate_before_raise = 1e15;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = :aav_limit
+       AND reason LIKE '%did not increase observed autovacuum throughput%'
+       AS raise_early_in_interval_is_judged
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- A -1 MB seed guarantees a measured rate above a zero pre-raise rate: the raise is allowed.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL,
+    last_vacuum_io_bytes = -1048576,
+    last_cost_raise_at = clock_timestamp() - interval '120 seconds',
+    io_rate_before_raise = 0;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = 2 * :aav_limit
+       AND autovacuum_io_mbps > 0
+       AS observed_io_gain_allows_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- A record that no longer matches the live settings (operator change, failed apply) is ignored.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL,
+    last_raise_cost_limit = 12345,
+    io_rate_before_raise = 1e15;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_cost_limit = 2 * :aav_limit AS stale_raise_record_ignored
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+DELETE FROM adaptive_autovacuum.global_apply_queue;
 
 -- Decay: no backlog for the configured checks steps cost settings halfway back to the baseline.
 VACUUM aav_overdue;
@@ -462,7 +630,118 @@ WHERE s.name = 'autovacuum_vacuum_cost_delay';
 SELECT backlog_free_cycles = 0 AS decay_step_resets_counter
 FROM adaptive_autovacuum.controller_state;
 
+SELECT last_cost_raise_at IS NULL AND last_raise_cost_limit IS NULL
+       AND io_rate_before_raise IS NULL
+       AS backlog_free_check_clears_raise_record
+FROM adaptive_autovacuum.controller_state;
+
 DELETE FROM adaptive_autovacuum.global_apply_queue;
+
+-- Worker pool: an overdue queue far longer than the pool counts as saturation, and the
+-- recommendation may exceed the CPU count (host_cpu_count = 1 here).
+DO $$
+BEGIN
+    FOR i IN 1..8 LOOP
+        EXECUTE format('CREATE TABLE aav_wq_%s(id integer, payload text)'
+                       || ' WITH (autovacuum_enabled = false)', i);
+        EXECUTE format('INSERT INTO aav_wq_%s SELECT g, g::text FROM generate_series(1, 10000) g', i);
+    END LOOP;
+END
+$$;
+SELECT pg_stat_force_next_flush();
+VACUUM ANALYZE aav_wq_1, aav_wq_2, aav_wq_3, aav_wq_4, aav_wq_5, aav_wq_6, aav_wq_7, aav_wq_8;
+DO $$
+BEGIN
+    FOR i IN 1..8 LOOP
+        EXECUTE format('DELETE FROM aav_wq_%s WHERE id > 1000', i);
+    END LOOP;
+END
+$$;
+SELECT pg_stat_force_next_flush();
+SELECT setting::integer AS aav_workers FROM pg_settings WHERE name = 'autovacuum_max_workers' \gset
+
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT overdue_relations >= 8
+       AND backlog_trend = 'growing'
+       AND recommended_autovacuum_workers = 2 * :aav_workers
+       AND recommended_autovacuum_workers > (host_metrics ->> 'cpu_count')::integer
+       AND reason LIKE format('%%raise autovacuum_max_workers to %s%%', 2 * :aav_workers)
+       AS queue_pressure_raises_workers_past_cpu_count
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Host pressure (load 10 on 1 CPU) still blocks the raise.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(10, 1, 0, 0);
+END
+$$;
+
+SELECT overdue_relations >= 8
+       AND recommended_autovacuum_workers = :aav_workers
+       AS host_pressure_blocks_worker_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Free memory caps the raise: 3 x autovacuum_work_mem free allows exactly one extra worker.
+SELECT 3 * 1024 * CASE WHEN a.setting::integer < 0 THEN m.setting::bigint ELSE a.setting::bigint END
+       AS aav_mem
+FROM pg_settings a, pg_settings m
+WHERE a.name = 'autovacuum_work_mem' AND m.name = 'maintenance_work_mem' \gset
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+SELECT o_overdue >= 8 AS memory_capped_cycle_ran
+FROM adaptive_autovacuum._run_cycle(0, 1, :aav_mem, :aav_mem);
+
+SELECT recommended_autovacuum_workers = :aav_workers + 1
+       AS free_memory_caps_worker_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- recommendation_workers_max stays a hard ceiling.
+UPDATE adaptive_autovacuum.policy SET recommendation_workers_max = :aav_workers + 1;
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = 0,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommended_autovacuum_workers = :aav_workers + 1
+       AS policy_max_caps_worker_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+UPDATE adaptive_autovacuum.policy SET recommendation_workers_max = 16;
+
+-- A shrinking backlog holds the pool even under queue pressure.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '60 seconds',
+    last_debt_tuples = last_debt_tuples * 100,
+    debt_velocity = NULL;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT backlog_trend = 'shrinking'
+       AND recommended_autovacuum_workers = :aav_workers
+       AS shrinking_debt_holds_workers
+FROM adaptive_autovacuum.latest_global_recommendation;
 
 SELECT bool_and(relpersistence = 'u') AS audit_tables_unlogged
 FROM pg_class

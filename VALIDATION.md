@@ -755,6 +755,171 @@ and dry run proposes each table once.
   code review of the claim query. The hosted CI run for this revision is
   pending.
 
+## Validation performed 2026-09-13 (worker capacity: no CPU ceiling, queue pressure, active defaults)
+
+Changes under test: (1) the worker recommendation is no longer capped at one
+worker per CPU; the CPU count acts only through the load-per-CPU pressure
+gate, while free memory / `autovacuum_work_mem`, `autovacuum_worker_slots`,
+`recommendation_workers_max`, bounded doubling and the host-pressure gate stay;
+(2) saturation is also inferred from the queue: an overdue count of at least
+`2 × workers` and `workers + 2` counts like a fully busy pool, because one
+`pg_stat_activity` sample per cycle misses workers that start and finish
+between samples; (3) a fresh `CREATE EXTENSION` is active (`enabled = true`,
+`dry_run = false`, `manage_global_settings = true`); the cluster switch
+`adaptive_autovacuum.enabled` is unchanged (off). No C change; the shared
+memory layout is unchanged.
+
+- `make installcheck` green on WSL AlmaLinux 9 against PGDG 17.11 and 18.6,
+  twice each (on demand and preloaded), and on Windows against PG 18.4 in a
+  scratch instance, twice. New checks (eight overdue tables, a pool of three,
+  `host_cpu_count = 1`, synthetic growing debt): the recommendation is six
+  workers, above the CPU count, with the reason naming the raise; load 10 on
+  that one CPU holds the pool; a free-memory figure worth 1.5 extra workers
+  yields exactly one extra; `recommendation_workers_max = 4` caps at four; a
+  shrinking debt holds the pool under the same queue pressure; the policy
+  defaults read `enabled = true`, `dry_run = false`.
+- Live drill on WSL PG 18.6 (24 CPUs, 31 GB), replaying the Ubuntu method
+  from `aavtest.sql`: preloaded, `naptime_seconds = 10`, `ALTER SYSTEM`
+  `autovacuum_max_workers = 1`, `autovacuum_vacuum_cost_limit = 10`,
+  `autovacuum_vacuum_cost_delay = 100ms`; `CREATE EXTENSION` with no policy
+  update (the row came up `t|f|t`); 100 tables of 100,000 rows (20 MB each,
+  `autovacuum_vacuum_threshold = 1000`, scale factor 0); pgbench 16 clients,
+  8 threads, 200 s of single-row updates (405,464 transactions, 0 failed).
+  `min_table_bytes` was lowered to 8 MB because the Ubuntu tables are below
+  the 64 MB default filter and would otherwise not count as overdue.
+  Timeline (check every 10 s): 23:44:23 100 overdue, debt growing, queue rows
+  `autovacuum_max_workers 1 → 2`, `cost_limit 10 → 200`, `cost_delay 100 →
+  50` applied; 23:44:43 workers 4; 23:45:03 workers 8; 23:45:24 workers 12;
+  23:45:46 workers 16, cost limit 3200. At every one of those instants
+  `pg_stat_activity` showed exactly one autovacuum worker running (core's
+  launcher starts one per naptime), so the old all-workers-busy rule would
+  have stopped at 2; the queue-pressure rule carried the ramp. From 23:45:34
+  the debt read shrinking and the pool held at 12, then 16, while the cost
+  loop kept stepping until the backlog cleared (overdue 0 at 23:46:34, debt
+  10 M → 56 K tuples). After the load stopped `autovacuum_max_workers` stayed
+  at 16 and the cost settings at 10000 / 0.78 ms (no automatic lowering by
+  design; the decay needs ten clean checks). 28 queue rows, all `applied`,
+  old values recorded; 0 error lines in the server log.
+- Not shown live: a recommendation above the CPU count (the WSL host has 24
+  CPUs and the ramp stopped at the 16-slot PG18 default); that case is the
+  regression check with `host_cpu_count = 1`. A manual `_run_cycle` with
+  `host_cpu_count = 2` during the drill landed on a shrinking sample and
+  correctly held at 12. `autovacuum_worker_slots` as a ceiling is not
+  exercised (restart GUC). The hosted CI run for this revision is pending.
+- Side observation, unchanged behaviour: the opportunistic memory sizing set
+  `autovacuum_work_mem` to about 3 GB on this 31 GB host at the first check.
+
+## Validation performed 2026-09-14 (cost-raise brakes: throughput cap, observed-I/O feedback)
+
+Superseded in part by the next section (drain-time target and feedback timing); the cap and feedback checks below still apply.
+
+Motivation: in the 2026-09-13 drill the cost controller doubled `cost_limit`
+and halved `cost_delay` on every check, a 4x throughput step, and reached
+10000 / 0.78 ms (a theoretical 102 GB/s by (1000 / delay) x (limit /
+page_hit) x block size) in seven checks with no I/O signal in the loop.
+Changes under test: (1) `recommendation_max_vacuum_mbps` (default 3200
+MiB/s, about four times the 781 MiB/s of the PostgreSQL defaults) caps
+automatic raises; the delay is kept and only the limit raise that fits at the
+current delay is taken; (2) each applied raise is recorded with the
+autovacuum-worker throughput (`pg_stat_io`, reads + writes + extends + hits)
+measured before it, and the next raise is allowed only after a full
+post-raise sample interval and a gain of `cost_raise_min_io_gain_percent`
+(default 10); otherwise the controller holds and says why. New helper
+`vacuum_cost_ceiling_mbps()`, new columns `global_recommendations
+.autovacuum_io_mbps` / `.cost_ceiling_mbps`. SQL and tests only.
+
+- `make installcheck` green on WSL AlmaLinux 9 against PGDG 17.11 and 18.6,
+  twice each, and on Windows PG 18.4, twice. New checks: `vacuum_cost_ceiling
+  _mbps(200, 2) = 781.25` and delay 0 = infinity; cap 1600 from 200 / 2 ms
+  keeps the delay and raises the limit to 400 (1562.5 MiB/s); cap 780 holds
+  the pair with the reason "is held"; a recorded raise matching the live pair
+  with a huge pre-raise rate holds with "did not increase observed autovacuum
+  throughput"; a raise younger than the previous sample holds with "not yet
+  been observed over a full check interval"; a measurable gain over a zero
+  pre-raise rate allows the raise; a record whose pair differs from the live
+  settings is ignored.
+- Live drill on WSL PG 18.6 (24 CPUs, 31 GB), identical to the 2026-09-13
+  one (preloaded, `naptime_seconds = 10`, `autovacuum_max_workers = 1`,
+  `cost_limit = 10`, `cost_delay = 100ms`, 100 tables of 100,000 rows,
+  `min_table_bytes = 8 MB`, pgbench 16 clients / 8 threads / 240 s, 563,840
+  transactions, 0 failed). Cost pair timeline (checks every 10 s, observed
+  autovacuum MB/s in brackets): 00:22:27 raise to 200 / 50 ms [0.0];
+  00:22:37 hold, "has not yet been observed over a full check interval";
+  00:22:47 raise to 400 / 25 ms [1.0 > 0.0]; 00:22:57 hold, awaiting the
+  interval; 00:23:07 raise to 800 / 12.5 ms [21.3 > 1.0 x 1.1]; 00:23:17
+  hold, awaiting; 00:23:28 onward debt shrinking, pair held at 800 / 12.5 ms
+  (ceiling 500 MiB/s) while observed throughput ran at 50 to 70 MB/s and the
+  overdue count fell 82 -> 0 by 00:26:49. The worker pool rose 1 -> 2 -> 4 ->
+  8 -> 12 on the same checks and held when the debt turned shrinking. After
+  the load stopped nothing was lowered. Previous run for comparison: cost
+  limit 3200 at 00:45:46 and 10000 / 0.78 ms at 00:47:37 with the backlog
+  clearing in about the same time (overdue 0 at 00:46:34 vs 00:26:49 now,
+  from load start 00:44:23 vs 00:22:27: 2 min 11 s vs 4 min 22 s), i.e. the
+  extra 12x to 200x of cost budget bought about two minutes on a cached 2 GB
+  data set.
+- The throughput cap was not reached live: the feedback delay plus the
+  shrinking-debt hold stopped the ramp at 500 MiB/s. The cap is exercised by
+  the regression checks.
+- Server log in the drill window: 16 ERROR lines, all the regression suite's
+  intentional CHECK-constraint rejections at 00:22:05-06 before the drill
+  started, plus the two expected "terminating background worker" FATAL
+  lines at the two shutdowns. No errors from the drill itself.
+- Limitation noted for the record: autovacuum workers flush `pg_stat_io`
+  between tables, so one very long vacuum can make an interval read low and
+  hold a raise one check longer; a hold never lowers anything.
+
+## Validation performed 2026-09-14 (drain-time target, feedback timing, record fixes)
+
+Follow-up to the previous section: the operator asked for the backlog to
+come under control in about three minutes instead of four and a half. The
+recorded series showed why it took longer: from the first "shrinking" check
+the projected drain (debt / shrink rate) was 189 s and stayed at 120-180 s
+for a minute, yet "shrinking" alone meant hold. Changes: (1)
+`max_backlog_drain_seconds` (default 180): a shrinking backlog holds the
+cost and worker raises only when projected to clear within the target;
+otherwise it is stepped up (cap and feedback still apply) and the reason
+says "would take about N s to clear"; (2) feedback timing: the post-raise
+interval is recognised from the queue row's `applied_at` (the raise must
+fall within the first tenth of the interval), so a raise is judged on the
+next check, not one check later; (3) two record fixes found by the drill:
+a pair still waiting in the apply queue keeps its first record (the second
+drill of the day sat at 400 / 25 ms for four minutes with "has not yet been
+observed" because the record was rewritten every check while the C-side
+once-per-two-naptimes rule delayed the apply, and the applied row was then
+never matched), the applied row is matched by value, and a backlog-free
+check clears the record (the third drill held once against a quiet
+interval, "59.5 MB/s before, 0.1 MB/s after", when a new small backlog
+appeared three minutes after the previous one had cleared).
+
+- `make installcheck` green on WSL AlmaLinux 9 against PGDG 17.11 and 18.6,
+  twice each, and on Windows PG 18.4, twice. New checks: a debt shrinking
+  10 % per 60 s check (600 s projected drain) still doubles the cost limit
+  with the "would take about ... (max_backlog_drain_seconds = 180)" reason;
+  the fast-shrinking hold now reports "clear in about N s"; a raise applied
+  one second into a 60 s interval is judged on that interval ("did not
+  increase observed autovacuum throughput") instead of awaiting another; the
+  backlog-free decay check leaves the raise record cleared; policy default.
+- Live drill on WSL PG 18.6, same setup as the previous sections (24 CPUs,
+  `naptime_seconds = 10`, `autovacuum_max_workers = 1`, `cost_limit = 10`,
+  `cost_delay = 100ms`, 100 tables of 100,000 rows, pgbench 16 clients for
+  240 s, 420,676 transactions, 0 failed). Load started 00:48:04. Cost pair
+  and observed autovacuum MB/s per check: 00:48:04 200 / 50 [0.0]; 00:48:14
+  400 / 25 queued [3.0], applied 00:48:25 (C-side apply spacing); 00:48:35
+  800 / 12.5 [17.1 > 1.0 x 1.1]; 00:48:55 1600 / 6.25 [59.5 > 20.5 x 1.1],
+  ceiling 2000 MiB/s; 00:49:16 onward shrinking with projected drain within
+  180 s: held. Observed throughput 133-173 MB/s at 1600 / 6.25 ms (versus
+  50-70 MB/s at 800 / 12.5 ms in the previous drill: the raise did buy
+  throughput, and the feedback saw it). Overdue 100 -> 65 -> 48 -> 31 -> 17
+  -> 3 -> 0 at 00:50:09, i.e. 2 min 5 s after load start (previous drill
+  4 min 22 s; unbraked 2 min 11 s ending at 10000 / 0.78 ms). Workers rose
+  1 -> 2 -> 4 -> 8 -> 12 on the same checks and held. A second small backlog
+  (12 tables at 00:51:50) was raised once to the cap: 2560 / 6.25 ms = 3200
+  MiB/s exactly, reason "Throughput cap 3200 MB/s ... the delay stays at
+  6.25 ms and cost_limit goes to 2560"; the record-clearing fix (3) was
+  applied after this run and is covered by the regression check. Nothing
+  lowered after the load stopped. Server log in the drill window: only the
+  two expected "terminating background worker" lines at the shutdowns.
+
 ## Required release gate
 
 For each supported PostgreSQL major version:
