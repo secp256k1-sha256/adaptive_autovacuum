@@ -40,7 +40,10 @@ jobs:
           su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
 
           # Pass 2: the real deployment shape - library preloaded, launcher registered, controller off.
+          # The GUC defaults to on since 1.1.0; the suite needs the launcher idle or its concurrent cycles
+          # change the expected output. The installer step afterwards turns it on explicitly.
           echo "shared_preload_libraries = 'adaptive_autovacuum'" >> /tmp/aav-pgdata/postgresql.auto.conf
+          echo "adaptive_autovacuum.enabled = off" >> /tmp/aav-pgdata/postgresql.auto.conf
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -l /tmp/aav-pgdata/server.log -w restart"
           su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
       - name: Installer helper against the scratch cluster (pg_ctl path)
