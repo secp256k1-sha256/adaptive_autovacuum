@@ -16,6 +16,9 @@ for f in "$dist"/*.deb "$dist"/*.rpm "$dist"/*.zip; do
     name=$(basename "$f"); sha=$(sha256sum "$f" | cut -d' ' -f1); size=$(stat -c %s "$f")
     case "$name" in
         *-debuginfo-*|*-debugsource-*|*-dbgsym_*) echo "skipping debug package $name" >&2; continue ;;
+        # adaptive_autovacuum-1.1.0.zip : PGXN source distribution, not an installer artifact (listed in SHA256SUMS only)
+        adaptive_autovacuum-[0-9]*.zip)
+            [[ $name == *-pg*-windows-* ]] || { echo "source distribution $name: checksummed, not in the manifest" >&2; continue; } ;;&
         # adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm : helper shared by every major (postgres_major 0 = any)
         adaptive-autovacuum-setup-*.noarch.rpm)
             [[ $name =~ ^adaptive-autovacuum-setup-[^-]+-[0-9]+\.(el[0-9]+)\.noarch\.rpm$ ]] || { echo "unrecognised helper rpm name: $name" >&2; exit 1; }

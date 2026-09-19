@@ -1,0 +1,52 @@
+{
+   "name": "adaptive_autovacuum",
+   "abstract": "Autovacuum that tunes itself: an adaptive autovacuum controller with background workers for PostgreSQL 17 and 18",
+   "description": "adaptive_autovacuum watches dead-tuple and freeze debt, worker saturation and host capacity, and adjusts PostgreSQL autovacuum settings within guardrails: cluster-wide cost limits and workers, per-table thresholds and temporary boosts, ANALYZE for tables without statistics, and a guarded emergency vacuum when anti-wraparound autovacuum is demonstrably stuck. Every change is bounded, audited with its previous value and reversible.",
+   "version": "1.1.0",
+   "maintainer": [
+      "Mayuresh Bagayatkar <secp256k1-sha256@users.noreply.github.com>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "adaptive_autovacuum": {
+         "abstract": "Adaptive autovacuum policy controller with background workers",
+         "file": "sql/adaptive_autovacuum--1.1.0.sql",
+         "docfile": "README.md",
+         "version": "1.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0",
+            "plpgsql": 0
+         }
+      }
+   },
+   "release_status": "testing",
+   "resources": {
+      "homepage": "https://github.com/secp256k1-sha256/adaptive_autovacuum",
+      "bugtracker": {
+         "web": "https://github.com/secp256k1-sha256/adaptive_autovacuum/issues"
+      },
+      "repository": {
+         "url": "https://github.com/secp256k1-sha256/adaptive_autovacuum.git",
+         "web": "https://github.com/secp256k1-sha256/adaptive_autovacuum",
+         "type": "git"
+      }
+   },
+   "generated_by": "adaptive_autovacuum maintainers",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "autovacuum",
+      "vacuum",
+      "maintenance",
+      "monitoring",
+      "background worker",
+      "wraparound",
+      "tuning"
+   ]
+}

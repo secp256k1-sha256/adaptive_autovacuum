@@ -25,8 +25,10 @@ jobs:
           SPEC=$(sed -n 's/^Version:\s*//p' packaging/rpm/postgresql-adaptive-autovacuum.spec)
           CH=$(sed -n '1s/.*(\([^)]*\)).*/\1/p' packaging/debian/changelog.in)
           HELPER=$(sed -n 's/^readonly SETUP_VERSION="\(.*\)"/\1/p' packaging/linux/adaptive-autovacuum-setup)
-          echo "tag=$TAG control=$VER spec=$SPEC changelog=$CH helper=$HELPER"
+          META=$(jq -r .version META.json); METAPROV=$(jq -r '.provides.adaptive_autovacuum.version' META.json); METAFILE=$(jq -r '.provides.adaptive_autovacuum.file' META.json)
+          echo "tag=$TAG control=$VER spec=$SPEC changelog=$CH helper=$HELPER meta=$META/$METAPROV"
           test "$TAG" = "$VER" && test "$SPEC" = "$VER" && test "$CH" = "$VER-1" && test "$HELPER" = "$VER"
+          test "$META" = "$VER" && test "$METAPROV" = "$VER" && test "$METAFILE" = "sql/adaptive_autovacuum--$VER.sql"
           test -f "sql/adaptive_autovacuum--$VER.sql"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
@@ -58,6 +60,10 @@ jobs:
           mkdir -p dist
           find artifacts -type f \( -name '*.rpm' -o -name '*.deb' -o -name '*.zip' \) -exec cp {} dist/ \;
           cp packaging/linux/install.sh packaging/windows/install.ps1 dist/
+          # PGXN-ready source distribution (META.json at the top level of the zip), for a later PGXN upload.
+          VER="${{ needs.verify-version.outputs.version }}"
+          git archive --format=zip --prefix="adaptive_autovacuum-$VER/" -o "dist/adaptive_autovacuum-$VER.zip" "$GITHUB_REF_NAME"
+          unzip -l "dist/adaptive_autovacuum-$VER.zip" | grep -q "adaptive_autovacuum-$VER/META.json"
           bash packaging/common/make-release-manifest.sh dist "${{ needs.verify-version.outputs.version }}" "$GITHUB_REPOSITORY"
           python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('dist/release-manifest.json')), json.load(open('packaging/common/release-manifest.schema.json'))); print('manifest valid')"
           # Every artifact the manifest points to must exist in this release.
@@ -66,14 +72,21 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ needs.verify-version.outputs.version }} (beta)
           files: dist/*
           fail_on_unmatched_files: true
+          # A normal release (not the GitHub prerelease flag) so that releases/latest resolves and the
+          # documented quick install works; the beta status is stated here and in the README.
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           body: |
+            **Beta.** Functionally validated on PostgreSQL 17 and 18 (Linux and Windows), regression suites,
+            live drills and short soaks; not yet run for months in production. Please report `doctor` output with issues.
+
             Install (PostgreSQL 17 or 18):
 
             Linux: download `install.sh`, read it, then `sudo bash install.sh --database <name>`
             Windows: download `install.ps1`, read it, then run it from an elevated PowerShell with `-Database <name>`
 
             Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.
+            `adaptive_autovacuum-<version>.zip` is the PGXN-style source distribution (build from source with `make`).
