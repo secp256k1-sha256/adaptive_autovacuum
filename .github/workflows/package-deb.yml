@@ -35,6 +35,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential debhelper devscripts postgresql-server-dev-${{ matrix.pgmajor }} jq git
       - name: dpkg-buildpackage
+        shell: bash
         run: |
           set -euo pipefail
           VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
@@ -87,6 +88,7 @@ jobs:
           pg_ctlcluster ${{ matrix.pgmajor }} main start
           pg_lsclusters
       - name: Offline bootstrap install through install.sh (pg_lsclusters discovery path)
+        shell: bash
         run: |
           set -euo pipefail
           VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
@@ -97,6 +99,7 @@ jobs:
       - name: Idempotency, disable, remove-preload (bats live suite)
         run: AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
       - name: Package removal keeps database objects
+        shell: bash
         run: |
           set -euo pipefail
           adaptive-autovacuum-setup remove-preload --yes

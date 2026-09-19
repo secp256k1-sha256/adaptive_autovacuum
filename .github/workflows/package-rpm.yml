@@ -31,6 +31,7 @@ jobs:
           dnf config-manager --set-enabled crb
           dnf -y install postgresql${{ matrix.pgmajor }}-devel rpm-build rpmdevtools gcc make jq git rpmlint
       - name: Source tarball and rpmbuild
+        shell: bash
         run: |
           set -euo pipefail
           VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
@@ -82,6 +83,7 @@ jobs:
           su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/initdb -D /var/lib/pgsql/${{ matrix.pgmajor }}/data --no-locale --encoding=UTF8"
           su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/pg_ctl -D /var/lib/pgsql/${{ matrix.pgmajor }}/data -l /var/lib/pgsql/${{ matrix.pgmajor }}/data/server.log -w start"
       - name: Offline bootstrap install through install.sh
+        shell: bash
         run: |
           set -euo pipefail
           VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
@@ -93,6 +95,7 @@ jobs:
       - name: Idempotency, disable, remove-preload (bats live suite)
         run: AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
       - name: Package removal keeps database objects
+        shell: bash
         run: |
           set -euo pipefail
           adaptive-autovacuum-setup remove-preload --yes
