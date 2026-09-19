@@ -2,7 +2,7 @@
 
 **Target:** PostgreSQL 17 and later (full feature set on 18)
 **Extension version:** 1.1.0 (1.0.0 reference implementation revised 2026-08-14, superseding the original recommendation-only design; 1.1.0 adds the operator/installer API: `doctor()`, `status()`, `enable_default_policy()`, and the upgrade script `1.0.0--1.1.0`)
-**Safety posture:** a fresh install is active (policy `enabled = true`, `dry_run = false`, cluster-setting management on) behind the cluster switch `adaptive_autovacuum.enabled`; per-table cost boosts are opt-in; emergency execution is on. Installing is opting in, which matches the no-DBA target; the guardrails below carry that choice. Upgrade scripts must preserve the `enabled` / `dry_run` values an installation already has.
+**Safety posture:** a fresh install is active (policy `enabled = true`, `dry_run = false`, cluster-setting management on) behind the cluster switch `adaptive_autovacuum.enabled` (on by default since 1.1.0; off pauses every database); per-table cost boosts are opt-in; emergency execution is on. Installing is opting in, which matches the no-DBA target; the guardrails below carry that choice. Upgrade scripts must preserve the `enabled` / `dry_run` values an installation already has.
 
 ## 1. Purpose
 
@@ -138,7 +138,7 @@ Keeping policy in SQL makes most changes reviewable and upgradeable without addi
 An automatic write requires all applicable gates:
 
 1. The library is preloaded.
-2. `adaptive_autovacuum.enabled` is on at cluster level.
+2. `adaptive_autovacuum.enabled` is on at cluster level (the default).
 3. The extension exists in the target database.
 4. `adaptive_autovacuum.policy.enabled` is true in that database.
 5. `dry_run` is false.

@@ -58,7 +58,7 @@ PGDLLEXPORT void adaptive_autovacuum_emergency_main(Datum main_arg);
 PG_FUNCTION_INFO_V1(adaptive_autovacuum_host_metrics);
 PG_FUNCTION_INFO_V1(adaptive_autovacuum_cluster_summary_status);
 
-static bool aav_enabled = false;
+static bool aav_enabled = true;
 static char *aav_control_database = NULL;
 static char *aav_global_settings_database = NULL;
 static int aav_naptime_seconds = 60;
@@ -202,11 +202,12 @@ _PG_init(void)
 {
     BackgroundWorker worker;
 
+    /* On by default: installing (preload + CREATE EXTENSION) is the opt-in; off pauses every database. */
     DefineCustomBoolVariable("adaptive_autovacuum.enabled",
                              "Enable the adaptive autovacuum launcher.",
-                             "The SQL policy in each database must also be enabled.",
+                             "Cluster-wide switch, on by default; the SQL policy in each database must also be enabled.",
                              &aav_enabled,
-                             false,
+                             true,
                              PGC_SIGHUP,
                              0,
                              NULL,

@@ -1003,3 +1003,15 @@ Not exercised locally: DEB build and Ubuntu (`pg_lsclusters`) discovery path, aa
   (`trap`) instead of leaving the previous exit code. Pester unit suite green (16) after the support-list change.
 - Not exercised locally: DEB build of the two-package source, aarch64/arm64, a live PG17 install on Windows (the 17
   service shares port 5432 with 18 on this workstation), the GitHub workflows.
+
+### Addendum 2026-09-19: `adaptive_autovacuum.enabled` defaults to on
+
+The C GUC default changed from off to on (installing = preload + CREATE EXTENSION is the opt-in; `off` pauses every
+database). Regression re-run green on WSL PG 17.11/18.6 (two passes each; pass 2 still sets the GUC off explicitly so the
+launcher stays idle during the suite) and Windows PG 18.4 (two passes). A preload-only scratch cluster with no
+`adaptive_autovacuum.enabled` line shows `boot_val = on, source = default`, the launcher worker running and the first
+cycle completed; `doctor` reports `launcher_enabled` OK without any ALTER SYSTEM. The installers still set the GUC on
+explicitly so that an earlier `off` is undone. CI discovery inside the `postgres` containers was fixed the same day:
+`/proc/<pid>/exe` is unreadable there (no ptrace access for container root), so the scan now falls back to `argv[0]`,
+skips zombies, validates against `postmaster.pid`, silences the environment read, and closes descriptors 3-9 around
+`pg_ctl` so a restarted postmaster cannot hold the caller (bats) open.

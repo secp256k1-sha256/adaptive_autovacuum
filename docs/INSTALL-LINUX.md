@@ -72,7 +72,7 @@ Nothing has changed at that point. After confirmation:
   service again and exits 8.
 - **Activation.** Per database: `CREATE EXTENSION` when absent, `ALTER EXTENSION ... UPDATE` when an older
   version is installed (policy and history are preserved), nothing when current. It refuses to downgrade.
-- **Enable.** `adaptive_autovacuum.enabled = on` and, on PostgreSQL 18, `track_cost_delay_timing = on`
+- **Enable.** `adaptive_autovacuum.enabled = on` (already the built-in default; set explicitly so an earlier `off` is undone) and, on PostgreSQL 18, `track_cost_delay_timing = on`
   via `ALTER SYSTEM` + `pg_reload_conf()`. `--no-enable` skips this step. A fresh `CREATE EXTENSION` already
   creates an active policy; upgrades never change operator values.
 - **Verify.** Files, preload, launcher worker and `SELECT * FROM adaptive_autovacuum.doctor()` in every

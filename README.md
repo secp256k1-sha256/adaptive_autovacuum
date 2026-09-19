@@ -263,7 +263,7 @@ For tables getting dangerously close to transaction-ID wraparound (the failure m
 
 ## What it never does
 
-- Never acts until the cluster switch `adaptive_autovacuum.enabled` is on; a fresh `CREATE EXTENSION` is otherwise active (see [Turning it on safely](#turning-it-on-safely) for the watch-only start).
+- Never acts in a database without `CREATE EXTENSION`, and never anywhere while the cluster switch `adaptive_autovacuum.enabled` is off (on by default; see [Turning it on safely](#turning-it-on-safely) for the watch-only start).
 - Never touches a setting outside its fixed allow-list, never turns autovacuum off, and never touches table data.
 - Never fights you: your per-table changes freeze its automation for that table; your stricter global values are respected.
 - Never adds vacuum load to an already overloaded server (it watches load and memory before boosting anything).
@@ -381,7 +381,7 @@ Add to `postgresql.conf` and restart PostgreSQL (a restart is needed once, becau
 
 ```conf
 shared_preload_libraries = 'adaptive_autovacuum'
-adaptive_autovacuum.enabled = off        # you will turn this on in step 1 below
+adaptive_autovacuum.enabled = on         # default; set off to pause everything (see "Turning it on safely")
 track_cost_delay_timing = on             # lets it see vacuums that are mostly sleeping
 ```
 
@@ -452,14 +452,14 @@ SELECT * FROM adaptive_autovacuum.doctor();          -- every row OK?
 
 ## Turning it on safely
 
-Installing is opting in: a fresh `CREATE EXTENSION` creates an **active** policy (`enabled = true`, `dry_run = false`, `manage_global_settings = true`), so once `adaptive_autovacuum.enabled = on` is in `postgresql.conf` the extension manages cluster settings and per-table triggers without further setup. That is the intended path for a server nobody tunes by hand; the guardrails (bounded steps, host-pressure gate, allow-list, audit with old values, baseline recovery) are what make it acceptable. Set `enabled = false` to pause a database, or `dry_run = true` to watch only. An extension upgrade never changes the values you have set.
+Installing is opting in: a fresh `CREATE EXTENSION` creates an **active** policy (`enabled = true`, `dry_run = false`, `manage_global_settings = true`), and the cluster switch `adaptive_autovacuum.enabled` is on by default, so once the library is preloaded and the extension is created the extension manages cluster settings and per-table triggers without further setup. That is the intended path for a server nobody tunes by hand; the guardrails (bounded steps, host-pressure gate, allow-list, audit with old values, baseline recovery) are what make it acceptable. Set `enabled = false` to pause a database, or `dry_run = true` to watch only. An extension upgrade never changes the values you have set.
 
 If you prefer to stage it, watch first. Watch the audit tables between steps.
 
 ```sql
 -- Step 1: watch only. It logs what it WOULD do, changes nothing.
 UPDATE adaptive_autovacuum.policy SET dry_run = true;
--- and in postgresql.conf: adaptive_autovacuum.enabled = on   (+ reload)
+-- (adaptive_autovacuum.enabled is on by default; nothing to change in postgresql.conf)
 
 -- Step 2: let it act: fix cluster settings and per-table triggers.
 --   (add  manage_global_settings = false  if you want per-table changes only)
@@ -479,7 +479,7 @@ Server settings (`postgresql.conf`):
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `adaptive_autovacuum.enabled` | `off` | master switch |
+| `adaptive_autovacuum.enabled` | `on` | cluster-wide switch; `off` pauses every database without removing anything |
 | `adaptive_autovacuum.naptime_seconds` | `60` | sleep after one full pass over all databases (the revisit period of a database is the pass time plus this) |
 | `adaptive_autovacuum.control_database` | `postgres` | where the coordinator connects |
 | `adaptive_autovacuum.max_database_workers` | `2` | how many databases may be checked at the same time. The default of 2 keeps one busy database (for example one running its in-cycle ANALYZE of a large table) from delaying the checks of the others; set 1 for a strictly serial scan |
