@@ -76,8 +76,9 @@ jobs:
           dnf -qy module disable postgresql
           dnf -y install epel-release   # bats lives in EPEL
           dnf -y install postgresql${{ matrix.pgmajor }}-server jq bats procps-ng util-linux
-          /usr/pgsql-${{ matrix.pgmajor }}/bin/postgresql-${{ matrix.pgmajor }}-setup initdb
-          su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/pg_ctl -D /var/lib/pgsql/${{ matrix.pgmajor }}/data -w start"
+          # postgresql-N-setup needs systemctl (reads PGDATA from the unit); no systemd in the container, so initdb directly.
+          su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/initdb -D /var/lib/pgsql/${{ matrix.pgmajor }}/data --no-locale --encoding=UTF8"
+          su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/pg_ctl -D /var/lib/pgsql/${{ matrix.pgmajor }}/data -l /var/lib/pgsql/${{ matrix.pgmajor }}/data/server.log -w start"
       - name: Offline bootstrap install through install.sh
         run: |
           set -euo pipefail
