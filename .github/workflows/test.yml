@@ -36,19 +36,20 @@ jobs:
           trap 'su postgres -c "pg_ctl -D /tmp/aav-pgdata -m immediate stop" || true' EXIT
 
           # Pass 1: library loaded on demand by CREATE EXTENSION (no shared_preload_libraries).
-          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start"
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -l /tmp/aav-pgdata/server.log -w start"
           su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
 
           # Pass 2: the real deployment shape - library preloaded, launcher registered, controller off.
           echo "shared_preload_libraries = 'adaptive_autovacuum'" >> /tmp/aav-pgdata/postgresql.auto.conf
-          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w restart"
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -l /tmp/aav-pgdata/server.log -w restart"
           su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
       - name: Installer helper against the scratch cluster (pg_ctl path)
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
           export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
-          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start" || true
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -l /tmp/aav-pgdata/server.log -w start" || true
           install -m 755 packaging/linux/adaptive-autovacuum-setup /usr/local/bin/adaptive-autovacuum-setup
           # Diagnostics: what the container looks like to the discovery code. Written to the job
           # summary too, which is readable on the run page without a login.
@@ -61,7 +62,7 @@ jobs:
             command -v pg_lsclusters && pg_lsclusters 2>&1 || true
             ls /usr/lib/postgresql/*/bin/pg_config 2>&1 || true
             adaptive-autovacuum-setup check --verbose 2>&1 || echo "check exited $?"
-            adaptive-autovacuum-setup check --json 2>&1 | jq -c '{selectable: (.selectable | length), installations, clusters}' || true
+            adaptive-autovacuum-setup check --json | jq -c '{selectable: (.selectable | length), installations, clusters}' || true
             echo '--- process scan trace ---'
             bash -x /usr/local/bin/adaptive-autovacuum-setup check --json 2>&1 >/dev/null | grep -E '^\+ (comm=|state=|exe=|datadir=|ppid=|continue|add_cluster)' | head -60 || true
             echo '```'

@@ -30,7 +30,7 @@ setup() {
     run bash "$SETUP" install --database postgres --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     [[ "$output" == *"Installation complete."* ]]
-    run bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
+    run --separate-stderr bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     jq -e '.databases[] | select(.database == "postgres") | .status.extension_version != null and (.checks | map(select(.status == "FAIL")) | length == 0)' <<<"$output"
     [ "$(jq -r '.last_run.final_state' <<<"$output")" = "completed" ]
@@ -46,11 +46,11 @@ setup() {
 @test "disable and enable toggle the launcher GUC" {
     run bash "$SETUP" disable --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
-    run bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
+    run --separate-stderr bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
     [ "$(jq -r '.databases[0].status.launcher_enabled' <<<"$output")" = "false" ]
     run bash "$SETUP" enable --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
-    run bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
+    run --separate-stderr bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
     [ "$(jq -r '.databases[0].status.launcher_enabled' <<<"$output")" = "true" ]
 }
 
@@ -58,7 +58,7 @@ setup() {
     run bash "$SETUP" remove-preload --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     [[ "$output" == *"restarted without adaptive_autovacuum"* ]]
-    run bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
+    run --separate-stderr bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
     [ "$status" -eq 10 ]
     [ "$(jq -r '.databases[0].checks[] | select(.check_name == "library_preloaded") | .status' <<<"$output")" = "FAIL" ]
     # Put it back for the following tests.
