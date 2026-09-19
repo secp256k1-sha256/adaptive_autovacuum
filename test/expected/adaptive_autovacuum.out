@@ -727,6 +727,32 @@ WHERE oid IN ('adaptive_autovacuum.policy'::regclass,
               'adaptive_autovacuum.emergency_queue'::regclass,
               'adaptive_autovacuum.controller_state'::regclass);
 t
+/* 1.1.0 operator API: fixed check set, valid vocabulary, preload check agrees with shared memory. */
+SELECT count(*) = 15 AS doctor_check_count,
+       bool_and(status IN ('OK', 'WARN', 'FAIL', 'RESTART_REQUIRED')) AS doctor_statuses_valid,
+       bool_and(detail IS NOT NULL) AS doctor_details_present
+FROM adaptive_autovacuum.doctor();
+t|t|t
+SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'library_preloaded')
+       = CASE WHEN (SELECT available FROM adaptive_autovacuum.cluster_summary_status())
+              THEN 'OK' ELSE 'FAIL' END AS preload_check_matches_shared_memory;
+t
+SELECT extension_version = '1.1.0' AS status_version,
+       available_version = '1.1.0' AS status_available_version,
+       library_preloaded = (SELECT available FROM adaptive_autovacuum.cluster_summary_status()) AS status_preload_matches,
+       launcher_running IS NOT NULL AS status_launcher_known,
+       wraparound_status IN ('ok', 'watch', 'alarm') AS status_wraparound_known
+FROM adaptive_autovacuum.status();
+t|t|t|t|t
+SELECT adaptive_autovacuum._preload_lists_library('pg_stat_statements, "$libdir/adaptive_autovacuum"') AS preload_parse_quoted_libdir,
+       adaptive_autovacuum._preload_lists_library('adaptive_autovacuum.so') AS preload_parse_suffix,
+       NOT adaptive_autovacuum._preload_lists_library('pg_stat_statements,auto_explain') AS preload_parse_absent,
+       NOT adaptive_autovacuum._preload_lists_library('adaptive_autovacuum_extra') AS preload_parse_exact_name,
+       NOT adaptive_autovacuum._preload_lists_library('') AS preload_parse_empty;
+t|t|t|t|t
+SELECT adaptive_autovacuum._version_key('1.0.0') < adaptive_autovacuum._version_key('1.1.0') AS version_key_orders,
+       adaptive_autovacuum._version_key('1.2.0-beta') = ARRAY[1, 2, 0] AS version_key_ignores_tag;
+t|t
 DROP TABLE aav_healthy;
 DROP TABLE aav_overdue;
 DROP TABLE aav_no_stats;

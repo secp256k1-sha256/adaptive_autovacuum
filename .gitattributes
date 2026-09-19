@@ -1,0 +1,7 @@
+# Shell tooling must stay LF even on Windows checkouts (bash rejects CRLF).
+*.sh            text eol=lf
+*.bats          text eol=lf
+*.spec          text eol=lf
+packaging/linux/**   text eol=lf
+packaging/debian/**  text eol=lf
+packaging/common/**  text eol=lf

@@ -50,7 +50,7 @@ echo.
 echo Install into the running cluster (elevated prompt required):
 echo   copy windows\adaptive_autovacuum.dll         "%PGROOT%\lib\"
 echo   copy adaptive_autovacuum.control             "%PGROOT%\share\extension\"
-echo   copy sql\adaptive_autovacuum--1.0.0.sql      "%PGROOT%\share\extension\"
+echo   copy sql\adaptive_autovacuum--*.sql        "%PGROOT%\share\extension\"
 echo.
 echo Then follow the Windows installation steps in the README.
 popd

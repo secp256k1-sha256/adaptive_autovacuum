@@ -1,0 +1,33 @@
+Source: postgresql-@PGMAJOR@-adaptive-autovacuum
+Section: database
+Priority: optional
+Maintainer: adaptive_autovacuum maintainers <noreply@github.com>
+Build-Depends: debhelper-compat (= 13), postgresql-server-dev-@PGMAJOR@, jq
+Standards-Version: 4.6.2
+Homepage: https://github.com/secp256k1-sha256/adaptive_autovacuum
+Rules-Requires-Root: no
+
+Package: postgresql-@PGMAJOR@-adaptive-autovacuum
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, postgresql-@PGMAJOR@, adaptive-autovacuum-setup (= ${source:Version})
+Description: adaptive autovacuum controller extension for PostgreSQL @PGMAJOR@
+ adaptive_autovacuum watches dead-tuple and freeze debt, worker saturation
+ and host capacity, and adjusts PostgreSQL autovacuum settings within
+ guardrails.
+ .
+ This package installs the shared library and the extension control and SQL
+ scripts for PostgreSQL @PGMAJOR@. It does not restart PostgreSQL, change its
+ configuration or create the extension; run "adaptive-autovacuum-setup install"
+ (package adaptive-autovacuum-setup, installed as a dependency) for that.
+
+Package: adaptive-autovacuum-setup
+Architecture: all
+Depends: ${misc:Depends}, jq, bash (>= 4.2), util-linux
+Description: setup, health-check and rollback helper for adaptive_autovacuum
+ adaptive-autovacuum-setup discovers PostgreSQL clusters, appends
+ adaptive_autovacuum to shared_preload_libraries while preserving other
+ entries, restarts the selected service with consent and rollback, creates or
+ updates the extension per database and runs the SQL health checks.
+ .
+ One helper serves every PostgreSQL major on the host; the
+ postgresql-<major>-adaptive-autovacuum packages depend on it.

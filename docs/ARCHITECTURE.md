@@ -1,7 +1,7 @@
 # Adaptive Autovacuum Architecture Guide
 
 **Target:** PostgreSQL 17 and later (full feature set on 18)
-**Extension version:** 1.0.0 reference implementation (revised 2026-08-14; supersedes the original recommendation-only design)
+**Extension version:** 1.1.0 (1.0.0 reference implementation revised 2026-08-14, superseding the original recommendation-only design; 1.1.0 adds the operator/installer API: `doctor()`, `status()`, `enable_default_policy()`, and the upgrade script `1.0.0--1.1.0`)
 **Safety posture:** a fresh install is active (policy `enabled = true`, `dry_run = false`, cluster-setting management on) behind the cluster switch `adaptive_autovacuum.enabled`; per-table cost boosts are opt-in; emergency execution is on. Installing is opting in, which matches the no-DBA target; the guardrails below carry that choice. Upgrade scripts must preserve the `enabled` / `dry_run` values an installation already has.
 
 ## 1. Purpose

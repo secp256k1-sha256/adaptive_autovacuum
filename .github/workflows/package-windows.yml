@@ -1,0 +1,62 @@
+name: package-windows
+
+# Windows x64 ZIPs for PostgreSQL 17 and 18, built with MSVC against an EDB installation and exercised
+# with install.ps1 (offline manifest) on the same runner.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build-and-test:
+    name: zip windows x64 pg${{ matrix.pgmajor }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pgmajor: [17, 18]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey)
+        shell: pwsh
+        run: |
+          choco install postgresql${{ matrix.pgmajor }} --params '/Password:aavtest /Port:5432' -y --no-progress
+          $root = 'C:\Program Files\PostgreSQL\${{ matrix.pgmajor }}'
+          if (-not (Test-Path "$root\include\server\postgres.h")) { throw 'server headers missing: the EDB package did not install the development files' }
+          Get-Service postgresql* | Format-Table Name, Status -AutoSize
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build DLL
+        shell: cmd
+        run: windows\build_windows.bat "C:\Program Files\PostgreSQL\${{ matrix.pgmajor }}"
+      - name: Build ZIP
+        shell: pwsh
+        run: |
+          $info = .\packaging\windows\build-zip.ps1 -PgMajor ${{ matrix.pgmajor }}
+          $info | Format-List | Out-String | Write-Host
+          "ZIP_SHA=$($info.sha256)" >> $env:GITHUB_ENV
+          "EXT_VERSION=$($info.extension_version)" >> $env:GITHUB_ENV
+      - name: Offline install through install.ps1, doctor, Pester live suite
+        shell: pwsh
+        run: |
+          $pgpass = Join-Path $env:RUNNER_TEMP 'pgpass.conf'
+          [IO.File]::WriteAllText($pgpass, "localhost:5432:*:postgres:aavtest`n", (New-Object Text.UTF8Encoding $false))
+          $zip = Get-ChildItem dist -Filter '*.zip' | Select-Object -First 1
+          $m = [ordered]@{ schema_version = 1; extension_version = $env:EXT_VERSION; package_revision = 1; minimum_installer_version = '1.1.0'; published_at = (Get-Date).ToUniversalTime().ToString('o')
+                           artifacts = @([ordered]@{ artifact_filename = $zip.Name; artifact_url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$env:EXT_VERSION/$($zip.Name)"; sha256 = $env:ZIP_SHA; postgres_major = ${{ matrix.pgmajor }}; operating_system = 'windows'; architecture = 'x64'; package_type = 'zip' }) }
+          $m | ConvertTo-Json -Depth 5 | Set-Content dist\release-manifest.json
+          & 'C:\Program Files\PostgreSQL\${{ matrix.pgmajor }}\bin\psql.exe' -X -h localhost -U postgres -d postgres -c 'CREATE DATABASE aav_installer_test' -w
+          .\packaging\windows\install.ps1 -Check -Manifest dist\release-manifest.json -ArtifactDir dist -PgPassFile $pgpass
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\packaging\windows\install.ps1 -Yes -Manifest dist\release-manifest.json -ArtifactDir dist -PgPassFile $pgpass -Database aav_installer_test -ServiceName postgresql-x64-${{ matrix.pgmajor }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          $env:AAV_TEST_LIVE = '1'; $env:AAV_TEST_PGPASSFILE = $pgpass; $env:AAV_TEST_DATABASE = 'aav_installer_test'; $env:AAV_TEST_SERVICE = 'postgresql-x64-${{ matrix.pgmajor }}'
+          Invoke-Pester -Path test/installer/windows-install.Tests.ps1 -CI
+        env:
+          PGPASSWORD: aavtest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zip-windows-x64-pg${{ matrix.pgmajor }}
+          path: dist/*.zip
+          if-no-files-found: error

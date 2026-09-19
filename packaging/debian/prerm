@@ -1,0 +1,11 @@
+#!/bin/sh
+# Files only: never DROP EXTENSION or touch a running cluster from a package script.
+set -e
+case "$1" in
+    remove)
+        echo "Removing adaptive_autovacuum files. If the library is still in shared_preload_libraries, run"
+        echo "  adaptive-autovacuum-setup remove-preload   before the next PostgreSQL restart."
+        ;;
+esac
+#DEBHELPER#
+exit 0

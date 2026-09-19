@@ -13,6 +13,8 @@
 - The PostgreSQL 18 job has run and passed on GitHub Actions (first run failed and was fixed; see the 2026-08-10 CI entry below).
 - The PostgreSQL 17 leg and the matrix form were added on 2026-08-14 and have NOT yet run on GitHub Actions. The identical command sequence (build, install, two-pass installcheck) has passed locally against PGDG 17.11 on AlmaLinux 9; treat the hosted PG17 run as pending until the first green matrix run is recorded here.
 
+- The installer workflows added on 2026-09-19 (`test.yml` replacing `ci.yml`, `package-rpm.yml`, `package-deb.yml`, `package-windows.yml`, `release.yml`) have NOT yet run on GitHub Actions. The RPM build, the offline `install.sh` path and the Windows ZIP path were exercised locally (below); the DEB build, aarch64/arm64 and the Chocolatey PostgreSQL step in the Windows job are unverified.
+
 ## Validation performed 2026-08-08 (post-review fixes)
 
 Compiled against PGDG PostgreSQL 18.4 on EL9 (AlmaLinux 9 build host; gcc 11.5)
@@ -929,3 +931,75 @@ For each supported PostgreSQL major version:
 3. Test with assertions enabled.
 4. Exercise launcher restart, worker timeout, SIGTERM during VACUUM, stale queue recovery, ownership conflict, cgroup memory limits, and active anti-wraparound autovacuum.
 5. Run sustained workload tests before enabling non-dry-run actions.
+
+## Validation performed 2026-09-19 (1.1.0 operator API and Tier 1 installer)
+
+Extension: version bumped to 1.1.0 with `adaptive_autovacuum--1.1.0.sql` (full) and `adaptive_autovacuum--1.0.0--1.1.0.sql`
+(upgrade: `doctor()`, `status()`, `enable_default_policy()`, `_preload_lists_library()`, `_version_key()`; no table changes).
+New regression test `upgrade`: `CREATE EXTENSION VERSION '1.0.0'`, operator edits and history rows, `ALTER EXTENSION UPDATE`,
+values preserved, 15 doctor rows, `enable_default_policy()` flips and is idempotent, `pg_monitor` can read but not enable.
+Main test gained doctor/status/preload-parser asserts that hold in both passes.
+
+- Regression: green on WSL AlmaLinux 9 PGDG 17.11 and 18.6 (two passes each: on-demand load, preloaded) and on
+  Windows PostgreSQL 18.4 scratch instance (two passes). Two fixes found by the run: `extract(epoch ...)` is numeric
+  (cast to double precision), and `current_setting('adaptive_autovacuum.naptime_seconds')` returns `1min` (read
+  `pg_settings.setting` instead).
+
+Linux helper `packaging/linux/adaptive-autovacuum-setup` + `install.sh`, on WSL AlmaLinux 9.8 (systemd running, PGDG
+`postgresql-18.service` on 5432 and `postgresql-17.service` on 5433, both initialised for this test):
+
+- Discovery merged systemd and process evidence per data directory, read port/socket from `postmaster.pid`, verified facts
+  over the socket as `postgres`, flagged PG17 as unsupported and auto-selected PG18. `--pg-major 17` and `--port 5433` exit 3;
+  bad arguments exit 2; `check --json` is valid JSON.
+- `install --database postgres --yes`: preload `'' -> 'adaptive_autovacuum'` via `ALTER SYSTEM` with a psql variable
+  (a `-c` command does not interpolate `:'v'`; the statement goes through stdin), restart, `CREATE EXTENSION`,
+  `adaptive_autovacuum.enabled = on`, `track_cost_delay_timing = on`, 15/15 doctor rows OK. `--no-restart` leaves state
+  `restart_required`; the rerun recognises the pending file value and resumes at the restart. Rerun after success:
+  no preload change, no restart, exit 0. `disable`/`enable` toggle the GUC. PG17 untouched (empty preload, no extension).
+- Forced failure: a broken `.so` made the restart fail (`file too short`); the helper printed the log excerpt, restored the
+  backed-up `postgresql.auto.conf` after checking its hash, restarted, exited 8, journal `rolled_back`.
+- PostgreSQL behaviour found and handled: `ALTER SYSTEM SET shared_preload_libraries = ''` writes `'""'` and the server
+  then fails with `could not access file ""`; an empty list is now `ALTER SYSTEM RESET` (with a check that the main
+  configuration file does not still list the library).
+- RPM `postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm` built with `rpmbuild` from the working tree, installed with
+  `dnf install ./...` through `install.sh --manifest ... --artifact-dir ...` (offline path); checksum mismatch and a
+  path-traversal filename in the manifest are rejected with exit 6 before anything is installed; `rpm -V` clean.
+- bats: 12 unit tests (`linux-discovery.bats`, one skipped as root) and 6 live tests (`linux-install.bats`) green.
+
+Windows `AdaptiveAutovacuum.Setup.psm1` / `adaptive-autovacuum-setup.ps1` / `install.ps1`, on the workstation's live EDB
+PostgreSQL 18.4 service `postgresql-x64-18` (PowerShell 7.5.2 and Windows PowerShell 5.1):
+
+- Discovery found four EDB installations (14, 15, 17, 18) from services and registry, merged them per data directory,
+  parsed the quoted service path with spaces, and selected the only running supported one (18).
+- `install.ps1 -Manifest -ArtifactDir` (offline ZIP with `artifact-manifest.json`): ZIP checksum and per-file checksums
+  verified, the in-use DLL replaced by rename-aside and cleaned after the restart, service restarted, `CREATE EXTENSION`
+  in `aav_installer_test`, controller enabled, 15/15 doctor rows OK (first run: `last_cycle` WARN until the first cycle).
+  Checksum mismatch and a hostile manifest exit 6. Rerun: `Restart: not needed`, exit 0. `check` and `doctor -Format json`
+  work under Windows PowerShell 5.1 from the installed copy in `C:\Program Files\adaptive_autovacuum\1.1.0`.
+- A database still on pre-1.1.0 objects (development snapshot) now yields one `doctor_api` WARN row instead of aborting.
+- Pester 6: 16 unit tests (`windows-discovery.Tests.ps1`) green. The live Pester suite mirrors the manual run above.
+- The controller was disabled again afterwards (`disable`), leaving the workstation with 1.1.0 files installed and
+  `adaptive_autovacuum.enabled = off` as before.
+
+Not exercised locally: DEB build and Ubuntu (`pg_lsclusters`) discovery path, aarch64/arm64, the GitHub workflows.
+
+### Addendum 2026-09-19: PostgreSQL 17 and 18 packages, shared helper package
+
+- Supported majors widened to 17 and 18 in both helpers and both bootstraps. With several supported majors installed the
+  bootstrap takes the one with a running cluster; with two running it exits 4 and requires `--pg-major` / `-PgMajor`,
+  which is then forwarded to the helper so the package and the configured cluster always match.
+- RPM spec parametrised by `pgmajor`; the helper moved into its own noarch package `adaptive-autovacuum-setup` because
+  two versioned packages owning `/usr/bin/adaptive-autovacuum-setup` conflict (`dnf` transaction test error reproduced
+  on WSL). Debian templates (`control.in`, `changelog.in`, `generate.sh`) produce the same split (`Architecture: all`).
+  `debug_package` disabled. The release manifest gained `component: setup-helper` artifacts (`postgres_major: 0`) and
+  `install.sh` installs helper + extension in one transaction after verifying both checksums.
+- WSL AlmaLinux 9, PG17 (5433) and PG18 (5432) both running: `postgresql17-` and `postgresql18-adaptive-autovacuum`
+  built from the same spec, `install.sh --pg-major 17` configured the PG17 cluster (preload, restart, CREATE EXTENSION,
+  15/15 doctor OK), then `--pg-major 18` installed the second package next to it with the shared helper; both clusters
+  healthy afterwards. Stopping PG17 made the bootstrap pick 18 automatically.
+- Windows: PG17 and PG18 ZIPs built (MSVC, `build-zip.ps1 -PgMajor`); with 14/15/17/18 installed and only 18 running,
+  `install.ps1 -Check` selected 18 and the pg18 ZIP; `-PgMajor 17` selected the (stopped) 17 installation for `check`;
+  `-PgMajor 16` exits 5. Found and fixed: a loop variable clobbered the parsed manifest, and unexpected errors now exit 8
+  (`trap`) instead of leaving the previous exit code. Pester unit suite green (16) after the support-list change.
+- Not exercised locally: DEB build of the two-package source, aarch64/arm64, a live PG17 install on Windows (the 17
+  service shares port 5432 with 18 on this workstation), the GitHub workflows.

@@ -1,0 +1,101 @@
+name: package-deb
+
+# Ubuntu DEBs for PostgreSQL 17 and 18 (24.04 and 26.04, amd64 and arm64), each installed and exercised
+# in a clean container of the same release. The PGDG apt repository provides postgresql-17 and -18.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    name: deb ${{ matrix.dist }} ${{ matrix.arch }} pg${{ matrix.pgmajor }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pgmajor: [17, 18]
+        include:
+          - { dist: ubuntu24.04, image: "ubuntu:24.04", codename: noble,    arch: amd64, runner: ubuntu-latest }
+          - { dist: ubuntu24.04, image: "ubuntu:24.04", codename: noble,    arch: arm64, runner: ubuntu-24.04-arm }
+          - { dist: ubuntu26.04, image: "ubuntu:26.04", codename: resolute, arch: amd64, runner: ubuntu-latest }
+          - { dist: ubuntu26.04, image: "ubuntu:26.04", codename: resolute, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - name: PGDG repository and build dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+          install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${{ matrix.codename }}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential debhelper devscripts postgresql-server-dev-${{ matrix.pgmajor }} jq git
+      - name: dpkg-buildpackage
+        run: |
+          set -euo pipefail
+          VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
+          bash packaging/debian/generate.sh ${{ matrix.pgmajor }}
+          CHVER=$(dpkg-parsechangelog -l debian/changelog -S Version)
+          test "$CHVER" = "$VER-1" || { echo "control default_version $VER-1 != changelog $CHVER"; exit 1; }
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist
+          mv ../postgresql-${{ matrix.pgmajor }}-adaptive-autovacuum_${CHVER}_${{ matrix.arch }}.deb dist/postgresql-${{ matrix.pgmajor }}-adaptive-autovacuum_${CHVER}_${{ matrix.dist }}_${{ matrix.arch }}.deb
+          mv ../adaptive-autovacuum-setup_${CHVER}_all.deb dist/
+          dpkg-deb -c dist/*.deb; dpkg-deb -I dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}-pg${{ matrix.pgmajor }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  install-test:
+    name: install deb ${{ matrix.dist }} ${{ matrix.arch }} pg${{ matrix.pgmajor }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        pgmajor: [17, 18]
+        include:
+          - { dist: ubuntu24.04, image: "ubuntu:24.04", codename: noble,    arch: amd64, runner: ubuntu-latest }
+          - { dist: ubuntu24.04, image: "ubuntu:24.04", codename: noble,    arch: arm64, runner: ubuntu-24.04-arm }
+          - { dist: ubuntu26.04, image: "ubuntu:26.04", codename: resolute, arch: amd64, runner: ubuntu-latest }
+          - { dist: ubuntu26.04, image: "ubuntu:26.04", codename: resolute, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}-pg${{ matrix.pgmajor }}
+          path: dist
+      - name: Clean PostgreSQL ${{ matrix.pgmajor }} server (no compiler, no headers); cluster via pg_ctlcluster
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+          install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${{ matrix.codename }}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y --no-install-recommends postgresql-${{ matrix.pgmajor }} jq bats procps util-linux
+          pg_ctlcluster ${{ matrix.pgmajor }} main start
+          pg_lsclusters
+      - name: Offline bootstrap install through install.sh (pg_lsclusters discovery path)
+        run: |
+          set -euo pipefail
+          VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
+          bash packaging/common/make-release-manifest.sh dist "$VER"
+          bash packaging/linux/install.sh --check --manifest dist/release-manifest.json --artifact-dir dist
+          bash packaging/linux/install.sh --yes --manifest dist/release-manifest.json --artifact-dir dist --database postgres
+          adaptive-autovacuum-setup doctor --format json | jq -e '.databases[0].checks | map(select(.status == "FAIL")) | length == 0'
+      - name: Idempotency, disable, remove-preload (bats live suite)
+        run: AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
+      - name: Package removal keeps database objects
+        run: |
+          set -euo pipefail
+          adaptive-autovacuum-setup remove-preload --yes
+          apt-get remove -y postgresql-${{ matrix.pgmajor }}-adaptive-autovacuum
+          test ! -e /usr/lib/postgresql/${{ matrix.pgmajor }}/lib/adaptive_autovacuum.so
+          su postgres -c "psql -X -A -t -c \"SELECT count(*) FROM pg_extension WHERE extname = 'adaptive_autovacuum'\"" | grep -qx 1

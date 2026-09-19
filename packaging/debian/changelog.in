@@ -1,0 +1,6 @@
+postgresql-@PGMAJOR@-adaptive-autovacuum (1.1.0-1) unstable; urgency=medium
+
+  * Operator API: doctor(), status(), enable_default_policy(); upgrade script 1.0.0 -> 1.1.0.
+  * adaptive-autovacuum-setup helper and Tier 1 installer.
+
+ -- adaptive_autovacuum maintainers <noreply@github.com>  Sat, 19 Sep 2026 12:00:00 +0000

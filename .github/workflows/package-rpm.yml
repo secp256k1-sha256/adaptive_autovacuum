@@ -1,0 +1,93 @@
+name: package-rpm
+
+# EL9 RPMs for PostgreSQL 17 and 18 (x86_64 and aarch64), each installed and exercised in a clean container.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    name: rpm el9 ${{ matrix.arch }} pg${{ matrix.pgmajor }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pgmajor: [17, 18]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: almalinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: PGDG repository and build dependencies
+        run: |
+          dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-${{ matrix.arch }}/pgdg-redhat-repo-latest.noarch.rpm
+          dnf -qy module disable postgresql
+          dnf -y install postgresql${{ matrix.pgmajor }}-devel rpm-build rpmdevtools gcc make jq git rpmlint
+      - name: Source tarball and rpmbuild
+        run: |
+          set -euo pipefail
+          VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
+          SPECVER=$(sed -n 's/^Version:\s*//p' packaging/rpm/postgresql-adaptive-autovacuum.spec)
+          test "$VER" = "$SPECVER" || { echo "control default_version $VER != spec Version $SPECVER"; exit 1; }
+          mkdir -p ~/rpmbuild/{SOURCES,SPECS,RPMS,SRPMS,BUILD}
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git archive --format=tar.gz --prefix="adaptive_autovacuum-$VER/" -o ~/rpmbuild/SOURCES/adaptive_autovacuum-$VER.tar.gz HEAD
+          cp packaging/rpm/postgresql-adaptive-autovacuum.spec ~/rpmbuild/SPECS/
+          rpmbuild --define "pgmajor ${{ matrix.pgmajor }}" -ba ~/rpmbuild/SPECS/postgresql-adaptive-autovacuum.spec
+          rpmlint ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm || true
+          mkdir -p dist && cp ~/rpmbuild/RPMS/${{ matrix.arch }}/postgresql${{ matrix.pgmajor }}-adaptive-autovacuum-*.rpm ~/rpmbuild/RPMS/noarch/adaptive-autovacuum-setup-*.noarch.rpm dist/
+          rpm -qlp dist/*.rpm; rpm -qpR dist/*.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-el9-${{ matrix.arch }}-pg${{ matrix.pgmajor }}
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  install-test:
+    name: install rpm el9 ${{ matrix.arch }} pg${{ matrix.pgmajor }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        pgmajor: [17, 18]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: almalinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-el9-${{ matrix.arch }}-pg${{ matrix.pgmajor }}
+          path: dist
+      - name: Clean PostgreSQL ${{ matrix.pgmajor }} server (no compiler, no headers)
+        run: |
+          dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-${{ matrix.arch }}/pgdg-redhat-repo-latest.noarch.rpm
+          dnf -qy module disable postgresql
+          dnf -y install postgresql${{ matrix.pgmajor }}-server jq bats procps-ng util-linux
+          /usr/pgsql-${{ matrix.pgmajor }}/bin/postgresql-${{ matrix.pgmajor }}-setup initdb
+          su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/pg_ctl -D /var/lib/pgsql/${{ matrix.pgmajor }}/data -w start"
+      - name: Offline bootstrap install through install.sh
+        run: |
+          set -euo pipefail
+          VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
+          bash packaging/common/make-release-manifest.sh dist "$VER"
+          bash packaging/linux/install.sh --check --manifest dist/release-manifest.json --artifact-dir dist
+          bash packaging/linux/install.sh --yes --manifest dist/release-manifest.json --artifact-dir dist --database postgres
+          adaptive-autovacuum-setup doctor --format json | jq -e '.databases[0].checks | map(select(.status == "FAIL")) | length == 0'
+          rpm -V postgresql${{ matrix.pgmajor }}-adaptive-autovacuum
+      - name: Idempotency, disable, remove-preload (bats live suite)
+        run: AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
+      - name: Package removal keeps database objects
+        run: |
+          set -euo pipefail
+          adaptive-autovacuum-setup remove-preload --yes
+          dnf -y remove postgresql${{ matrix.pgmajor }}-adaptive-autovacuum
+          test ! -e /usr/pgsql-${{ matrix.pgmajor }}/lib/adaptive_autovacuum.so
+          su postgres -c "/usr/pgsql-${{ matrix.pgmajor }}/bin/psql -X -A -t -c \"SELECT count(*) FROM pg_extension WHERE extname = 'adaptive_autovacuum'\"" | grep -qx 1

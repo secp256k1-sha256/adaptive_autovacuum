@@ -1,0 +1,79 @@
+name: release
+
+# Tag v<version> -> build every package, test each in a clean environment, then publish ONE GitHub
+# release with all assets, release-manifest.json, SHA256SUMS, install.sh and install.ps1.
+# Nothing is published unless the whole matrix passed; published artifacts are never replaced.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          TAG=${GITHUB_REF_NAME#v}
+          VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
+          SPEC=$(sed -n 's/^Version:\s*//p' packaging/rpm/postgresql-adaptive-autovacuum.spec)
+          CH=$(sed -n '1s/.*(\([^)]*\)).*/\1/p' packaging/debian/changelog.in)
+          HELPER=$(sed -n 's/^readonly SETUP_VERSION="\(.*\)"/\1/p' packaging/linux/adaptive-autovacuum-setup)
+          echo "tag=$TAG control=$VER spec=$SPEC changelog=$CH helper=$HELPER"
+          test "$TAG" = "$VER" && test "$SPEC" = "$VER" && test "$CH" = "$VER-1" && test "$HELPER" = "$VER"
+          test -f "sql/adaptive_autovacuum--$VER.sql"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: verify-version
+    uses: ./.github/workflows/test.yml
+  rpm:
+    needs: verify-version
+    uses: ./.github/workflows/package-rpm.yml
+  deb:
+    needs: verify-version
+    uses: ./.github/workflows/package-deb.yml
+  windows:
+    needs: verify-version
+    uses: ./.github/workflows/package-windows.yml
+
+  publish:
+    needs: [verify-version, test, rpm, deb, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble release directory, manifest and checksums
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y jq python3-jsonschema
+          mkdir -p dist
+          find artifacts -type f \( -name '*.rpm' -o -name '*.deb' -o -name '*.zip' \) -exec cp {} dist/ \;
+          cp packaging/linux/install.sh packaging/windows/install.ps1 dist/
+          bash packaging/common/make-release-manifest.sh dist "${{ needs.verify-version.outputs.version }}" "$GITHUB_REPOSITORY"
+          python3 -c "import json,jsonschema,sys; jsonschema.validate(json.load(open('dist/release-manifest.json')), json.load(open('packaging/common/release-manifest.schema.json'))); print('manifest valid')"
+          # Every artifact the manifest points to must exist in this release.
+          for f in $(jq -r '.artifacts[].artifact_filename' dist/release-manifest.json); do test -f "dist/$f"; done
+          ls -la dist; cat dist/SHA256SUMS
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            Install (PostgreSQL 17 or 18):
+
+            Linux: download `install.sh`, read it, then `sudo bash install.sh --database <name>`
+            Windows: download `install.ps1`, read it, then run it from an elevated PowerShell with `-Database <name>`
+
+            Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.

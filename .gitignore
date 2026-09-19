@@ -14,3 +14,4 @@ regression.diffs
 regression.out
 log/
 tmp_check/
+dist/

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/secp256k1-sha256/adaptive_autovacuum/packaging/common/release-manifest.schema.json",
+  "title": "adaptive_autovacuum release manifest",
+  "description": "Machine-readable list of the immutable artifacts of one release. The installers select exactly one artifact by PostgreSQL major, operating system, distribution and architecture and verify its SHA-256 before installing.",
+  "type": "object",
+  "required": ["schema_version", "extension_version", "package_revision", "minimum_installer_version", "published_at", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "extension_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([.-][A-Za-z0-9.-]+)?$" },
+    "package_revision": { "type": "integer", "minimum": 1 },
+    "minimum_installer_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "published_at": { "type": "string", "format": "date-time" },
+    "release_tag": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+([.-][A-Za-z0-9.-]+)?$" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["artifact_filename", "artifact_url", "sha256", "postgres_major", "operating_system", "architecture", "package_type"],
+        "additionalProperties": false,
+        "properties": {
+          "artifact_filename": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$" },
+          "artifact_url": { "type": "string", "pattern": "^https://[A-Za-z0-9._-]+/[A-Za-z0-9._/+%-]+$" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size_bytes": { "type": "integer", "minimum": 1 },
+          "postgres_major": { "type": "integer", "minimum": 0, "description": "PostgreSQL major the artifact is built for; 0 = independent of the major (setup helper)" },
+          "operating_system": { "type": "string", "enum": ["linux", "windows"] },
+          "distribution": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$", "description": "e.g. ubuntu24.04, ubuntu26.04, el9; absent for Windows" },
+          "architecture": { "type": "string", "enum": ["amd64", "arm64", "x86_64", "aarch64", "x64", "noarch", "all"] },
+          "package_type": { "type": "string", "enum": ["deb", "rpm", "zip"] },
+          "component": { "type": "string", "enum": ["extension", "setup-helper"], "default": "extension", "description": "setup-helper artifacts carry the shared adaptive-autovacuum-setup program and are installed together with the extension package" }
+        }
+      }
+    }
+  }
+}

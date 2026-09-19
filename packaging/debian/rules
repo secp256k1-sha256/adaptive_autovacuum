@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+# Build against one PostgreSQL major; the extension package name carries the major.
+# generate.sh prepends "PG_MAJOR := N" for a materialised package.
+PG_MAJOR ?= 18
+PG_CONFIG := /usr/lib/postgresql/$(PG_MAJOR)/bin/pg_config
+EXT_PKG := $(CURDIR)/debian/postgresql-$(PG_MAJOR)-adaptive-autovacuum
+HELPER_PKG := $(CURDIR)/debian/adaptive-autovacuum-setup
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) PG_CONFIG=$(PG_CONFIG)
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(EXT_PKG) PG_CONFIG=$(PG_CONFIG)
+	install -D -m 755 packaging/linux/adaptive-autovacuum-setup $(HELPER_PKG)/usr/bin/adaptive-autovacuum-setup
+	install -D -m 644 packaging/common/health-check.sql $(HELPER_PKG)/usr/share/adaptive-autovacuum/health-check.sql
+	install -D -m 644 packaging/common/enable-preload.sql $(HELPER_PKG)/usr/share/adaptive-autovacuum/enable-preload.sql
+	install -D -m 644 packaging/common/disable-preload.sql $(HELPER_PKG)/usr/share/adaptive-autovacuum/disable-preload.sql
+	install -d -m 700 $(HELPER_PKG)/var/lib/adaptive-autovacuum
+
+override_dh_auto_test:
+	# Regression tests need a running server; they run in CI against the installed package.
+
+override_dh_auto_clean:
+	$(MAKE) clean PG_CONFIG=$(PG_CONFIG) || true

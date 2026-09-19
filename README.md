@@ -9,6 +9,50 @@
 
 > **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4, 18.6, 17.6, and 17.11), including regression suites, a hot-standby drill, live emergency-vacuum drills, and ~20,000 TPS pgbench runs, but has not yet completed sustained production-scale testing.
 
+## Quick install (PostgreSQL 17 and 18)
+
+No compiler, headers or manual file copying. Download the installer, read it, run it.
+
+**Linux** (Ubuntu 24.04 / 26.04, RHEL / Rocky / Alma 9):
+
+```bash
+curl -fsSLO https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.sh
+less install.sh
+sudo bash install.sh --database mydb
+```
+
+**Windows** (EDB-style PostgreSQL 17 or 18 x64, elevated PowerShell):
+
+```powershell
+Invoke-WebRequest https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1 -Database mydb -Credential (Get-Credential postgres)
+```
+
+The installer discovers your PostgreSQL clusters (and makes you choose when that is ambiguous, for example when both a 17 and an 18 cluster run), verifies the
+package checksum against the release manifest, installs the files, appends `adaptive_autovacuum` to
+`shared_preload_libraries` without touching the other entries, asks before restarting the one selected service,
+creates or updates the extension in the databases you named, turns the controller on, and ends with a health report:
+
+```
+[OK]   artifact checksum verified
+[OK]   extension files installed
+[OK]   existing preload libraries preserved
+[OK]   adaptive_autovacuum added to shared_preload_libraries
+[OK]   PostgreSQL restarted and accepting connections
+[OK]   extension created in mydb (1.1.0)
+[OK]   controller enabled (adaptive_autovacuum.enabled = on)
+Health of database mydb:
+  [OK]   library_preloaded ... [OK]   launcher_running ... [OK]   policy: active ...
+Installation complete.
+```
+
+Diagnose any time with `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`) or, in SQL,
+`SELECT * FROM adaptive_autovacuum.doctor();`. Details, offline installation, package-manager-only installation,
+uninstall and exit codes: [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md), [docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md),
+[docs/INSTALLER-SECURITY.md](docs/INSTALLER-SECURITY.md), [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+
 
 <div align="center">
 
@@ -161,6 +205,7 @@ It should behave like:
 - [What it never does](#what-it-never-does)
 - [See what it is doing](#see-what-it-is-doing)
 - [How it decides](#how-it-decides)
+- [Quick install (PostgreSQL 17 and 18)](#quick-install-postgresql-17-and-18)
 - [Install](#install)
 - [Turning it on safely](#turning-it-on-safely)
 - [Tuning the controller](#tuning-the-controller)
@@ -296,9 +341,34 @@ Built-in caution, so it never thrashes: a table must stay behind for two consecu
 
 ## Install
 
-Works on Linux/Unix and Windows. The extension behaves identically on both; only the build and service commands differ.
+Three ways, from easiest to most manual. All of them end with the same two facts: the library is in
+`shared_preload_libraries` (one restart), and `CREATE EXTENSION adaptive_autovacuum` has run in every database
+you want managed. Databases without the extension are skipped.
 
-### Linux / Unix
+### 1. Installer (PostgreSQL 17 and 18)
+
+See [Quick install](#quick-install-postgresql-17-and-18) above. `install.sh` / `install.ps1` are small bootstraps around
+the packages below and `adaptive-autovacuum-setup`, the helper that owns discovery, configuration, restart,
+activation, health checks and rollback. Every step is idempotent; rerunning after success or an interruption is safe.
+
+### 2. Package manager (PostgreSQL 17 and 18)
+
+Release assets per PostgreSQL major (17 and 18): `postgresql-<major>-adaptive-autovacuum_<ver>_ubuntu24.04_amd64.deb` (also `ubuntu26.04`, `arm64`),
+`postgresql<major>-adaptive-autovacuum-<ver>.el9.x86_64.rpm` (also `aarch64`), `adaptive_autovacuum-<ver>-pg<major>-windows-x64.zip`,
+plus one shared helper package per format (`adaptive-autovacuum-setup_<ver>_all.deb`, `adaptive-autovacuum-setup-<ver>.el9.noarch.rpm`)
+that the extension packages depend on. Verify against `SHA256SUMS`, then:
+
+```bash
+sudo dnf install ./adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm   # or the two .deb files
+sudo adaptive-autovacuum-setup install --database mydb
+```
+
+The packages install files only (library, control, SQL scripts, helper). They never restart PostgreSQL, change its
+configuration, run `CREATE EXTENSION`, or drop extension objects when removed.
+
+### 3. Build from source (PostgreSQL 17 or 18)
+
+### Linux / Unix, from source
 
 Build against your server's major version, 17 or 18 (needs the server dev package: `postgresql18-devel` / `postgresql17-devel` or `postgresql-server-dev-18` / `-17`):
 
@@ -315,7 +385,7 @@ adaptive_autovacuum.enabled = off        # you will turn this on in step 1 below
 track_cost_delay_timing = on             # lets it see vacuums that are mostly sleeping
 ```
 
-### Windows (existing installation, e.g. the EDB installer)
+### Windows, from source (existing installation, e.g. the EDB installer)
 
 You need the DLL once; build it on any machine with the same PostgreSQL major version:
 
@@ -334,7 +404,7 @@ All build outputs land in the `windows\` folder.
 ```bat
 copy windows\adaptive_autovacuum.dll    "C:\Program Files\PostgreSQL\18\lib\"
 copy adaptive_autovacuum.control        "C:\Program Files\PostgreSQL\18\share\extension\"
-copy sql\adaptive_autovacuum--1.0.0.sql "C:\Program Files\PostgreSQL\18\share\extension\"
+copy sql\adaptive_autovacuum--*.sql   "C:\Program Files\PostgreSQL\18\share\extension\"
 ```
 
 5. Register the library and restart the PostgreSQL service **once**:
@@ -359,15 +429,26 @@ UPDATE adaptive_autovacuum.policy SET high_load_per_cpu = 0.85;
 
 Everything else (cluster-setting fixes, per-table help, restore, the audit tables, emergency protection) works the same as on Linux.
 
-### Both platforms
+### After a source build: preload, restart, activate
 
-Then in every database you want managed:
+The helper works with a source build too (copy `packaging/linux/adaptive-autovacuum-setup` to `/usr/local/bin`, or use
+`packaging/windows/adaptive-autovacuum-setup.ps1`); `install --database mydb` then does the preload append, the restart
+prompt, `CREATE EXTENSION` and the health check for you. By hand instead:
+
+```sql
+-- keep any libraries already listed: 'pg_stat_statements,adaptive_autovacuum'
+ALTER SYSTEM SET shared_preload_libraries = 'adaptive_autovacuum';
+ALTER SYSTEM SET track_cost_delay_timing = on;       -- PostgreSQL 18
+```
+
+restart PostgreSQL once, then in every database you want managed:
 
 ```sql
 CREATE EXTENSION adaptive_autovacuum;
+ALTER SYSTEM SET adaptive_autovacuum.enabled = on;   -- the cluster switch; see "Turning it on safely"
+SELECT pg_reload_conf();
+SELECT * FROM adaptive_autovacuum.doctor();          -- every row OK?
 ```
-
-Databases without the extension are simply skipped.
 
 ## Turning it on safely
 
@@ -505,9 +586,25 @@ You don't have to wait for the emergency to know something is wrong: `SELECT * F
 
 ## Upgrading and removing
 
-**Upgrade / redeploy:** turn the launcher off (`adaptive_autovacuum.enabled = off`, reload) → let it restore managed tables (or accept the current values) → `DROP EXTENSION adaptive_autovacuum` in each database (this deletes its saved originals, hence restore *first*) → replace the files, restart if the `.so` changed → `CREATE EXTENSION` again and re-apply your policy.
+**Upgrade (1.0.0 and later):** install the new files (installer, package, or `make install`), restart PostgreSQL if
+the library changed, then in every database `ALTER EXTENSION adaptive_autovacuum UPDATE;`. The upgrade scripts
+(`adaptive_autovacuum--OLD--NEW.sql`) preserve your policy, per-table settings and history; operator values are
+never changed by an upgrade. `adaptive-autovacuum-setup install --database ...` does exactly this and refuses to
+downgrade. Development snapshots built before 1.0.0 was frozen have no upgrade path: turn the launcher off, let it
+restore managed tables (or accept the current values), `DROP EXTENSION` and `CREATE EXTENSION` again.
 
-**Remove:** same as above, then take `adaptive_autovacuum` out of `shared_preload_libraries` and restart. To undo applied cluster changes, every old value is in `global_apply_queue.old_value`.
+**Disable without removing:** `adaptive-autovacuum-setup disable` (sets `adaptive_autovacuum.enabled = off` and
+reloads; files, preload and extension objects stay).
+
+**Remove:** `adaptive-autovacuum-setup remove-preload` takes only `adaptive_autovacuum` out of
+`shared_preload_libraries` (other libraries and their order preserved) and restarts on request; then remove the
+package. Extension objects are never dropped automatically: run `DROP EXTENSION adaptive_autovacuum;` per database
+yourself if you want the policy and history gone. Cluster settings the controller applied keep their previous
+values in `global_apply_queue.old_value`.
+
+**Health at any time:** `SELECT * FROM adaptive_autovacuum.doctor();` (OK / WARN / FAIL / RESTART_REQUIRED with a
+remediation per row), `SELECT * FROM adaptive_autovacuum.status();` (one machine-readable row), or the helper's
+`doctor --format json`. Both SQL functions are readable by `pg_monitor`.
 
 ## Testing
 

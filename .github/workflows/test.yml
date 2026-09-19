@@ -1,0 +1,105 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  extension:
+    name: extension (PostgreSQL ${{ matrix.pgversion }})
+    strategy:
+      fail-fast: false
+      matrix:
+        pgversion: [17, 18]
+    runs-on: ubuntu-latest
+    container: postgres:${{ matrix.pgversion }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools, server headers and installer dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential postgresql-server-dev-${{ matrix.pgversion }} jq bats procps
+      - name: Build and install
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config
+          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config
+      - name: Regression tests (on-demand load, then preloaded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
+          chown -R postgres:postgres "$GITHUB_WORKSPACE"
+          rm -rf /tmp/aav-pgdata
+          su postgres -c "initdb -D /tmp/aav-pgdata --no-locale --encoding=UTF8"
+          echo "port = 55432" >> /tmp/aav-pgdata/postgresql.auto.conf
+          trap 'su postgres -c "pg_ctl -D /tmp/aav-pgdata -m immediate stop" || true' EXIT
+
+          # Pass 1: library loaded on demand by CREATE EXTENSION (no shared_preload_libraries).
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start"
+          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
+
+          # Pass 2: the real deployment shape - library preloaded, launcher registered, controller off.
+          echo "shared_preload_libraries = 'adaptive_autovacuum'" >> /tmp/aav-pgdata/postgresql.auto.conf
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w restart"
+          su postgres -c "cd '$GITHUB_WORKSPACE' && PGPORT=55432 make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pgversion }}/bin/pg_config"
+      - name: Installer helper against the scratch cluster (pg_ctl path)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start" || true
+          install -m 755 packaging/linux/adaptive-autovacuum-setup /usr/local/bin/adaptive-autovacuum-setup
+          adaptive-autovacuum-setup check --json | jq '.selectable | length'
+          AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata -m fast stop"
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-diffs-pg${{ matrix.pgversion }}
+          path: |
+            regression.diffs
+            regression.out
+            results/
+          if-no-files-found: ignore
+
+  installer-lint:
+    name: installer scripts (shellcheck + bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck bats jq
+      - name: shellcheck
+        run: shellcheck -S warning packaging/linux/adaptive-autovacuum-setup packaging/linux/install.sh packaging/common/make-release-manifest.sh
+      - name: bats unit tests
+        run: bats test/installer/linux-discovery.bats
+      - name: install.sh refuses an unsupported host cleanly
+        run: |
+          set +e
+          sudo AAV_SUPPORTED_MAJORS=99 bash packaging/linux/install.sh --check --manifest packaging/common/release-manifest.schema.json; rc=$?
+          set -e
+          echo "rc=$rc"; test "$rc" -eq 3 -o "$rc" -eq 6
+
+  windows-unit:
+    name: Windows module (Pester + PSScriptAnalyzer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester 5 and PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path packaging/windows -Recurse -Severity Error
+          $r | Format-Table -AutoSize | Out-String | Write-Host
+          if ($r) { exit 1 }
+      - name: Pester unit tests (PowerShell 7)
+        shell: pwsh
+        run: Invoke-Pester -Path test/installer/windows-discovery.Tests.ps1 -CI
+      - name: Pester unit tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: Invoke-Pester -Path test/installer/windows-discovery.Tests.ps1 -CI
