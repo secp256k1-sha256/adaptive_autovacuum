@@ -40,7 +40,12 @@ jobs:
           & "$root\bin\psql.exe" -X -h localhost -p 5432 -U postgres -d postgres -w -c "ALTER USER postgres PASSWORD 'aavtest'"
           if ($LASTEXITCODE -ne 0) { throw 'could not set the postgres password' }
           $orig | Set-Content $hba -NoNewline
+          # Works whether the trust lines are still in effect or password auth already applies.
+          $env:PGPASSWORD = 'aavtest'
           & "$root\bin\psql.exe" -X -h localhost -p 5432 -U postgres -d postgres -w -c 'SELECT pg_reload_conf()'
+          if ($LASTEXITCODE -ne 0) { throw 'reload after restoring pg_hba.conf failed' }
+          & "$root\bin\psql.exe" -X -h localhost -p 5432 -U postgres -d postgres -w -c 'SELECT 1'
+          if ($LASTEXITCODE -ne 0) { throw 'password authentication with the CI password failed' }
           Get-Service postgresql* | Format-Table Name, Status, StartType -AutoSize
       - uses: ilammy/msvc-dev-cmd@v1
         with:

@@ -43,7 +43,7 @@ jobs:
           mkdir -p dist
           mv ../postgresql-${{ matrix.pgmajor }}-adaptive-autovacuum_${CHVER}_${{ matrix.arch }}.deb dist/postgresql-${{ matrix.pgmajor }}-adaptive-autovacuum_${CHVER}_${{ matrix.dist }}_${{ matrix.arch }}.deb
           mv ../adaptive-autovacuum-setup_${CHVER}_all.deb dist/
-          dpkg-deb -c dist/*.deb; dpkg-deb -I dist/*.deb
+          for f in dist/*.deb; do echo "== $f"; dpkg-deb -I "$f"; dpkg-deb -c "$f"; done
       - uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.dist }}-${{ matrix.arch }}-pg${{ matrix.pgmajor }}

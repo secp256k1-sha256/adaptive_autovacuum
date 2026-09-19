@@ -36,8 +36,9 @@ jobs:
           SPECVER=$(sed -n 's/^Version:\s*//p' packaging/rpm/postgresql-adaptive-autovacuum.spec)
           test "$VER" = "$SPECVER" || { echo "control default_version $VER != spec Version $SPECVER"; exit 1; }
           mkdir -p ~/rpmbuild/{SOURCES,SPECS,RPMS,SRPMS,BUILD}
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git archive --format=tar.gz --prefix="adaptive_autovacuum-$VER/" -o ~/rpmbuild/SOURCES/adaptive_autovacuum-$VER.tar.gz HEAD
+          # checkout ran before git was installed in this container, so there is no .git: tar the tree instead.
+          tar --exclude=./.git --exclude=./dist --exclude=./windows -czf ~/rpmbuild/SOURCES/adaptive_autovacuum-$VER.tar.gz \
+              --transform "s,^\./,adaptive_autovacuum-$VER/," .
           cp packaging/rpm/postgresql-adaptive-autovacuum.spec ~/rpmbuild/SPECS/
           rpmbuild --define "pgmajor ${{ matrix.pgmajor }}" -ba ~/rpmbuild/SPECS/postgresql-adaptive-autovacuum.spec
           rpmlint ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm || true
