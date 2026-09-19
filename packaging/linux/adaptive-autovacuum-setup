@@ -338,22 +338,40 @@ discover_processes() {
         # Zombies (unreaped postmasters in containers) keep the name but have no exe, cmdline or environment.
         state=$(awk '/^State:/{print $2}' "$pd/status" 2>/dev/null || true)
         [[ $state == Z* ]] && continue
-        exe=$(readlink "$pd/exe" 2>/dev/null || true)
-        exe=${exe% (deleted)}
-        [[ -n $exe && -x $exe ]] || continue
         # Only postmasters carry -D (or PGDATA); children are re-titled copies without it.
         datadir=$(datadir_from_cmdline "$pid" || true)
         [[ -n $datadir ]] || continue
         # Skip a child whose parent is a postmaster of the same data directory.
         ppid=$(awk '/^PPid:/{print $2}' "$pd/status" 2>/dev/null || echo 1)
         if [[ -r /proc/$ppid/cmdline && $(datadir_from_cmdline "$ppid" || true) == "$datadir" ]]; then continue; fi
+        # Executable: /proc/<pid>/exe needs ptrace access to another user's process, which container
+        # root often lacks. Fall back to argv[0]; an unknown binary is attached later by major.
+        exe=$(readlink "$pd/exe" 2>/dev/null || true)
+        exe=${exe% (deleted)}
+        if [[ -z $exe ]]; then
+            exe=$(argv0_from_cmdline "$pid" || true)
+            if [[ $exe == /* && -x $exe ]]; then verbose "process: pid $pid: /proc/$pid/exe unreadable (no ptrace access); using argv[0] $exe"
+            else verbose "process: pid $pid: /proc/$pid/exe unreadable and argv[0] '${exe:-?}' is not an absolute executable; binaries resolved by major"; exe=""; fi
+        fi
+        # Validate against the data directory when we may read it: a live postmaster.pid must name this pid.
+        if [[ -r $datadir/postmaster.pid ]]; then
+            local pidfile_pid; pidfile_pid=$(sed -n 1p "$datadir/postmaster.pid" 2>/dev/null || true)
+            if [[ -n $pidfile_pid && $pidfile_pid != "$pid" ]]; then verbose "process: pid $pid: $datadir/postmaster.pid names pid $pidfile_pid; skipped"; continue; fi
+        fi
         owner=$(stat -c %U "$pd" 2>/dev/null || true)
-        bindir=$(dirname "$(canon "$exe")")
-        verbose "process: pid $pid ($owner) $exe -D $datadir"
+        bindir=""; [[ -n $exe ]] && bindir=$(dirname "$(canon "$exe")")
+        verbose "process: pid $pid ($owner) ${exe:-<binary unknown>} -D $datadir"
         add_cluster "data_directory=$(canon "$datadir")" "pid=$pid" "service_account=$owner" \
             "running_state=running" "bindir=$bindir" "discovery_sources=process"
-        add_install "$bindir"
+        [[ -n $bindir ]] && add_install "$bindir"
     done
+    return 0
+}
+
+argv0_from_cmdline() {  # pid -> first argument of the command line
+    local -a argv=()
+    mapfile -d '' argv < "/proc/$1/cmdline" 2>/dev/null || return 0
+    printf '%s' "${argv[0]:-}"
 }
 
 discover_explicit() {
@@ -374,10 +392,13 @@ enrich_from_datadir() {
     for ((i=0; i<n; i++)); do
         datadir=$(jq -r ".[$i].data_directory" <<<"$CLUSTERS")
         pgver=""; [[ -r $datadir/PG_VERSION ]] && pgver=$(tr -d '[:space:]' <"$datadir/PG_VERSION")
-        pidfile="$datadir/postmaster.pid"; pid=""; port=""; sock=""; alive=stopped
+        # alive: running (pid file names a live pid), stopped (pid file readable but absent/dead), unknown (unreadable).
+        pidfile="$datadir/postmaster.pid"; pid=""; port=""; sock=""; alive=unknown
         if [[ -r $pidfile ]]; then
             pid=$(sed -n 1p "$pidfile"); port=$(sed -n 4p "$pidfile"); sock=$(sed -n 5p "$pidfile")
-            if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then alive=running; else pid=""; port=""; sock=""; fi
+            if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then alive=running; else pid=""; port=""; sock=""; alive=stopped; fi
+        elif [[ -d $datadir && ! -e $pidfile && -r $datadir ]]; then
+            alive=stopped
         fi
         CLUSTERS=$(jq --argjson i "$i" --arg m "${pgver:-}" --arg pid "${pid:-}" --arg port "${port:-}" --arg sock "${sock:-}" --arg alive "$alive" '
             .[$i] |= (
@@ -385,7 +406,9 @@ enrich_from_datadir() {
               | (if $pid != "" then .pid = ($pid|tonumber) else . end)
               | (if $port != "" then .port = ($port|tonumber) else . end)
               | (if $sock != "" then .socket_dir = $sock else . end)
-              | .running_state = (if $alive == "running" then "running" else (if .running_state == "running" and $pid == "" then "stopped" else (.running_state // "stopped") end) end)
+              | .running_state = (if $alive == "running" then "running"
+                                  elif $alive == "stopped" then (if .pid then "running" else "stopped" end)
+                                  else (.running_state // "unknown") end)
               | .owner = (.owner // .service_account)
             )' <<<"$CLUSTERS")
         if [[ -z $(jq -r ".[$i].owner // empty" <<<"$CLUSTERS") && -d $datadir ]]; then
