@@ -323,28 +323,36 @@ datadir_from_cmdline() {  # pid -> data dir from -D
         if [[ $a == -D ]]; then printf '%s' "${argv[i+1]:-}"; return 0; fi
         if [[ $a == -D?* ]]; then printf '%s' "${a#-D}"; return 0; fi
     done
-    # No -D: the server may rely on PGDATA.
-    tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n 's/^PGDATA=//p' | head -1
+    # No -D: the server may rely on PGDATA. Unreadable environment (zombie, other namespace) = unknown.
+    { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null || true; } | sed -n 's/^PGDATA=//p' | head -1
 }
 
+# Walk /proc directly: no dependency on ps output formats, and every read is fail-soft.
 discover_processes() {
-    local pid user comm exe bindir datadir
-    while read -r pid user comm _; do
-        [[ $comm =~ (^|/)(postgres|postmaster)$ ]] || continue
-        # Only postmasters have -D or PGDATA; child processes are re-parented copies of argv.
-        exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-        [[ -n $exe ]] || continue
-        datadir=$(datadir_from_cmdline "$pid")
+    local pd pid comm state exe bindir datadir owner ppid
+    for pd in /proc/[0-9]*; do
+        pid=${pd#/proc/}
+        comm=$(cat "$pd/comm" 2>/dev/null || true)
+        [[ $comm == postgres || $comm == postmaster ]] || continue
+        # Zombies (unreaped postmasters in containers) keep the name but have no exe, cmdline or environment.
+        state=$(awk '/^State:/{print $2}' "$pd/status" 2>/dev/null || true)
+        [[ $state == Z* ]] && continue
+        exe=$(readlink "$pd/exe" 2>/dev/null || true)
+        exe=${exe% (deleted)}
+        [[ -n $exe && -x $exe ]] || continue
+        # Only postmasters carry -D (or PGDATA); children are re-titled copies without it.
+        datadir=$(datadir_from_cmdline "$pid" || true)
         [[ -n $datadir ]] || continue
-        # Skip children: their parent is a postmaster with the same data directory.
-        local ppid; ppid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 1)
-        if [[ -r /proc/$ppid/cmdline ]] && [[ $(datadir_from_cmdline "$ppid") == "$datadir" ]]; then continue; fi
-        bindir=$(dirname "$exe")
-        verbose "process: pid $pid ($user) $exe -D $datadir"
-        add_cluster "data_directory=$(canon "$datadir")" "pid=$pid" "service_account=$user" \
+        # Skip a child whose parent is a postmaster of the same data directory.
+        ppid=$(awk '/^PPid:/{print $2}' "$pd/status" 2>/dev/null || echo 1)
+        if [[ -r /proc/$ppid/cmdline && $(datadir_from_cmdline "$ppid" || true) == "$datadir" ]]; then continue; fi
+        owner=$(stat -c %U "$pd" 2>/dev/null || true)
+        bindir=$(dirname "$(canon "$exe")")
+        verbose "process: pid $pid ($owner) $exe -D $datadir"
+        add_cluster "data_directory=$(canon "$datadir")" "pid=$pid" "service_account=$owner" \
             "running_state=running" "bindir=$bindir" "discovery_sources=process"
         add_install "$bindir"
-    done < <(ps -eo pid=,user=,comm=,args= 2>/dev/null)
+    done
 }
 
 discover_explicit() {

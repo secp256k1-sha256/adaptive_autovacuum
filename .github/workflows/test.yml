@@ -50,12 +50,23 @@ jobs:
           export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start" || true
           install -m 755 packaging/linux/adaptive-autovacuum-setup /usr/local/bin/adaptive-autovacuum-setup
-          # Diagnostics first: what the container looks like to the discovery code.
-          su postgres -c "pg_ctl -D /tmp/aav-pgdata status" || true
-          ps -eo pid,user,comm,args | grep '[p]ostgres' || true
-          ls -la /tmp/aav-pgdata/postmaster.pid /var/run/postgresql/ 2>&1 || true
-          adaptive-autovacuum-setup check --verbose || echo "check exited $?"
-          adaptive-autovacuum-setup check --json | jq '{selectable: (.selectable | length), clusters: [.clusters[] | {candidate_id, data_directory, port, running_state, connection_verified, supported, inconsistent, discovery_sources}]}'
+          # Diagnostics: what the container looks like to the discovery code. Written to the job
+          # summary too, which is readable on the run page without a login.
+          {
+            echo '### Installer discovery diagnostics (PostgreSQL ${{ matrix.pgversion }})'
+            echo '```'
+            su postgres -c "pg_ctl -D /tmp/aav-pgdata status" 2>&1 || true
+            ps -eo pid,user,comm,args 2>&1 | grep '[p]ostgres' || echo "no postgres processes"
+            ls -la /tmp/aav-pgdata/postmaster.pid /var/run/postgresql/ 2>&1 || true
+            command -v pg_lsclusters && pg_lsclusters 2>&1 || true
+            ls /usr/lib/postgresql/*/bin/pg_config 2>&1 || true
+            adaptive-autovacuum-setup check --verbose 2>&1 || echo "check exited $?"
+            adaptive-autovacuum-setup check --json 2>&1 | jq -c '{selectable: (.selectable | length), installations, clusters}' || true
+            echo '--- process scan trace ---'
+            bash -x /usr/local/bin/adaptive-autovacuum-setup check --json 2>&1 >/dev/null | grep -E '^\+ (comm=|state=|exe=|datadir=|ppid=|continue|add_cluster)' | head -60 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          adaptive-autovacuum-setup check --json | jq -e '(.selectable | length) >= 1'
           AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -m fast stop"
       - name: Upload regression diffs on failure
