@@ -15,8 +15,8 @@ readonly SUPPORTED_MAJORS="${AAV_SUPPORTED_MAJORS:-17 18}"
 readonly US=$'\x1f'
 
 # Exit codes shared with install.sh and the Windows installer.
-readonly EX_OK=0 EX_ARGS=2 EX_NO_PG=3 EX_AMBIGUOUS=4 EX_UNSUPPORTED=5
-readonly EX_DOWNLOAD=6 EX_PRIVILEGE=7 EX_CONFIG_FAILED=8 EX_RESTART=9 EX_HEALTH=10
+# shellcheck disable=SC2034  # EX_OK/EX_DOWNLOAD document the shared contract; used by install.sh
+readonly EX_OK=0 EX_ARGS=2 EX_NO_PG=3 EX_AMBIGUOUS=4 EX_UNSUPPORTED=5 EX_DOWNLOAD=6 EX_PRIVILEGE=7 EX_CONFIG_FAILED=8 EX_RESTART=9 EX_HEALTH=10
 
 # ---------------------------------------------------------------- options
 COMMAND=""
@@ -132,7 +132,7 @@ say()     { [[ $QUIET_STDOUT -eq 1 ]] || printf '%s\n' "$*"; log_line "$*"; }
 ok()      { say "[OK]   $*"; }
 warn()    { say "[WARN] $*"; }
 fail()    { say "[FAIL] $*"; }
-verbose() { [[ $OPT_VERBOSE -eq 1 ]] && say "[..]   $*" || log_line "[..] $*"; }
+verbose() { if [[ $OPT_VERBOSE -eq 1 ]]; then printf '%s\n' "[..]   $*" >&2; fi; log_line "[..] $*"; }
 die()     { local code=$1; shift; printf 'ERROR: %s\n' "$*" >&2; log_line "ERROR: $*"; exit "$code"; }
 
 open_log() {
@@ -264,9 +264,9 @@ add_cluster() {  # key=value pairs; data_directory required; merges by canonical
 
 discover_pg_lsclusters() {
     command -v pg_lsclusters >/dev/null 2>&1 || return 0
-    local line ver name port status owner datadir logfile
+    local ver name port status owner datadir
     # Table output is stable: Ver Cluster Port Status Owner Data-directory Log-file.
-    while read -r ver name port status owner datadir logfile; do
+    while read -r ver name port status owner datadir _; do
         [[ $ver =~ ^[0-9]+$ ]] || continue
         verbose "pg_lsclusters: $ver/$name port $port $status $datadir"
         add_cluster "data_directory=$(canon "$datadir")" "cluster_id=$ver/$name" "port=$port" \
@@ -451,7 +451,7 @@ interrogate_candidate() {  # index
     sock=$(jq -r '.socket_dir // empty' <<<"$c"); port=$(jq -r '.port // empty' <<<"$c")
     [[ -n $bindir && -x $bindir/psql ]] || { verbose "candidate $i: no psql binary"; return 1; }
     PSQL="$bindir/psql"
-    [[ -n $OPT_PORT ]] && port=$OPT_PORT
+    if [[ -z $port && -n $OPT_PORT ]]; then port=$OPT_PORT; fi
     local tried=0
     if [[ -n $OPT_HOST ]]; then
         CONN_MODE=tcp; CONN_HOST=$OPT_HOST; CONN_PORT=$port; CONN_USER=${OPT_DB_USER:-postgres}
@@ -468,8 +468,10 @@ interrogate_candidate() {  # index
     [[ $tried -eq 1 && -n ${out:-} ]] || { verbose "candidate $i: no connection"; CONN_MODE=""; return 1; }
     local IFS="$US"; local -a f; read -r -a f <<<"$out"
     local sql_major=$(( f[0] / 10000 ))
-    if [[ $(canon "${f[2]}") != $(jq -r .data_directory <<<"$c") ]]; then
-        verbose "candidate $i: SQL data_directory ${f[2]} differs from discovered; keeping discovered"
+    # A shared socket directory can answer for another cluster: facts must belong to this data directory.
+    if [[ $(canon "${f[2]}") != "$(canon "$(jq -r .data_directory <<<"$c")")" ]]; then
+        verbose "candidate $i: connection reached data_directory ${f[2]}, not $(jq -r .data_directory <<<"$c"); facts discarded"
+        CONN_MODE=""; return 1
     fi
     CLUSTERS=$(jq --argjson i "$i" --argjson maj "$sql_major" --arg full "${f[1]}" --arg conf "${f[3]}" --argjson port "${f[4]}" \
         --arg spl "${f[5]}" --arg rec "${f[6]}" --arg hba "${f[7]}" --arg usr "${f[8]}" --arg su "${f[9]}" --arg aas "${f[10]}" --argjson start "${f[11]}" \
@@ -496,17 +498,17 @@ discover_all() {
 }
 
 apply_filters() {  # -> filtered array on stdout
-    local f="$CLUSTERS"
-    [[ -n $OPT_PG_MAJOR ]] && f=$(jq --argjson m "$OPT_PG_MAJOR" 'map(select(.postgres_major == $m))' <<<"$f")
-    [[ -n $OPT_DATA_DIR ]] && f=$(jq --arg d "$(canon "$OPT_DATA_DIR")" 'map(select(.data_directory == $d))' <<<"$f")
-    [[ -n $OPT_CLUSTER ]] && f=$(jq --arg c "$OPT_CLUSTER" 'map(select(.cluster_id == $c))' <<<"$f")
+    local arr="$CLUSTERS"
+    if [[ -n $OPT_PG_MAJOR ]]; then arr=$(jq --argjson m "$OPT_PG_MAJOR" 'map(select(.postgres_major == $m))' <<<"$arr"); fi
+    if [[ -n $OPT_DATA_DIR ]]; then arr=$(jq --arg d "$(canon "$OPT_DATA_DIR")" 'map(select(.data_directory == $d))' <<<"$arr"); fi
+    if [[ -n $OPT_CLUSTER ]]; then arr=$(jq --arg c "$OPT_CLUSTER" 'map(select(.cluster_id == $c))' <<<"$arr"); fi
     if [[ -n $OPT_SERVICE ]]; then
         local unit=$OPT_SERVICE; [[ $unit == *.service ]] || unit="$unit.service"
-        f=$(jq --arg s "$unit" 'map(select(.service_name == $s))' <<<"$f")
+        arr=$(jq --arg s "$unit" 'map(select(.service_name == $s))' <<<"$arr")
     fi
-    [[ -n $OPT_PORT ]] && f=$(jq --argjson p "$OPT_PORT" 'map(select(.port == $p))' <<<"$f")
-    [[ -n $OPT_PG_CONFIG ]] && f=$(jq --arg b "$(dirname "$(canon "$OPT_PG_CONFIG")")" 'map(select(.bindir == $b))' <<<"$f")
-    printf '%s' "$f"
+    if [[ -n $OPT_PORT ]]; then arr=$(jq --argjson p "$OPT_PORT" 'map(select(.port == $p))' <<<"$arr"); fi
+    if [[ -n $OPT_PG_CONFIG ]]; then arr=$(jq --arg b "$(dirname "$(canon "$OPT_PG_CONFIG")")" 'map(select(.bindir == $b))' <<<"$arr"); fi
+    printf '%s' "$arr"
 }
 
 print_candidates() {  # array
@@ -590,7 +592,8 @@ preload_remove() {  # value -> value without our library, order preserved
 }
 
 files_installed() {  # 0 when library + control present for the selected installation
-    local lib="$(sel .pkglibdir)/$EXT_NAME.so" ctl="$(sel .sharedir)/extension/$EXT_NAME.control"
+    local lib ctl
+    lib="$(sel .pkglibdir)/$EXT_NAME.so"; ctl="$(sel .sharedir)/extension/$EXT_NAME.control"
     [[ -f $lib && -f $ctl ]]
 }
 installed_default_version() { sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" "$(sel .sharedir)/extension/$EXT_NAME.control" 2>/dev/null | head -1; }
@@ -634,7 +637,8 @@ cmd_check() {
 wait_ready() {  # seconds -> 0 when SHOW works
     local deadline=$(( $(date +%s) + $1 ))
     while (( $(date +%s) < deadline )); do
-        if out=$(sql postgres "SELECT 1" 2>/dev/null) && [[ $out == 1 ]]; then return 0; fi
+        local probe
+        if probe=$(sql postgres "SELECT 1" 2>/dev/null) && [[ $probe == 1 ]]; then return 0; fi
         sleep 1
     done
     return 1
@@ -656,7 +660,8 @@ log_excerpt() {
     local unit; unit=$(sel .service_name)
     say "--- recent server log ---"
     if [[ -n $unit ]] && systemd_available; then journalctl -u "$unit" -n 40 --no-pager 2>/dev/null | tail -40 | sed 's/^/  /' || true; fi
-    local logdir="$(sel .data_directory)/log" latest
+    local logdir latest
+    logdir="$(sel .data_directory)/log"
     if [[ -d $logdir ]]; then
         latest=$(ls -t "$logdir" 2>/dev/null | head -1)
         if [[ -n $latest ]]; then tail -40 "$logdir/$latest" 2>/dev/null | sed "s/^/  /"; fi
@@ -666,7 +671,8 @@ log_excerpt() {
 
 # Offline rollback of postgresql.auto.conf; only if the file is byte-identical to what we wrote.
 rollback_auto_conf() {  # backup_path expected_hash -> 0 restored
-    local auto="$(sel .data_directory)/postgresql.auto.conf" cur
+    local auto cur
+    auto="$(sel .data_directory)/postgresql.auto.conf"
     cur=$(sha256sum "$auto" | cut -d' ' -f1)
     if [[ $cur != "$2" ]]; then
         fail "postgresql.auto.conf changed since this installer wrote it; not overwriting. Restore manually: cp $1 $auto"
@@ -738,7 +744,8 @@ cmd_install() {
     [[ $preload_pending -eq 1 ]] && restart_needed=1
     # A library file newer than the running postmaster needs a restart even if preload was already set.
     if [[ $preload_change -eq 0 && $preload_pending -eq 0 ]]; then
-        local lib="$(sel .pkglibdir)/$EXT_NAME.so" libm start
+        local lib libm start
+        lib="$(sel .pkglibdir)/$EXT_NAME.so"
         libm=$(stat -c %Y "$lib"); start=$(sel .postmaster_start_epoch)
         if [[ $libm -gt ${start:-0} ]]; then restart_needed=1; fi
     fi
@@ -757,7 +764,8 @@ cmd_install() {
     confirm "Continue?" || { journal_final cancelled; die $EX_ARGS "cancelled"; }
 
     # ---- 1. preload ----
-    local auto="$(sel .data_directory)/postgresql.auto.conf" backup="" pre_hash="" post_hash=""
+    local auto backup="" pre_hash="" post_hash=""
+    auto="$(sel .data_directory)/postgresql.auto.conf"
     if [[ $preload_change -eq 1 ]]; then
         mkdir -p "$STATE_DIR/backups"
         if [[ -f $auto ]]; then
@@ -776,7 +784,7 @@ cmd_install() {
         fi
         post_hash=$(sha256sum "$auto" | cut -d' ' -f1)
         journal_set '.preload_after = $v | .auto_conf_hash_after = $h' --arg v "$newval" --arg h "$post_hash"
-        journal_step preload done "$newval"
+        journal_step preload 'done' "$newval"
         ok "existing preload libraries preserved"
         ok "$EXT_NAME added to shared_preload_libraries"
     elif [[ $preload_pending -eq 1 ]]; then
@@ -800,14 +808,14 @@ cmd_install() {
             [[ $start_after -gt ${start_before:-0} ]] || warn "pg_postmaster_start_time did not advance; verify the restart"
             local effective; effective=$(sql postgres "SHOW shared_preload_libraries")
             preload_lists "$effective" || { journal_step restart failed "preload not effective"; journal_final failed; die $EX_RESTART "server restarted but shared_preload_libraries is '$effective'"; }
-            journal_step restart done; ok "PostgreSQL restarted and accepting connections"
+            journal_step restart 'done'; ok "PostgreSQL restarted and accepting connections"
         else
             fail "PostgreSQL did not become ready within $OPT_RESTART_TIMEOUT s"
             log_excerpt
             if [[ $preload_change -eq 1 && -n $backup ]]; then
                 say "Rolling back shared_preload_libraries to '$preload_now' ..."
                 if rollback_auto_conf "$backup" "$post_hash" && restart_selected; then
-                    journal_step rollback done; journal_final rolled_back
+                    journal_step rollback 'done'; journal_final rolled_back
                     die $EX_CONFIG_FAILED "restart with $EXT_NAME failed; previous configuration restored and the server is running again. Check the log excerpt above (library load error?)"
                 fi
                 journal_step rollback failed; journal_final failed
@@ -823,10 +831,10 @@ cmd_install() {
     for d in "${dbs[@]}"; do
         cur=$(sql "$d" "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = '$EXT_NAME'), '')")
         if [[ -z $cur ]]; then
-            if sql "$d" "CREATE EXTENSION $EXT_NAME" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension created in $d ($ext_version)"; journal_step "create:$d" done
+            if sql "$d" "CREATE EXTENSION $EXT_NAME" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension created in $d ($ext_version)"; journal_step "create:$d" 'done'
             else fail "CREATE EXTENSION failed in $d (see $LOG_FILE)"; journal_step "create:$d" failed; act_failed=1; fi
         elif [[ $cur != "$ext_version" ]]; then
-            if sql "$d" "ALTER EXTENSION $EXT_NAME UPDATE" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension updated in $d ($cur -> $ext_version); policy and history preserved"; journal_step "update:$d" done
+            if sql "$d" "ALTER EXTENSION $EXT_NAME UPDATE" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension updated in $d ($cur -> $ext_version); policy and history preserved"; journal_step "update:$d" 'done'
             else fail "ALTER EXTENSION UPDATE failed in $d (see $LOG_FILE)"; journal_step "update:$d" failed; act_failed=1; fi
         else
             ok "extension already at $ext_version in $d"
@@ -844,7 +852,7 @@ cmd_install() {
             sql postgres "ALTER SYSTEM SET track_cost_delay_timing = on" >/dev/null || warn "could not set track_cost_delay_timing"
         fi
         sql postgres "SELECT pg_reload_conf()" >/dev/null
-        journal_step enable done; ok "controller enabled (adaptive_autovacuum.enabled = on)"
+        journal_step enable 'done'; ok "controller enabled (adaptive_autovacuum.enabled = on)"
     fi
 
     # ---- 5. verify ----
@@ -876,9 +884,10 @@ cmd_install() {
 }
 
 verify_files() {
-    local lib="$(sel .pkglibdir)/$EXT_NAME.so" ctl="$(sel .sharedir)/extension/$EXT_NAME.control" ver
+    local lib ctl ver sqlf
+    lib="$(sel .pkglibdir)/$EXT_NAME.so"; ctl="$(sel .sharedir)/extension/$EXT_NAME.control"
     ver=$(installed_default_version)
-    local sqlf="$(sel .sharedir)/extension/$EXT_NAME--$ver.sql"
+    sqlf="$(sel .sharedir)/extension/$EXT_NAME--$ver.sql"
     if [[ -f $lib && -f $ctl && -f $sqlf ]]; then ok "extension files installed ($lib, $ctl, $(basename "$sqlf"))"; return 0; fi
     fail "extension files incomplete: $( [[ -f $lib ]] || echo "$lib ") $( [[ -f $ctl ]] || echo "$ctl ") $( [[ -f $sqlf ]] || echo "$sqlf")"
     return 1
@@ -907,7 +916,8 @@ print_doctor() {  # db -> 0 when no FAIL rows
 cmd_doctor() {
     need_cmd jq
     discover_all; select_candidate; use_selected_connection || true
-    local lib="$(sel .pkglibdir)/$EXT_NAME.so" ctl="$(sel .sharedir)/extension/$EXT_NAME.control" ver=""
+    local lib ctl ver=""
+    lib="$(sel .pkglibdir)/$EXT_NAME.so"; ctl="$(sel .sharedir)/extension/$EXT_NAME.control"
     [[ -f $ctl ]] && ver=$(installed_default_version)
     local rc=0 dbs=() d
     if [[ $(sel .connection_verified) == true ]]; then
@@ -954,7 +964,7 @@ cmd_toggle() {  # on|off
     journal_init; journal_set '.selected = $c | .enabled_before = $v' --argjson c "$SELECTED" --arg v "$before"
     MUTATED=1
     sql postgres "ALTER SYSTEM SET adaptive_autovacuum.enabled = $1" >/dev/null && sql postgres "SELECT pg_reload_conf()" >/dev/null
-    journal_step "enabled=$1" done; journal_final "$( [[ $1 == on ]] && echo completed || echo disabled )"
+    journal_step "enabled=$1" 'done'; journal_final "$( [[ $1 == on ]] && echo completed || echo disabled )"
     ok "controller $( [[ $1 == on ]] && echo enabled || echo "disabled (files, preload and extension objects untouched)" )"
 }
 
@@ -972,7 +982,7 @@ cmd_remove_preload() {
     journal_init; journal_set '.selected = $c | .preload_before = $v' --argjson c "$SELECTED" --arg v "$now"
     MUTATED=1
     set_preload_value postgres "$newval" >/dev/null
-    journal_step remove-preload done "$newval"; ok "shared_preload_libraries set to '$newval'"
+    journal_step remove-preload 'done' "$newval"; ok "shared_preload_libraries set to '$newval'"
     warn "extension objects stay in every database; DROP EXTENSION $EXT_NAME is a separate, destructive step (it deletes the policy and history tables)"
     if [[ $OPT_NO_RESTART -eq 1 ]] || ! confirm "Restart $(sel .service_name) now?"; then journal_final restart_required; warn "restart pending"; exit 0; fi
     restart_selected || { journal_final failed; die $EX_RESTART "restart failed; check the service log"; }

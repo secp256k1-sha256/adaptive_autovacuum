@@ -50,7 +50,12 @@ jobs:
           export PATH=/usr/lib/postgresql/${{ matrix.pgversion }}/bin:$PATH
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -w start" || true
           install -m 755 packaging/linux/adaptive-autovacuum-setup /usr/local/bin/adaptive-autovacuum-setup
-          adaptive-autovacuum-setup check --json | jq '.selectable | length'
+          # Diagnostics first: what the container looks like to the discovery code.
+          su postgres -c "pg_ctl -D /tmp/aav-pgdata status" || true
+          ps -eo pid,user,comm,args | grep '[p]ostgres' || true
+          ls -la /tmp/aav-pgdata/postmaster.pid /var/run/postgresql/ 2>&1 || true
+          adaptive-autovacuum-setup check --verbose || echo "check exited $?"
+          adaptive-autovacuum-setup check --json | jq '{selectable: (.selectable | length), clusters: [.clusters[] | {candidate_id, data_directory, port, running_state, connection_verified, supported, inconsistent, discovery_sources}]}'
           AAV_TEST_LIVE=1 bats test/installer/linux-install.bats
           su postgres -c "pg_ctl -D /tmp/aav-pgdata -m fast stop"
       - name: Upload regression diffs on failure
