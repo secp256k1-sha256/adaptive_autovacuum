@@ -36,7 +36,8 @@ Describe 'Windows installer (live)' -Skip:(-not $script:live) {
         $j.last_run.final_state | Should -Be 'completed'
     }
     It 'is idempotent on rerun (no restart)' {
-        $out = & $setup install -Yes -PgPassFile $pass -ServiceName $svc -Database $db 2>&1 | Out-String
+        # The helper reports through Write-Host (information stream): capture every stream, not just stdout/stderr.
+        $out = & $setup install -Yes -PgPassFile $pass -ServiceName $svc -Database $db *>&1 | Out-String
         $LASTEXITCODE | Should -Be 0
         $out | Should -Match 'Restart:\s+not needed'
     }
