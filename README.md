@@ -9,7 +9,7 @@
 ![Language](https://img.shields.io/badge/lang-C%20%2B%20PL%2FpgSQL-555)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
-> **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4, 18.6, 17.6, and 17.11), including regression suites, a hot-standby drill, live emergency-vacuum drills, and ~20,000 TPS pgbench runs, but has not yet completed sustained production-scale testing.
+> **⚠️ Beta version, testing in progress.** This extension is under active development and validation. It has been functionally tested on Linux and Windows (PostgreSQL 18.4, 18.6, 17.6, and 17.11), including regression suites, a hot-standby drill, live emergency-vacuum drills, and ~20,000 TPS pgbench runs, but has not yet completed sustained production-scale testing. Please include `SELECT * FROM adaptive_autovacuum.doctor();` output in bug reports.
 
 ## Quick install (PostgreSQL 17 and 18)
 
@@ -34,7 +34,7 @@ Get-Content .\install.ps1
 The installer discovers your PostgreSQL clusters (and makes you choose when that is ambiguous, for example when both a 17 and an 18 cluster run), verifies the
 package checksum against the release manifest, installs the files, appends `adaptive_autovacuum` to
 `shared_preload_libraries` without touching the other entries, asks before restarting the one selected service,
-creates or updates the extension in the databases you named, turns the controller on, and ends with a health report:
+creates or updates the extension in the databases you named, turns the controller on, and ends with a health report.
 
 
 Diagnose any time with `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`) or, in SQL,
@@ -190,6 +190,7 @@ It should behave like:
 
 ## Contents
 
+- [Quick install](#quick-install-postgresql-17-and-18)
 - [Installation](#installation)
 - [How it decides](#how-it-decides)
 - [Monitoring](#monitoring)
@@ -205,7 +206,7 @@ It should behave like:
 
 **The [quick installer](#quick-install-postgresql-17-and-18) is the simplest route.** It downloads matching binaries and runs setup. PostgreSQL must already be installed; use an administrator account and a PostgreSQL superuser connection, with a restart window available.
 
-Prefer packages? Download them from [**v1.1.0 Releases**](https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/tag/v1.1.0) and verify against `SHA256SUMS`.
+Prefer packages? They are on the [release page](https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest) with `SHA256SUMS`.
 
 | Platform | Packages for PostgreSQL 17 and 18 |
 | :--- | :--- |
@@ -213,11 +214,14 @@ Prefer packages? Download them from [**v1.1.0 Releases**](https://github.com/sec
 | RHEL / Rocky / AlmaLinux 9 | RPM, x86_64 / aarch64; extension package **plus** shared helper package |
 | Windows, EDB-style installation | x64 ZIP for the PostgreSQL major; helper included |
 
-These examples assume the files have been downloaded. Replace `mydb` with an existing database and choose filenames matching your platform.
+Replace `mydb` with an existing database and pick the file names for your platform.
 
 **Ubuntu 24.04 amd64 / PostgreSQL 18:**
 
 ```bash
+U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
+curl -fsSLO $U/adaptive-autovacuum-setup_1.1.0-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.1.0-1_ubuntu24.04_amd64.deb
 sudo apt-get install ./adaptive-autovacuum-setup_1.1.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.1.0-1_ubuntu24.04_amd64.deb
 sudo adaptive-autovacuum-setup install --database mydb
 ```
@@ -225,6 +229,9 @@ sudo adaptive-autovacuum-setup install --database mydb
 **EL9 x86_64 / PostgreSQL 18:**
 
 ```bash
+U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
+curl -fsSLO $U/adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm
 sudo dnf install ./adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm
 sudo adaptive-autovacuum-setup install --database mydb
 ```
@@ -232,10 +239,13 @@ sudo adaptive-autovacuum-setup install --database mydb
 **Windows / PostgreSQL 18**, elevated PowerShell:
 
 ```powershell
-Expand-Archive .\adaptive_autovacuum-1.1.0-pg18-windows-x64.zip -DestinationPath .\aav
+$U = 'https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download'
+Invoke-WebRequest "$U/adaptive_autovacuum-1.1.0-pg18-windows-x64.zip" -OutFile aav.zip
+Expand-Archive aav.zip -DestinationPath aav
 .\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Database mydb -Credential (Get-Credential postgres)
 ```
 
+To verify a download, compare its SHA-256 with `SHA256SUMS` from the release page; the helper checks every file inside the Windows ZIP itself.
 
 <details>
 <summary><strong>Build from source (contributors and custom installations)</strong></summary>
@@ -253,7 +263,7 @@ PGDG RPM installations normally use `/usr/pgsql-18/bin/pg_config`. On Windows, u
 windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 ```
 
-Use the platform guide for file placement and setup. For manual activation, append `adaptive_autovacuum` to your existing `shared_preload_libraries` list, restart that instance, then run `CREATE EXTENSION adaptive_autovacuum;` in each target database. Existing explicit `off` settings must be changed if you want automation enabled.
+On Windows, `packaging\windows\build-zip.ps1 -PgMajor 18` packs the build into a ZIP you install as above. For manual activation, append `adaptive_autovacuum` to your existing `shared_preload_libraries` list, restart that instance, then run `CREATE EXTENSION adaptive_autovacuum;` in each target database. Existing explicit `off` settings must be changed if you want automation enabled.
 
 </details>
 
@@ -303,7 +313,7 @@ SELECT * FROM adaptive_autovacuum.status();
 | Cleanup-horizon blockers | `SELECT * FROM adaptive_autovacuum.horizon_blocker();` |
 | Shared summary capacity | `SELECT * FROM adaptive_autovacuum.cluster_summary_status();` |
 
-Linux diagnostics are also available with `sudo adaptive-autovacuum-setup doctor`, or `doctor --format json` for automation.
+From the shell: `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`); add `--format json` / `-Format json` for automation.
 
 ## Operating the controller
 
