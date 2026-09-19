@@ -16,5 +16,6 @@ cp "$here/prerm" "$out/postgresql-$major-adaptive-autovacuum.prerm"
 chmod 755 "$out"/*.postinst "$out"/*.prerm
 cp "$here/copyright" "$out/copyright"
 cp "$here/source/format" "$out/source/format"
-{ echo "PG_MAJOR := $major"; cat "$here/rules"; } >"$out/rules"; chmod 755 "$out/rules"
+# The shebang must stay on line 1; pin PG_MAJOR right after it.
+{ head -n 1 "$here/rules"; echo "PG_MAJOR := $major"; tail -n +2 "$here/rules"; } >"$out/rules"; chmod 755 "$out/rules"
 echo "generated $out for PostgreSQL $major"

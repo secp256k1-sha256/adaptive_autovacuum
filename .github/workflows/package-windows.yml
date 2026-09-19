@@ -19,10 +19,29 @@ jobs:
       - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey)
         shell: pwsh
         run: |
-          choco install postgresql${{ matrix.pgmajor }} --params '/Password:aavtest /Port:5432' -y --no-progress
-          $root = 'C:\Program Files\PostgreSQL\${{ matrix.pgmajor }}'
+          $major = ${{ matrix.pgmajor }}
+          # The runner image ships one PostgreSQL major preinstalled (own data dir, password "root", port 5432).
+          # Stop everything, install the target major only if absent, and set a password we control.
+          Get-Service postgresql* | ForEach-Object { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue; Set-Service $_.Name -StartupType Disabled }
+          $root = "C:\Program Files\PostgreSQL\$major"
+          if (-not (Test-Path "$root\bin\pg_config.exe")) { choco install postgresql$major --params '/Password:aavtest /Port:5432' -y --no-progress }
           if (-not (Test-Path "$root\include\server\postgres.h")) { throw 'server headers missing: the EDB package did not install the development files' }
-          Get-Service postgresql* | Format-Table Name, Status -AutoSize
+          $svc = Get-CimInstance Win32_Service | Where-Object { $_.Name -eq "postgresql-x64-$major" }
+          if (-not $svc) { throw "service postgresql-x64-$major not found" }
+          $data = [regex]::Match($svc.PathName, '-D\s+"([^"]+)"').Groups[1].Value
+          Write-Host "service $($svc.Name) data=$data"
+          Set-Service $svc.Name -StartupType Manual
+          Stop-Service $svc.Name -Force -ErrorAction SilentlyContinue
+          $hba = Join-Path $data 'pg_hba.conf'
+          $orig = Get-Content -Raw $hba
+          ("host all all 127.0.0.1/32 trust`nhost all all ::1/128 trust`n" + $orig) | Set-Content $hba -NoNewline
+          Start-Service $svc.Name
+          & "$root\bin\pg_isready.exe" -h localhost -p 5432 -t 30
+          & "$root\bin\psql.exe" -X -h localhost -p 5432 -U postgres -d postgres -w -c "ALTER USER postgres PASSWORD 'aavtest'"
+          if ($LASTEXITCODE -ne 0) { throw 'could not set the postgres password' }
+          $orig | Set-Content $hba -NoNewline
+          & "$root\bin\psql.exe" -X -h localhost -p 5432 -U postgres -d postgres -w -c 'SELECT pg_reload_conf()'
+          Get-Service postgresql* | Format-Table Name, Status, StartType -AutoSize
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
