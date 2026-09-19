@@ -13,7 +13,7 @@
 - The PostgreSQL 18 job has run and passed on GitHub Actions (first run failed and was fixed; see the 2026-08-10 CI entry below).
 - The PostgreSQL 17 leg and the matrix form were added on 2026-08-14 and have NOT yet run on GitHub Actions. The identical command sequence (build, install, two-pass installcheck) has passed locally against PGDG 17.11 on AlmaLinux 9; treat the hosted PG17 run as pending until the first green matrix run is recorded here.
 
-- The installer workflows added on 2026-09-19 (`test.yml` replacing `ci.yml`, `package-rpm.yml`, `package-deb.yml`, `package-windows.yml`, `release.yml`) have NOT yet run on GitHub Actions. The RPM build, the offline `install.sh` path and the Windows ZIP path were exercised locally (below); the DEB build, aarch64/arm64 and the Chocolatey PostgreSQL step in the Windows job are unverified.
+- 2026-09-20: `test.yml`, `package-rpm.yml`, `package-deb.yml`, `package-windows.yml` and `release.yml` have all run green on GitHub Actions; release `v1.1.0` ("1.1.0 (beta)") was published by `release.yml` with the full matrix (see the 2026-09-20 entry below).
 
 ## Validation performed 2026-08-08 (post-review fixes)
 
@@ -1015,3 +1015,36 @@ explicitly so that an earlier `off` is undone. CI discovery inside the `postgres
 `/proc/<pid>/exe` is unreadable there (no ptrace access for container root), so the scan now falls back to `argv[0]`,
 skips zombies, validates against `postmaster.pid`, silences the environment read, and closes descriptors 3-9 around
 `pg_ctl` so a restarted postmaster cannot hold the caller (bats) open.
+
+## Validation performed 2026-09-20 (first packaged release v1.1.0)
+
+`release.yml` published GitHub release **v1.1.0 "1.1.0 (beta)"** (normal release so `releases/latest` resolves; beta stated in
+title, notes and README) with 21 assets: 8 Ubuntu DEBs (24.04/26.04 x amd64/arm64 x PG 17/18) + `adaptive-autovacuum-setup_1.1.0-1_all.deb`,
+4 EL9 RPMs (x86_64/aarch64 x PG 17/18) + `adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm`, 2 Windows ZIPs (PG 17/18),
+`release-manifest.json` (16 installer artifacts, schema-validated), `SHA256SUMS`, `install.sh`, `install.ps1`, and the PGXN-style
+source zip `adaptive_autovacuum-1.1.0.zip` (META.json at top level). Every asset hash in `SHA256SUMS` matches the manifest.
+
+Each package was installed and exercised in a clean environment by CI before publication: DEB in `ubuntu:24.04` / `ubuntu:26.04`
+containers via `apt-get install` of the two packages, `install.sh` offline, the `pg_lsclusters` discovery path, the live bats suite
+and `apt-get remove` (extension objects preserved); RPM likewise in `almalinux:9` (x86_64 and aarch64 runners); Windows on
+`windows-latest` (Chocolatey EDB PostgreSQL 17/18, MSVC build, `install.ps1` offline, live Pester suite: install, restart,
+activation, doctor, idempotent rerun, disable).
+
+Online quick install verified with the README commands against the published release:
+- WSL AlmaLinux 9 (PG 17 and 18 running): `curl -fsSLO .../releases/latest/download/install.sh; sudo bash install.sh --pg-major 18
+  --database postgres --yes` downloaded and checksum-verified the PG18 RPM and the helper RPM from GitHub, installed them and finished
+  with doctor clean.
+- Windows 11 (EDB 14/15/17/18 installed, 18 running): `Invoke-WebRequest .../releases/latest/download/install.ps1; .\install.ps1
+  -Database aav_installer_test -Credential ...` downloaded and verified the PG18 ZIP, replaced the in-use DLL, restarted the service,
+  15/15 doctor OK; the controller was disabled again afterwards.
+
+CI defects found and fixed while getting there (all in workflows/test harness, none in the extension): `argv[0]` fallback when
+`/proc/<pid>/exe` is unreadable in containers; zombie postmasters; quiet `environ` reads; descriptors 3-9 closed around `pg_ctl`
+(bats hang); `--separate-stderr` for JSON tests; EPEL/CRB for `postgresql<major>-devel` on EL9; `initdb` instead of the systemd-bound
+`postgresql-N-setup`; `tar` instead of `git archive` when checkout has no `.git`; make shebang kept on line 1 of generated
+`debian/rules`; `shell: bash` for `pipefail` steps (Ubuntu 24.04 dash); Chocolatey vs preinstalled PostgreSQL on the Windows runner
+(password set via temporary trust); Pester live suite runs scripts in a child `pwsh`; and a matrix bug that silently dropped every
+x86_64/amd64 and 24.04 job (`include` entries without a matrix key overwrite each other) caught before publication.
+
+Beta exit criteria (unchanged): 30 days on at least two external clusters with the controller active and no unexplained cluster
+changes or failed applies, one field upgrade through `ALTER EXTENSION UPDATE`, CI green on every platform.

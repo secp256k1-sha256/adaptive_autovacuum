@@ -341,114 +341,146 @@ Built-in caution, so it never thrashes: a table must stay behind for two consecu
 
 ## Install
 
-Three ways, from easiest to most manual. All of them end with the same two facts: the library is in
-`shared_preload_libraries` (one restart), and `CREATE EXTENSION adaptive_autovacuum` has run in every database
-you want managed. Databases without the extension are skipped.
+Three ways in, from the least to the most manual. Whatever the route, a working installation is two facts: the
+library is listed in `shared_preload_libraries` (one PostgreSQL restart), and `CREATE EXTENSION adaptive_autovacuum`
+has run in every database you want managed. Databases without the extension are skipped. The controller switch
+`adaptive_autovacuum.enabled` is on by default; installing is the opt-in.
 
-### 1. Installer (PostgreSQL 17 and 18)
+Requirements: PostgreSQL 17 or 18, a superuser connection, and one restart window. Packages exist for Ubuntu 24.04 /
+26.04 (amd64, arm64), RHEL / Rocky / AlmaLinux 9 (x86_64, aarch64) and Windows x64 (EDB-style installations).
+Other platforms build from source.
 
-See [Quick install](#quick-install-postgresql-17-and-18) above. `install.sh` / `install.ps1` are small bootstraps around
-the packages below and `adaptive-autovacuum-setup`, the helper that owns discovery, configuration, restart,
-activation, health checks and rollback. Every step is idempotent; rerunning after success or an interruption is safe.
+| | Linux | Windows |
+|---|---|---|
+| **A. One command** | `install.sh` (see [Quick install](#quick-install-postgresql-17-and-18)) | `install.ps1` |
+| **B. Packages** | `apt-get` / `dnf` with the release `.deb` / `.rpm`, then the helper | release `.zip`, then the helper |
+| **C. From source** | `make install` with the server dev package | MSVC build of the DLL |
 
-### 2. Package manager (PostgreSQL 17 and 18)
+Every route ends with the same health check: `SELECT * FROM adaptive_autovacuum.doctor();` (or
+`adaptive-autovacuum-setup doctor`). All rows `OK` means done.
 
-Release assets per PostgreSQL major (17 and 18): `postgresql-<major>-adaptive-autovacuum_<ver>_ubuntu24.04_amd64.deb` (also `ubuntu26.04`, `arm64`),
-`postgresql<major>-adaptive-autovacuum-<ver>.el9.x86_64.rpm` (also `aarch64`), `adaptive_autovacuum-<ver>-pg<major>-windows-x64.zip`,
-plus one shared helper package per format (`adaptive-autovacuum-setup_<ver>_all.deb`, `adaptive-autovacuum-setup-<ver>.el9.noarch.rpm`)
-that the extension packages depend on. Verify against `SHA256SUMS`, then:
+### A. One-command installer
+
+`install.sh` and `install.ps1` download the release manifest, pick the package for your host, verify its SHA-256, install
+it, and hand over to `adaptive-autovacuum-setup`, the helper that owns discovery, the preload change, the restart prompt,
+`CREATE EXTENSION`, the health check and rollback. Commands and expected output are in
+[Quick install](#quick-install-postgresql-17-and-18); options and exit codes in [docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md)
+and [docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md). Rerunning is safe at any point.
+
+### B. Packages
+
+Two packages per Linux host: the extension package for your PostgreSQL major, and the shared
+`adaptive-autovacuum-setup` package (one per host, any major) that it depends on. Windows ships one ZIP per major that
+already contains the helper. All files are on the [release page](https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest)
+together with `SHA256SUMS`.
+
+**Ubuntu 24.04 / 26.04** (pick your major, Ubuntu version and architecture in the file name):
 
 ```bash
-sudo dnf install ./adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm   # or the two .deb files
+V=1.1.0; U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/download/v$V
+curl -fsSLO $U/SHA256SUMS
+curl -fsSLO $U/adaptive-autovacuum-setup_${V}-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_${V}-1_ubuntu24.04_amd64.deb
+sha256sum --ignore-missing -c SHA256SUMS
+sudo apt-get install ./adaptive-autovacuum-setup_${V}-1_all.deb ./postgresql-18-adaptive-autovacuum_${V}-1_ubuntu24.04_amd64.deb
 sudo adaptive-autovacuum-setup install --database mydb
 ```
 
-The packages install files only (library, control, SQL scripts, helper). They never restart PostgreSQL, change its
-configuration, run `CREATE EXTENSION`, or drop extension objects when removed.
+**RHEL / Rocky / AlmaLinux 9** (needs the [PGDG repository](https://www.postgresql.org/download/linux/redhat/) for the server package itself):
 
-### 3. Build from source (PostgreSQL 17 or 18)
+```bash
+V=1.1.0; U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/download/v$V
+curl -fsSLO $U/SHA256SUMS
+curl -fsSLO $U/adaptive-autovacuum-setup-${V}-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-${V}-1.el9.x86_64.rpm
+sha256sum --ignore-missing -c SHA256SUMS
+sudo dnf install ./adaptive-autovacuum-setup-${V}-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-${V}-1.el9.x86_64.rpm
+sudo adaptive-autovacuum-setup install --database mydb
+```
 
-### Linux / Unix, from source
+**Windows** (elevated PowerShell; the ZIP holds the DLL, control and SQL files, the helper and an `artifact-manifest.json`
+with a hash per file, which the helper verifies before copying anything):
 
-Build against your server's major version, 17 or 18 (needs the server dev package: `postgresql18-devel` / `postgresql17-devel` or `postgresql-server-dev-18` / `-17`):
+```powershell
+$V = '1.1.0'; $U = "https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/download/v$V"
+Invoke-WebRequest "$U/adaptive_autovacuum-$V-pg18-windows-x64.zip" -OutFile aav.zip
+Invoke-WebRequest "$U/SHA256SUMS" -OutFile SHA256SUMS
+(Get-FileHash aav.zip -Algorithm SHA256).Hash.ToLower() -eq ((Select-String "pg18-windows-x64.zip" SHA256SUMS).Line.Split(' ')[0])   # must print True
+Expand-Archive aav.zip -DestinationPath aav
+.\aav\adaptive-autovacuum-setup.ps1 install -SourceDir .\aav -Database mydb -Credential (Get-Credential postgres)
+```
+
+The packages install files only. They never restart PostgreSQL, change its configuration, run `CREATE EXTENSION`, or
+drop extension objects when removed; `adaptive-autovacuum-setup install` does the configuration, shows its plan and asks
+before the restart (`--yes` / `-Yes` for unattended runs, `--no-restart` to defer it). With several supported clusters on
+one host, select with `--pg-major`, `--service`, `--data-dir` or `--port` (Windows: `-ServiceName`, `-DataDirectory`, `-Port`).
+Uninstall is described in [Upgrading and removing](#upgrading-and-removing).
+
+### C. Build from source (PostgreSQL 17 or 18)
+
+**Linux / Unix.** Needs the server dev package (`postgresql18-devel` / `postgresql17-devel` on RHEL-like,
+`postgresql-server-dev-18` / `-17` on Debian-like):
 
 ```bash
 make PG_CONFIG=/usr/pgsql-18/bin/pg_config
 sudo make install PG_CONFIG=/usr/pgsql-18/bin/pg_config
+sudo install -m 755 packaging/linux/adaptive-autovacuum-setup /usr/local/bin/   # optional: the helper (needs jq)
 ```
 
-Add to `postgresql.conf` and restart PostgreSQL (a restart is needed once, because of `shared_preload_libraries`):
-
-```conf
-shared_preload_libraries = 'adaptive_autovacuum'
-adaptive_autovacuum.enabled = on         # default; set off to pause everything (see "Turning it on safely")
-track_cost_delay_timing = on             # lets it see vacuums that are mostly sleeping
-```
-
-### Windows, from source (existing installation, e.g. the EDB installer)
-
-You need the DLL once; build it on any machine with the same PostgreSQL major version:
+**Windows.** You need the DLL once; build it on any machine with the same PostgreSQL major:
 
 1. Install **Visual Studio Build Tools** (the free compiler package is enough).
-2. Make sure your PostgreSQL installation includes the development files (`include\server` and `lib\postgres.lib` exist. The EDB installer ships them by default).
-3. Open the **"x64 Native Tools Command Prompt for VS"**, go to the extension folder, and run:
+2. Make sure the PostgreSQL installation has the development files (`include\server` and `lib\postgres.lib`; the EDB installer ships them).
+3. In an **"x64 Native Tools Command Prompt for VS"**, from the extension folder:
 
 ```bat
 windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 ```
 
-All build outputs land in the `windows\` folder.
-
-4. Copy the files into your installation (Administrator prompt):
+All build outputs land in `windows\`. Then either build a package ZIP with `packaging\windows\build-zip.ps1 -PgMajor 18`
+and install it as in B, or copy the files by hand from an Administrator prompt:
 
 ```bat
-copy windows\adaptive_autovacuum.dll    "C:\Program Files\PostgreSQL\18\lib\"
-copy adaptive_autovacuum.control        "C:\Program Files\PostgreSQL\18\share\extension\"
-copy sql\adaptive_autovacuum--*.sql   "C:\Program Files\PostgreSQL\18\share\extension\"
+copy windows\adaptive_autovacuum.dll   "C:\Program Files\PostgreSQL\18\lib\"
+copy adaptive_autovacuum.control       "C:\Program Files\PostgreSQL\18\share\extension\"
+copy sql\adaptive_autovacuum--*.sql    "C:\Program Files\PostgreSQL\18\share\extension\"
 ```
 
-5. Register the library and restart the PostgreSQL service **once**:
+**Then configure, on either platform.** Easiest is the helper from the checkout:
+
+```bash
+sudo adaptive-autovacuum-setup install --database mydb                                          # Linux
+packaging\windows\adaptive-autovacuum-setup.ps1 install -Database mydb -Credential (Get-Credential postgres)   # Windows
+```
+
+By hand instead, as a superuser:
 
 ```sql
+-- keep any libraries already listed, e.g. 'pg_stat_statements,adaptive_autovacuum'
 ALTER SYSTEM SET shared_preload_libraries = 'adaptive_autovacuum';
-ALTER SYSTEM SET track_cost_delay_timing = on;
+ALTER SYSTEM SET track_cost_delay_timing = on;       -- PostgreSQL 18: lets it see vacuums that mostly sleep
 ```
 
-```powershell
-Restart-Service postgresql-x64-18      # or: net stop postgresql-x64-18 && net start postgresql-x64-18
+restart PostgreSQL once (`systemctl restart postgresql-18` / `Restart-Service postgresql-x64-18`), then in every database
+you want managed:
+
+```sql
+CREATE EXTENSION adaptive_autovacuum;
+SELECT * FROM adaptive_autovacuum.doctor();          -- every row OK?
 ```
 
-> If `shared_preload_libraries` already lists other libraries on your server, add
-> `adaptive_autovacuum` to the list instead of replacing it.
+`adaptive_autovacuum.enabled` is on by default, so nothing else is needed; set it `off` (`ALTER SYSTEM` + reload) to pause
+every database at once.
 
-**One Windows difference to know about:** Windows has no "load average". The extension measures CPU busy percentage instead (you'll see it as `load1` in the metrics). Unlike a load average, this value can never exceed the number of cores, so if you want the "server is overloaded, don't add vacuum work" protection to engage on Windows, set it below 1.0:
+**One Windows difference to know about:** Windows has no "load average". The extension measures CPU busy percentage instead
+(you'll see it as `load1` in the metrics). Unlike a load average, this value can never exceed the number of cores, so if you
+want the "server is overloaded, don't add vacuum work" protection to engage on Windows, set it below 1.0:
 
 ```sql
 UPDATE adaptive_autovacuum.policy SET high_load_per_cpu = 0.85;
 ```
 
 Everything else (cluster-setting fixes, per-table help, restore, the audit tables, emergency protection) works the same as on Linux.
-
-### After a source build: preload, restart, activate
-
-The helper works with a source build too (copy `packaging/linux/adaptive-autovacuum-setup` to `/usr/local/bin`, or use
-`packaging/windows/adaptive-autovacuum-setup.ps1`); `install --database mydb` then does the preload append, the restart
-prompt, `CREATE EXTENSION` and the health check for you. By hand instead:
-
-```sql
--- keep any libraries already listed: 'pg_stat_statements,adaptive_autovacuum'
-ALTER SYSTEM SET shared_preload_libraries = 'adaptive_autovacuum';
-ALTER SYSTEM SET track_cost_delay_timing = on;       -- PostgreSQL 18
-```
-
-restart PostgreSQL once, then in every database you want managed:
-
-```sql
-CREATE EXTENSION adaptive_autovacuum;
-ALTER SYSTEM SET adaptive_autovacuum.enabled = on;   -- the cluster switch; see "Turning it on safely"
-SELECT pg_reload_conf();
-SELECT * FROM adaptive_autovacuum.doctor();          -- every row OK?
-```
 
 ## Turning it on safely
 
