@@ -9,7 +9,7 @@
 [![Status](https://img.shields.io/badge/Status-Beta-orange)](VALIDATION.md)
 [![Language](https://img.shields.io/badge/C%20%2B%20PL%2FpgSQL-555555)](src/)
 
-> **⚠️ Beta — testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and ~20,000 TPS pgbench workloads. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
+> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and ~20,000 TPS pgbench workloads. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
 
 
 
@@ -34,7 +34,7 @@ Get-Content .\install.ps1
 ```
 **🗄️ Install once in the control database. Automatically manage the entire PostgreSQL cluster.**
 
-The installer selects the PostgreSQL cluster, verifies downloads, installs the extension, preserves existing preload libraries, asks before restarting, enables the controller and reports its health. PostgreSQL must already be installed.
+The installer selects the PostgreSQL cluster, verifies downloads, installs the extension, preserves existing preload libraries, asks before restarting, enables the controller and reports its health. PostgreSQL must already be installed. `--control-database NAME` / `-ControlDatabase NAME` picks a control database other than `postgres`.
 
 **🩺 Check health anytime:** `SELECT * FROM adaptive_autovacuum.doctor();` or `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`).
 
@@ -63,7 +63,7 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 | ♻️ | **Clean up after itself** | Restores owned table options and gradually unwinds temporary incident cost tuning. |
 | 🔎 | **Explain every decision** | Exposes cluster status, actions, previous values, recommendations and errors through SQL. |
 
-> 🎯 **The goal:** keep maintenance debt under control, use spare host capacity when needed and intervene before neglected vacuum work becomes an outage — not chase a benchmark score.
+> 🎯 **The goal:** keep maintenance debt under control, use spare host capacity when needed and intervene before neglected vacuum work becomes an outage, not chase a benchmark score.
 
 ### 🛡️ Guardrails
 
@@ -88,7 +88,7 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 
 ## ⚙️ How it decides
 
-One controller in the **control database** (`postgres` by default) discovers all eligible databases and scans them in sweep generations. Up to two database workers run concurrently by default. The controller collects central state, makes one global decision and performs at most one `ALTER SYSTEM` step per complete sweep. It sleeps for 60 seconds after a sweep; the revisit interval also includes scan time.
+One controller in the **control database** (`postgres` by default) discovers all eligible databases and scans them in sweep generations. Up to two database workers run concurrently by default. The controller collects central state, makes one global decision and applies all queued settings in one `ALTER SYSTEM` step per complete sweep. It sleeps for 60 seconds after a sweep; the revisit interval also includes scan time.
 
 | Decision | Evidence and limits |
 |---|---|
@@ -175,7 +175,7 @@ The distributed `sql/adaptive_autovacuum--1.2.0.sql` is assembled from `sql/part
 
 </details>
 
-See [Linux setup](docs/INSTALL.md), [Windows setup](docs/WINDOWS.md) and [installation diagnostics](docs/DOCTOR.md) for authentication, offline deployment and troubleshooting.
+See [Linux setup](docs/INSTALL-LINUX.md), [Windows setup](docs/INSTALL-WINDOWS.md), [troubleshooting](docs/TROUBLESHOOTING.md) and [installer security](docs/INSTALLER-SECURITY.md) for authentication, offline deployment and diagnostics.
 
 ## 📈 Monitoring
 
@@ -197,7 +197,7 @@ SELECT * FROM adaptive_autovacuum.status();
 | ⚙️ Global changes and original values | `SELECT * FROM adaptive_autovacuum.global_apply_queue ORDER BY id DESC;` |
 | 💡 Latest advice | `SELECT * FROM adaptive_autovacuum.latest_global_recommendation;` |
 | 📝 Decisions and errors | `SELECT * FROM adaptive_autovacuum.decisions ORDER BY id DESC LIMIT 50;` |
-| ⏳ Aging tables | `SELECT * FROM adaptive_autovacuum.aging_tables;` |
+| ⏳ Aging tables (of the database you query) | `SELECT * FROM adaptive_autovacuum.aging_tables;` |
 | 🚨 Wraparound status | `SELECT * FROM adaptive_autovacuum.wraparound_status;` |
 | 🔒 Cleanup-horizon blockers | `SELECT * FROM adaptive_autovacuum.horizon_blocker();` |
 | 👷 Controller/sweep progress | `SELECT * FROM adaptive_autovacuum.controller_status();` |
@@ -347,8 +347,10 @@ make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
 | Document | Contents |
 |---|---|
-| [Linux installation](docs/INSTALL.md) | Packages, cluster selection, authentication and offline setup. |
-| [Windows installation](docs/WINDOWS.md) | Credentials, Windows services, ZIPs and DLL handling. |
+| [Linux installation](docs/INSTALL-LINUX.md) | Packages, cluster selection, authentication and offline setup. |
+| [Windows installation](docs/INSTALL-WINDOWS.md) | Credentials, Windows services, ZIPs and DLL handling. |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Doctor checks, controller states, handoff files. |
+| [Installer security](docs/INSTALLER-SECURITY.md) | Verification, privileges and recovery. |
 | [Architecture](docs/ARCHITECTURE.md) | Controller, workers, SQL program and central state. |
 | [Validation](VALIDATION.md) | Test coverage and observed workload behavior. |
 
