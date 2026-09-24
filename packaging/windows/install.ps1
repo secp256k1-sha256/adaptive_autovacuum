@@ -11,7 +11,8 @@
 
     Invoke-WebRequest https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.ps1 -OutFile install.ps1
     Get-Content .\install.ps1
-    .\install.ps1 -Database mydb -Credential (Get-Credential postgres)
+    .\install.ps1 -Credential (Get-Credential postgres)                      # control database postgres
+    .\install.ps1 -ControlDatabase app -Credential (Get-Credential postgres)
 
   Exit codes: 0 ok, 2 arguments, 3 no supported PostgreSQL, 4 ambiguous, 5 unsupported platform,
               6 download/integrity failure, 7 privileges, 8 installation failure, 9 restart failed, 10 health check failed.
@@ -27,6 +28,7 @@ param(
     [string]$Version = 'latest',
     [string]$Manifest,
     [string]$ArtifactDir,
+    [string]$ControlDatabase,
     [string[]]$Database = @(),
     [switch]$AllDatabases,
     [switch]$SkipCreateExtension,
@@ -51,7 +53,7 @@ $ErrorActionPreference = 'Stop'
 # Any unexpected error is an installation failure with a defined exit code, never a silent exit 0.
 trap { Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 8 }
 
-$InstallerVersion = '1.1.0'
+$InstallerVersion = '1.2.0'
 $Repo = if ($env:AAV_REPO) { $env:AAV_REPO } else { 'secp256k1-sha256/adaptive_autovacuum' }
 $ReleaseBase = "https://github.com/$Repo/releases"
 $AllowedHosts = @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
@@ -68,7 +70,7 @@ function Get-FinalUri($Response, [string]$Requested) {
     return [uri]$Requested
 }
 
-if ($Version -ne 'latest' -and $Version -notmatch '^v?\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') { Fail $Ex.Args '-Version must look like 1.1.0' }
+if ($Version -ne 'latest' -and $Version -notmatch '^v?\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') { Fail $Ex.Args '-Version must look like 1.2.0' }
 $Version = $Version -replace '^v', ''
 if ($ArtifactDir -and -not (Test-Path $ArtifactDir -PathType Container)) { Fail $Ex.Args '-ArtifactDir is not a directory' }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { Fail $Ex.Unsupported "unsupported CPU architecture: $env:PROCESSOR_ARCHITECTURE (x64 only)" }
@@ -150,7 +152,7 @@ try {
     if (-not (Test-Path $setup) -or -not (Test-Path (Join-Path $expanded 'AdaptiveAutovacuum.Setup.psm1'))) { Fail $Ex.Download 'the package does not contain the setup helper' }
 
     # ---- hand over ----
-    $fwd = @{ SourceDir = $expanded; Database = $Database; AllDatabases = $AllDatabases; SkipCreateExtension = $SkipCreateExtension; NoEnable = $NoEnable
+    $fwd = @{ SourceDir = $expanded; ControlDatabase = $ControlDatabase; Database = $Database; AllDatabases = $AllDatabases; SkipCreateExtension = $SkipCreateExtension; NoEnable = $NoEnable
               NoRestart = $NoRestart; Yes = $Yes; DryRun = $DryRun; PgRoot = $PgRoot; ServiceName = $ServiceName; DataDirectory = $DataDirectory
               DbUser = $DbUser; Credential = $Credential; PgPassFile = $PgPassFile; StartupWait = $StartupWait; RestartTimeout = $RestartTimeout }
     if ($Port) { $fwd.Port = $Port }; if ($PgMajor) { $fwd.PgMajor = $PgMajor }

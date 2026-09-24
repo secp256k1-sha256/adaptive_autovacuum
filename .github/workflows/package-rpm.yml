@@ -89,7 +89,7 @@ jobs:
           VER=$(sed -n "s/^default_version *= *'\([^']*\)'.*/\1/p" adaptive_autovacuum.control)
           bash packaging/common/make-release-manifest.sh dist "$VER"
           bash packaging/linux/install.sh --check --manifest dist/release-manifest.json --artifact-dir dist
-          bash packaging/linux/install.sh --yes --manifest dist/release-manifest.json --artifact-dir dist --database postgres
+          bash packaging/linux/install.sh --yes --manifest dist/release-manifest.json --artifact-dir dist --control-database postgres
           adaptive-autovacuum-setup doctor --format json | jq -e '.databases[0].checks | map(select(.status == "FAIL")) | length == 0'
           rpm -V postgresql${{ matrix.pgmajor }}-adaptive-autovacuum
       - name: Idempotency, disable, remove-preload (bats live suite)

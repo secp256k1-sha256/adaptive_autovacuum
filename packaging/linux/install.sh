@@ -6,11 +6,11 @@
 #
 #   curl -fsSLO https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.sh
 #   less install.sh
-#   sudo bash install.sh --database mydb
+#   sudo bash install.sh
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.1.0"
+readonly INSTALLER_VERSION="1.2.0"
 readonly REPO="${AAV_REPO:-secp256k1-sha256/adaptive_autovacuum}"
 readonly RELEASE_BASE="https://github.com/$REPO/releases"
 # Hosts a GitHub release download may legitimately redirect to.
@@ -36,7 +36,7 @@ Usage: sudo bash install.sh [options] [-- setup options]
   --verbose               diagnostic output
   --help
 
-All other options (--database NAME, --skip-create-extension, --no-restart, --service NAME,
+All other options (--control-database NAME, --skip-create-extension, --no-restart, --service NAME,
 --data-dir PATH, --port PORT, --db-user NAME, --pgpassfile PATH, --no-enable ...) are passed to
 adaptive-autovacuum-setup install. Run "adaptive-autovacuum-setup --help" for the full list.
 
@@ -46,6 +46,8 @@ EOF
 }
 
 say() { printf '%s\n' "$*"; }
+# The packaged helper first; a stale copy earlier in PATH (e.g. /usr/local/bin) must not win.
+setup_bin() { if [[ -x /usr/bin/adaptive-autovacuum-setup ]]; then echo /usr/bin/adaptive-autovacuum-setup; else command -v adaptive-autovacuum-setup; fi; }
 verbose() { [[ $OPT_VERBOSE -eq 1 ]] && say "[..]   $*" || true; }
 die() { local c=$1; shift; printf 'ERROR: %s\n' "$*" >&2; exit "$c"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die $EX_ARGS "required command not found: $1. Install it: $2"; }
@@ -63,13 +65,13 @@ parse_args() {
             --verbose|-v) OPT_VERBOSE=1; SETUP_ARGS+=(--verbose); shift ;;
             --help|-h) usage; exit 0 ;;
             --) shift; SETUP_ARGS+=("$@"); break ;;
-            --database|--service|--data-dir|--cluster|--port|--host|--db-user|--pgpassfile|--pg-config|--startup-wait|--restart-timeout)
+            --control-database|--database|--service|--data-dir|--cluster|--port|--host|--db-user|--pgpassfile|--pg-config|--startup-wait|--restart-timeout)
                 SETUP_ARGS+=("$1" "${2:?}"); shift 2 ;;
             --skip-create-extension|--all-databases|--no-restart|--no-enable) SETUP_ARGS+=("$1"); shift ;;
             *) die $EX_ARGS "unknown option: $1 (see --help)" ;;
         esac
     done
-    [[ $OPT_VERSION == latest || $OPT_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die $EX_ARGS "--version must look like 1.1.0"
+    [[ $OPT_VERSION == latest || $OPT_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die $EX_ARGS "--version must look like 1.2.0"
     OPT_VERSION=${OPT_VERSION#v}
     [[ -z $OPT_PG_MAJOR || $OPT_PG_MAJOR =~ ^[0-9]+$ ]] || die $EX_ARGS "--pg-major must be a number"
     [[ -z $OPT_ARTIFACT_DIR || -d $OPT_ARTIFACT_DIR ]] || die $EX_ARGS "--artifact-dir is not a directory"
@@ -267,13 +269,13 @@ main() {
     local installed; installed=$(package_installed_version)
     if [[ $OPT_CHECK -eq 1 ]]; then
         say "Installed package: ${installed:-none}"
-        if command -v adaptive-autovacuum-setup >/dev/null 2>&1; then adaptive-autovacuum-setup check "${SETUP_ARGS[@]}"; fi
+        if setup_bin >/dev/null; then "$(setup_bin)" check "${SETUP_ARGS[@]}"; fi
         exit 0
     fi
     if [[ $OPT_DRY_RUN -eq 1 ]]; then
         say "Dry run: would download and verify the package, install it with $( [[ $PKG_TYPE == deb ]] && echo apt-get || echo dnf ), then run:"
         say "  adaptive-autovacuum-setup install ${SETUP_ARGS[*]}"
-        if command -v adaptive-autovacuum-setup >/dev/null 2>&1; then adaptive-autovacuum-setup install "${SETUP_ARGS[@]}" || true; fi
+        if setup_bin >/dev/null; then "$(setup_bin)" install "${SETUP_ARGS[@]}" || true; fi
         exit 0
     fi
     if [[ $OPT_YES -eq 0 ]]; then
@@ -286,9 +288,9 @@ main() {
     fi
     obtain_artifact
     install_package
-    command -v adaptive-autovacuum-setup >/dev/null 2>&1 || die $EX_CONFIG_FAILED "the package did not provide adaptive-autovacuum-setup"
+    setup_bin >/dev/null || die $EX_CONFIG_FAILED "the package did not provide adaptive-autovacuum-setup"
     say ""
-    exec adaptive-autovacuum-setup install "${SETUP_ARGS[@]}"
+    exec "$(setup_bin)" install "${SETUP_ARGS[@]}"
 }
 
 main "$@"

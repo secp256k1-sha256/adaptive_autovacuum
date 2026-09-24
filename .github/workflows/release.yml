@@ -85,8 +85,10 @@ jobs:
 
             Install (PostgreSQL 17 or 18):
 
-            Linux: download `install.sh`, read it, then `sudo bash install.sh --database <name>`
-            Windows: download `install.ps1`, read it, then run it from an elevated PowerShell with `-Database <name>`
+            Install once per cluster; the extension lives in the control database (`postgres` by default) and manages every database.
+            Linux: download `install.sh`, read it, then `sudo bash install.sh`
+            Windows: download `install.ps1`, read it, then run it from an elevated PowerShell with `-Credential (Get-Credential postgres)`
+            No upgrade path from 1.1.0: the installer re-creates the extension (policy and history of the old copy are deleted).
 
             Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.
             `adaptive_autovacuum-<version>.zip` is the PGXN-style source distribution (build from source with `make`).

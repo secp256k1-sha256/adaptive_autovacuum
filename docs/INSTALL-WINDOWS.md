@@ -9,10 +9,12 @@ PowerShell 7 both work; run from an **elevated** prompt.
 ```powershell
 Invoke-WebRequest https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content .\install.ps1
-.\install.ps1 -Database mydb -Credential (Get-Credential postgres)
+.\install.ps1 -Credential (Get-Credential postgres)
 ```
 
-`install.ps1` downloads `release-manifest.json`, validates it, picks the Windows x64 ZIP for the PostgreSQL major found on the host (the running one when both 17 and 18 are installed; `-PgMajor N` when both run),
+The extension is created once per cluster, in the control database (`postgres` by default; `-ControlDatabase NAME`
+chooses another one and sets `adaptive_autovacuum.control_database`). Every database of the cluster is managed from
+there. `install.ps1` downloads `release-manifest.json`, validates it, picks the Windows x64 ZIP for the PostgreSQL major found on the host (the running one when both 17 and 18 are installed; `-PgMajor N` when both run),
 verifies its SHA-256, expands it into a unique temporary directory, checks every file against the
 `artifact-manifest.json` inside the ZIP, and then runs `adaptive-autovacuum-setup.ps1 install` from the
 package. Add `-Yes` for unattended runs, `-Check` for discovery only, `-DryRun` for the plan.
@@ -54,7 +56,7 @@ The helper is installed by the package; use the copy in `C:\Program Files\adapti
 ```powershell
 .\adaptive-autovacuum-setup.ps1 check [-Json]
 .\adaptive-autovacuum-setup.ps1 doctor [-Format json]
-.\adaptive-autovacuum-setup.ps1 install -Database mydb -Credential (Get-Credential postgres) [-Yes]
+.\adaptive-autovacuum-setup.ps1 install [-ControlDatabase NAME] -Credential (Get-Credential postgres) [-Yes]
 .\adaptive-autovacuum-setup.ps1 disable | enable
 .\adaptive-autovacuum-setup.ps1 remove-preload
 .\adaptive-autovacuum-setup.ps1 remove-files      # only after remove-preload; never drops database objects
@@ -69,8 +71,9 @@ Selection filters when several PostgreSQL 18 instances run: `-ServiceName`, `-Da
 .\uninstall.ps1 -Credential (Get-Credential postgres) -RemoveFiles  # ... and delete the files afterwards
 ```
 
-Database objects are never dropped by the scripts. Per database, if you want that:
-`DROP EXTENSION adaptive_autovacuum;` (deletes policy and history).
+Database objects are never dropped by the scripts. In the control database, if you want that:
+`DROP EXTENSION adaptive_autovacuum;` (deletes policy and history). Upgrading from 1.1.0 has no upgrade script: the
+installer re-creates the extension in the control database after confirmation.
 
 ## Windows notes
 

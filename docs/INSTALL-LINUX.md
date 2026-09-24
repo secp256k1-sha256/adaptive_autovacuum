@@ -8,7 +8,7 @@ RHEL / Rocky / AlmaLinux 9 (x86_64, aarch64). Other hosts can still build from s
 ```bash
 curl -fsSLO https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.sh
 less install.sh
-sudo bash install.sh --database mydb
+sudo bash install.sh
 ```
 
 `install.sh` is a small bootstrap. It
@@ -26,16 +26,21 @@ All other options are passed to the helper (see below). Offline: `--manifest FIL
 
 ## Activation model
 
-The extension is created **per database** (`CREATE EXTENSION adaptive_autovacuum` in every database that
-should be managed). The launcher connects to `adaptive_autovacuum.control_database` (default `postgres`)
-only to list databases; that database does not need the extension. Databases without the extension are
-skipped. Because of that the installer never activates all databases silently:
+The extension is created **once per cluster**, in the control database (`adaptive_autovacuum.control_database`,
+`postgres` by default). The controller connects there, discovers every connectable non-template database from
+`pg_database` and manages all of them; the other databases need no extension objects at all.
 
-- `--database NAME` (repeatable) names the targets;
-- `--all-databases` is the explicit "everything connectable and non-template";
+- `--control-database NAME` chooses that database (`--database` is an alias); when it differs from the current
+  setting the helper writes `adaptive_autovacuum.control_database` with `ALTER SYSTEM` and reloads;
 - `--skip-create-extension` installs files and preload only;
-- an interactive session without any of these shows a list to pick from;
-- `template0`/`template1` are refused (`template1` would change every future database).
+- an interactive session without `--control-database` asks once (empty answer = `postgres`);
+- `template0`/`template1` are refused;
+- copies of the extension in other databases are reported as ignored; drop them with `DROP EXTENSION`.
+
+**Upgrading from 1.1.0.** There is no upgrade script. When the control database holds an older version, the plan
+shows `DROP EXTENSION + CREATE EXTENSION` and the helper re-creates the extension after your confirmation; the old
+policy edits and history in that database are deleted (note `changed_tables` and `global_apply_queue.old_value` first
+if you want to restore anything). Databases that carried 1.1.0 copies keep them until you drop them.
 
 ## What the helper does (`adaptive-autovacuum-setup install`)
 
@@ -48,10 +53,10 @@ Detected PostgreSQL:
   Preload now:      ''
 
 Plan:
-  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.1.0)
+  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.2.0)
   Preload change:   '' -> 'adaptive_autovacuum'
   Restart:          yes (postgresql-18.service)
-  Database:         mydb: CREATE EXTENSION adaptive_autovacuum (version 1.1.0)
+  Control database: postgres: CREATE EXTENSION adaptive_autovacuum (version 1.2.0)
   Enable controller: yes (adaptive_autovacuum.enabled = on, track_cost_delay_timing = on)
 
 Continue? [Y/n]
@@ -109,7 +114,7 @@ session, or reads `--pgpassfile`. Passwords never appear on a command line or in
 
 ```
 sudo adaptive-autovacuum-setup check [--json]           # discovery only
-sudo adaptive-autovacuum-setup doctor [--format json]   # health of every database with the extension
+sudo adaptive-autovacuum-setup doctor [--format json]   # health of the control database; ignored copies elsewhere are listed
 sudo adaptive-autovacuum-setup disable                  # controller off (GUC), nothing removed
 sudo adaptive-autovacuum-setup enable
 sudo adaptive-autovacuum-setup remove-preload           # keeps the other preload libraries; restart prompt
@@ -121,9 +126,9 @@ Log: `/var/log/adaptive-autovacuum/setup.log`.
 ## Package manager only
 
 ```bash
-sudo dnf install ./adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm   # postgresql17-... for PostgreSQL 17
-sudo apt-get install ./adaptive-autovacuum-setup_1.1.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.1.0-1_ubuntu24.04_amd64.deb
-sudo adaptive-autovacuum-setup install --database mydb
+sudo dnf install ./adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm   # postgresql17-... for PostgreSQL 17
+sudo apt-get install ./adaptive-autovacuum-setup_1.2.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
+sudo adaptive-autovacuum-setup install
 ```
 
 The extension packages depend on `adaptive-autovacuum-setup`, so both majors can be installed side by side and share
@@ -135,7 +140,7 @@ one helper. The packages install files only. They never restart PostgreSQL, edit
 1. `sudo adaptive-autovacuum-setup disable` (controller off, everything else stays)
 2. `sudo adaptive-autovacuum-setup remove-preload` (restart; other libraries preserved)
 3. `sudo dnf remove postgresql<major>-adaptive-autovacuum` / `sudo apt-get remove postgresql-<major>-adaptive-autovacuum`
-4. Optional and destructive, per database: `DROP EXTENSION adaptive_autovacuum;` (deletes policy and history)
+4. Optional and destructive, in the control database: `DROP EXTENSION adaptive_autovacuum;` (deletes policy and history)
 
 ## Exit codes
 

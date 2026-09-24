@@ -30,7 +30,7 @@ No compiler, headers or manual file copying. Download the installer, read it, ru
 ```bash
 curl -fsSLO https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.sh
 less install.sh
-sudo bash install.sh --database postgres
+sudo bash install.sh
 ```
 
 **Windows** (EDB-style PostgreSQL 17 or 18 x64, elevated PowerShell):
@@ -38,16 +38,15 @@ sudo bash install.sh --database postgres
 ```powershell
 Invoke-WebRequest https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content .\install.ps1
-.\install.ps1 -Database postgres -Credential (Get-Credential postgres)
+.\install.ps1 -Credential (Get-Credential postgres)
 ```
 
 The installer discovers your PostgreSQL clusters (and makes you choose when that is ambiguous, for example when both a 17 and an 18 cluster run), verifies the
 package checksum against the release manifest, installs the files, appends `adaptive_autovacuum` to
 `shared_preload_libraries` without touching the other entries, asks before restarting the one selected service,
-creates or updates the extension in the control database you name with `--database` / `-Database` (the control
-database is `postgres` unless you changed `adaptive_autovacuum.control_database`; the extension is created once per
-cluster), turns the controller on, and ends with a health report. The helper's options for naming several databases
-are legacy until the next release: only the control database needs the extension, and extra copies are ignored.
+creates the extension once, in the control database (`postgres`, or the one you pass with `--control-database` /
+`-ControlDatabase`), turns the controller on, and ends with a health report. Copies of the extension in other
+databases are reported as ignored.
 
 
 Diagnose any time with `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`) or, in SQL,
@@ -228,35 +227,35 @@ Prefer packages? They are on the [release page](https://github.com/secp256k1-sha
 | RHEL / Rocky / AlmaLinux 9 | RPM, x86_64 / aarch64; extension package **plus** shared helper package |
 | Windows, EDB-style installation | x64 ZIP for the PostgreSQL major; helper included |
 
-`--database` / `-Database` names the control database (`postgres` by default; the one place the extension is created). Pick the file names for your platform.
+The extension is created once, in the control database (`postgres` by default; `--control-database` / `-ControlDatabase` picks another). Pick the file names for your platform.
 
 **Ubuntu 24.04 amd64 / PostgreSQL 18:**
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup_1.1.0-1_all.deb
-curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.1.0-1_ubuntu24.04_amd64.deb
-sudo apt-get install ./adaptive-autovacuum-setup_1.1.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.1.0-1_ubuntu24.04_amd64.deb
-sudo adaptive-autovacuum-setup install --database postgres
+curl -fsSLO $U/adaptive-autovacuum-setup_1.2.0-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
+sudo apt-get install ./adaptive-autovacuum-setup_1.2.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
+sudo adaptive-autovacuum-setup install
 ```
 
 **EL9 x86_64 / PostgreSQL 18:**
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm
-curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm
-sudo dnf install ./adaptive-autovacuum-setup-1.1.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.1.0-1.el9.x86_64.rpm
-sudo adaptive-autovacuum-setup install --database postgres
+curl -fsSLO $U/adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm
+sudo dnf install ./adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm
+sudo adaptive-autovacuum-setup install
 ```
 
 **Windows / PostgreSQL 18**, elevated PowerShell:
 
 ```powershell
 $U = 'https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download'
-Invoke-WebRequest "$U/adaptive_autovacuum-1.1.0-pg18-windows-x64.zip" -OutFile aav.zip
+Invoke-WebRequest "$U/adaptive_autovacuum-1.2.0-pg18-windows-x64.zip" -OutFile aav.zip
 Expand-Archive aav.zip -DestinationPath aav
-.\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Database postgres -Credential (Get-Credential postgres)
+.\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Credential (Get-Credential postgres)
 ```
 
 To verify a download, compare its SHA-256 with `SHA256SUMS` from the release page; the helper checks every file inside the Windows ZIP itself.
@@ -452,7 +451,7 @@ UPDATE adaptive_autovacuum.policy SET emergency_vacuum_enabled = false;
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 ```
 
-**There is no upgrade path from 1.1.0 to 1.2.0** (beta). The extension changed from one installation per database to one control plane per cluster, and the SQL extension version is now 1.2.0 (the packages on the release page are still 1.1.0). To move: in every database that has the 1.1.0 objects, review `changed_tables` and `global_apply_queue.old_value`, restore what you do not want to keep, and run `DROP EXTENSION adaptive_autovacuum;`; then run `CREATE EXTENSION adaptive_autovacuum;` once, in the control database. Policy edits do not carry over; re-apply them to the cluster policy and re-create `table_policy` rows with `database_name`, `schema_name` and `relation_name`.
+**There is no upgrade path from 1.1.0 to 1.2.0** (beta). The extension changed from one installation per database to one control plane per cluster. The installer handles it: when the control database holds 1.1.0, the plan shows `DROP EXTENSION + CREATE EXTENSION` and, after confirmation, re-creates the extension there; policy edits and history of that copy are deleted, so review `changed_tables` and `global_apply_queue.old_value` first and re-apply policy changes afterwards (`table_policy` rows now use `database_name`, `schema_name`, `relation_name`). Databases that carried their own 1.1.0 copy keep them until you run `DROP EXTENSION adaptive_autovacuum;` there; `doctor()` lists them under `duplicate_installations`.
 
 **Remove:** first review and restore any global/table tuning you do not want to retain, disable the controller, and coordinate outstanding maintenance. On Linux:
 

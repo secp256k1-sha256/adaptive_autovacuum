@@ -6,7 +6,7 @@
 %global debug_package %{nil}
 
 Name:           postgresql%{pgmajor}-adaptive-autovacuum
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Adaptive autovacuum controller extension for PostgreSQL %{pgmajor}
 License:        PostgreSQL
@@ -73,7 +73,7 @@ install -d -m 700 %{buildroot}%{_sharedstatedir}/adaptive-autovacuum
 %post
 if [ "$1" -eq 1 ]; then
     echo "adaptive_autovacuum files installed for PostgreSQL %{pgmajor}."
-    echo "Configure and activate with: sudo adaptive-autovacuum-setup install --database <name>"
+    echo "Configure and activate with: sudo adaptive-autovacuum-setup install   (extension created once, in the control database postgres)"
 fi
 
 %preun
@@ -84,6 +84,10 @@ if [ "$1" -eq 0 ]; then
 fi
 
 %changelog
+* Thu Sep 24 2026 adaptive_autovacuum maintainers - 1.2.0-1
+- One control plane per cluster: install once in the control database (postgres); every database is discovered and managed, no CREATE EXTENSION elsewhere
+- Cost-weighted vacuum_activity_rate replaces the MB/s signal; XID velocity without allocating XIDs; cluster-first status(), database_status, table_status, actions
+- Installer: --control-database (default postgres); no upgrade script from 1.1.0, the helper re-creates the extension
 * Sat Sep 19 2026 adaptive_autovacuum maintainers - 1.1.0-1
 - Operator API: doctor(), status(), enable_default_policy(); upgrade script 1.0.0 -> 1.1.0
 - adaptive-autovacuum-setup helper (own noarch package) and Tier 1 installer; PostgreSQL 17 and 18

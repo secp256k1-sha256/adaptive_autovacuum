@@ -1116,3 +1116,38 @@ stopped, decay 2560/6.25 -> 1280/12.5 ms at sweep 29. Observed cost-weighted act
 allows during the load (about 100 K cost units/s on both hosts) and fell to single digits afterwards, which is what the
 hold reason reports. Worker count was never lowered; no controller errors in either server log (the 57 Windows log
 errors are the drill's own PowerShell monitor sending malformed statements, visible as `STATEMENT: 0`).
+
+## Validation performed 2026-09-24 (1.2.0 packaging and installers)
+
+Version 1.2.0 everywhere (control file, spec, Debian changelog, META.json, helper, install.sh, Windows module and
+install.ps1, manifest `minimum_installer_version`). Both installers switched from per-database activation to one
+control database: `--control-database` / `-ControlDatabase` (default `postgres`; `--database` / `-Database` kept as an
+alias, `--all-databases` / `-AllDatabases` rejected), the helper writes `adaptive_autovacuum.control_database` when it
+differs, re-creates the extension (`DROP EXTENSION` + `CREATE EXTENSION`, after the plan and confirmation) when the
+installed copy is older and no upgrade script exists, reports copies in other databases as ignored, waits for
+`controller_running`, and `doctor` checks the control database only (JSON gained `control_database` and
+`duplicate_installations`). `install.sh` now calls `/usr/bin/adaptive-autovacuum-setup` explicitly so a stale copy
+earlier in `PATH` cannot shadow the packaged helper (found on the test box).
+
+Linux (WSL AlmaLinux 9, PGDG PG 18.6 and 17.11 with the 1.1.0 RPMs installed and the extension in `postgres`):
+`bash -n` clean; 16/16 unit bats; RPMs built for 18 and 17 (`--define pgmajor`); `dnf install` upgraded all three
+packages in one transaction, `rpm -V` clean; `make-release-manifest.sh` produced a 3-artifact manifest with
+`minimum_installer_version 1.2.0`; `install.sh --check` and `--dry-run` offline against it; the packaged helper's plan
+for the 1.1.0 copy read `DROP EXTENSION + CREATE EXTENSION adaptive_autovacuum (1.1.0 -> 1.2.0: no upgrade script ...)`
+and `install --yes` re-created it (`[OK] extension re-created in postgres`), `doctor --format json` reported
+`control_database postgres`, `duplicate_installations ["aav_dup"]` for a copy created in another database, and
+`controller_running true`; `--control-database aav_dup` moved the control plane (`ALTER SYSTEM` + reload, controller
+followed: `status()` in `aav_dup` showed `is_control_database = t`) and back; live bats 7/7 (dry run, `--all-databases`
+rejected, two control databases rejected, install, idempotent rerun, disable/enable, remove-preload).
+
+Windows 11 (EDB PG 18.4 service `postgresql-x64-18`, 1.1.0 objects in `aav_installer_test`): `build-zip.ps1 -PgMajor 18`
+built `adaptive_autovacuum-1.2.0-pg18-windows-x64.zip`; all five PowerShell files parse; Pester discovery 16/16;
+`install.ps1` offline with a local manifest: `-Check` OK, checksum mismatch exit 6, `-DryRun` plan showed the re-create
+and the control-setting change, the real run replaced the DLL, restarted the service, set
+`adaptive_autovacuum.control_database = aav_installer_test`, re-created the extension there, enabled the controller,
+and `doctor` was all OK except `duplicate_installations WARN` for the old `aav_win` copy (sweep 1 over 9 databases);
+duplicate detection verified with a temporary `aav_win_dup`; idempotent rerun via the installed helper under
+`C:\Program Files\adaptive_autovacuum\1.2.0\`; Pester live suite 4/4 (a first run failed only because a stale 1.1.0
+ZIP in `dist\` was picked up; removed). The workstation was left with the controller disabled again.
+
+Not run here: DEB build (no dpkg on the test hosts; CI covers it), the GitHub `release.yml` publication itself.

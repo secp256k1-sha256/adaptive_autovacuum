@@ -5,7 +5,7 @@ case "$1" in
     configure)
         if [ -z "$2" ]; then
             echo "adaptive_autovacuum files installed for PostgreSQL @PGMAJOR@."
-            echo "Configure and activate with: sudo adaptive-autovacuum-setup install --database <name>"
+            echo "Configure and activate with: sudo adaptive-autovacuum-setup install   (extension created once, in the control database postgres)"
         fi
         ;;
 esac

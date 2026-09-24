@@ -14,30 +14,37 @@ setup() {
 
 @test "install --dry-run changes nothing and exits 0" {
     before=$(bash "$SETUP" check --json ${AAV_TEST_ARGS:-} | jq -c '.selectable[0] | {shared_preload_libraries}')
-    run bash "$SETUP" install --database postgres --dry-run ${AAV_TEST_ARGS:-}
+    run bash "$SETUP" install --control-database postgres --dry-run ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     [[ "$output" == *"Dry run: nothing changed."* ]]
     after=$(bash "$SETUP" check --json ${AAV_TEST_ARGS:-} | jq -c '.selectable[0] | {shared_preload_libraries}')
     [ "$before" = "$after" ]
 }
 
-@test "install without an activation target exits 2 in non-interactive mode" {
-    run bash "$SETUP" install --yes </dev/null ${AAV_TEST_ARGS:-}
+@test "--all-databases is rejected with exit 2" {
+    run bash "$SETUP" install --all-databases --yes </dev/null ${AAV_TEST_ARGS:-}
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"control database"* ]]
+}
+
+@test "two different control databases are rejected with exit 2" {
+    run bash "$SETUP" install --control-database postgres --database template1 --yes </dev/null ${AAV_TEST_ARGS:-}
     [ "$status" -eq 2 ]
 }
 
-@test "install --database postgres --yes completes and doctor reports no FAIL" {
-    run bash "$SETUP" install --database postgres --yes ${AAV_TEST_ARGS:-}
+@test "install --yes (control database postgres by default) completes and doctor reports no FAIL" {
+    run bash "$SETUP" install --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     [[ "$output" == *"Installation complete."* ]]
     run --separate-stderr bash "$SETUP" doctor --format json ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
-    jq -e '.databases[] | select(.database == "postgres") | .status.extension_version != null and (.checks | map(select(.status == "FAIL")) | length == 0)' <<<"$output"
+    jq -e '.databases[] | select(.database == "postgres") | .status.extension_version != null and .status.is_control_database == true and (.checks | map(select(.status == "FAIL")) | length == 0)' <<<"$output"
+    [ "$(jq -r '.control_database' <<<"$output")" = "postgres" ]
     [ "$(jq -r '.last_run.final_state' <<<"$output")" = "completed" ]
 }
 
 @test "rerun is idempotent: no preload change, no restart" {
-    run bash "$SETUP" install --database postgres --yes ${AAV_TEST_ARGS:-}
+    run bash "$SETUP" install --control-database postgres --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
     [[ "$output" == *"Preload change:   none"* ]]
     [[ "$output" == *"Restart:          not needed"* ]]
@@ -62,6 +69,6 @@ setup() {
     [ "$status" -eq 10 ]
     [ "$(jq -r '.databases[0].checks[] | select(.check_name == "library_preloaded") | .status' <<<"$output")" = "FAIL" ]
     # Put it back for the following tests.
-    run bash "$SETUP" install --database postgres --yes ${AAV_TEST_ARGS:-}
+    run bash "$SETUP" install --control-database postgres --yes ${AAV_TEST_ARGS:-}
     [ "$status" -eq 0 ]
 }

@@ -8,13 +8,15 @@
               7 privileges, 8 configuration failed (rolled back), 9 restart failed, 10 health check failed.
 .EXAMPLE
   .\adaptive-autovacuum-setup.ps1 check
-  .\adaptive-autovacuum-setup.ps1 install -Database mydb -Credential (Get-Credential postgres) -Yes
+  .\adaptive-autovacuum-setup.ps1 install -Credential (Get-Credential postgres) -Yes          # control database postgres
+  .\adaptive-autovacuum-setup.ps1 install -ControlDatabase app -Credential (Get-Credential postgres)
   .\adaptive-autovacuum-setup.ps1 doctor -Format json
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)][ValidateSet('check', 'install', 'doctor', 'enable', 'disable', 'remove-preload', 'remove-files', 'version', 'help')][string]$Command = 'help',
     [string]$SourceDir,
+    [string]$ControlDatabase,
     [string[]]$Database = @(),
     [switch]$AllDatabases,
     [switch]$SkipCreateExtension,
@@ -45,7 +47,7 @@ if ($Command -eq 'version') { Write-Output $SetupVersion; exit 0 }
 if ($PgPassFile -and -not (Test-Path $PgPassFile)) { Write-Error "-PgPassFile not found: $PgPassFile"; exit 2 }
 
 $P = @{
-    SourceDir = $SourceDir; Database = $Database; AllDatabases = [bool]$AllDatabases; SkipCreateExtension = [bool]$SkipCreateExtension
+    SourceDir = $SourceDir; ControlDatabase = $ControlDatabase; Database = $Database; AllDatabases = [bool]$AllDatabases; SkipCreateExtension = [bool]$SkipCreateExtension
     NoEnable = [bool]$NoEnable; NoRestart = [bool]$NoRestart; Yes = [bool]$Yes; DryRun = [bool]$DryRun; PgMajor = $PgMajor
     PgRoot = $PgRoot; ServiceName = $ServiceName; DataDirectory = $DataDirectory; Port = $Port; DbUser = $DbUser
     Credential = $Credential; PgPassFile = $PgPassFile; StartupWait = $StartupWait; RestartTimeout = $RestartTimeout

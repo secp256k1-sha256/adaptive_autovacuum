@@ -5,7 +5,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:SetupVersion = '1.1.0'
+$script:SetupVersion = '1.2.0'
 $script:ExtName = 'adaptive_autovacuum'
 $script:SupportedMajors = @(17, 18)
 if ($env:AAV_SUPPORTED_MAJORS) { $script:SupportedMajors = @($env:AAV_SUPPORTED_MAJORS -split '[ ,]+' | ForEach-Object { [int]$_ }) }
@@ -534,8 +534,8 @@ function Get-AavDoctor($Candidate, [string]$Database) {
     try { $out = Invoke-AavPsql -Candidate $Candidate -Database $Database -Sql "SELECT check_name, status, detail, coalesce(remediation, '') FROM $($script:ExtName).doctor()" }
     catch {
         $ver = Get-AavExtensionVersion $Candidate $Database
-        return @([pscustomobject]@{ check_name = 'doctor_api'; status = 'WARN'; detail = "installed extension $ver in $Database has no doctor() (pre-1.1.0 objects); health cannot be evaluated here"
-                                    remediation = "ALTER EXTENSION $($script:ExtName) UPDATE;  (development snapshots older than 1.0.0 need DROP EXTENSION + CREATE EXTENSION)" })
+        return @([pscustomobject]@{ check_name = 'doctor_api'; status = 'WARN'; detail = "installed extension $ver in $Database is older than 1.2.0; health cannot be evaluated here"
+                                    remediation = "rerun adaptive-autovacuum-setup.ps1 install, which re-creates the extension (no upgrade script)" })
     }
     $rows = @()
     foreach ($line in ($out -split "`r?`n")) { if (-not $line) { continue }; $f = $line.Split($script:US); $rows += [pscustomobject]@{ check_name = $f[0]; status = $f[1]; detail = $f[2]; remediation = $f[3] } }
@@ -615,29 +615,41 @@ function Invoke-AavInstall {
         $preloadFile = Invoke-AavPsql -Candidate $sel -Sql "SELECT coalesce((SELECT setting FROM pg_file_settings WHERE name = 'shared_preload_libraries' ORDER BY seqno DESC LIMIT 1), '')"
         if ($preloadChange -and (Test-AavPreloadLists $preloadFile)) { $preloadChange = $false; $preloadPending = $true }
 
-        $dbs = @()
+        # The control database: the one place the extension is created; every other database is managed from it.
+        $dbs = @(); $duplicates = @(); $controlChange = $false
+        if ($P.AllDatabases) { Stop-Aav $script:ExitCodes.Args '-AllDatabases was removed: the extension is created once, in the control database, and manages every database from there (see -ControlDatabase)' }
+        $controlNow = Invoke-AavPsql -Candidate $sel -Sql "SELECT coalesce(nullif(current_setting('adaptive_autovacuum.control_database', true), ''), 'postgres')"
+        $controlDb = $controlNow
+        if ($P.ControlDatabase) { $controlDb = $P.ControlDatabase }
+        elseif ($P.Database -and $P.Database.Count -gt 0) {
+            if ($P.Database.Count -gt 1) { Stop-Aav $script:ExitCodes.Args "one control database per cluster: -Database was given $($P.Database.Count) names" }
+            $controlDb = $P.Database[0]
+        }
         if (-not $P.SkipCreateExtension -and -not $sel.in_recovery) {
             $all = Get-AavDatabases $sel
-            if ($P.AllDatabases) { $dbs = $all }
-            elseif ($P.Database -and $P.Database.Count -gt 0) {
-                foreach ($d in $P.Database) {
-                    if ($d -notin $all) { Stop-Aav $script:ExitCodes.Args "database '$d' does not exist or does not allow connections" }
-                    if ($d -in @('template0', 'template1')) { Stop-Aav $script:ExitCodes.Args "refusing to create the extension in $d" }
-                    $dbs += $d
-                }
-            } elseif ((Test-AavInteractive) -and -not $P.Yes) {
-                Write-AavLine 'Databases that can be managed (the extension is created per database):'
-                for ($i = 0; $i -lt $all.Count; $i++) { Write-AavLine ("  {0}) {1}" -f ($i + 1), $all[$i]) }
-                $pick = Read-Host 'Database numbers (space separated, empty = postgres)'
-                if ([string]::IsNullOrWhiteSpace($pick)) { $dbs = @('postgres') } else { foreach ($n in ($pick -split '\s+')) { if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $all.Count) { $dbs += $all[[int]$n - 1] } else { Stop-Aav $script:ExitCodes.Args "bad selection: $n" } } }
-            } else { Stop-Aav $script:ExitCodes.Args 'no activation target: pass -Database NAME (repeatable), -AllDatabases, or -SkipCreateExtension' }
+            if (-not $P.ControlDatabase -and -not ($P.Database -and $P.Database.Count -gt 0) -and (Test-AavInteractive) -and -not $P.Yes) {
+                Write-AavLine 'The extension is created once, in the control database; every other database is managed from there.'
+                $pick = Read-Host "Control database (empty = $controlDb)"
+                if (-not [string]::IsNullOrWhiteSpace($pick)) { $controlDb = $pick.Trim() }
+            }
+            if ($controlDb -notin $all) { Stop-Aav $script:ExitCodes.Args "control database '$controlDb' does not exist or does not allow connections" }
+            if ($controlDb -in @('template0', 'template1')) { Stop-Aav $script:ExitCodes.Args "refusing to use $controlDb as the control database" }
+            $dbs = @($controlDb)
+            # Copies of the extension outside the control database are ignored by the controller.
+            foreach ($d in $all) { if ($d -ne $controlDb -and (Test-AavExtensionPresent $sel $d)) { $duplicates += $d } }
+            $controlChange = ($controlDb -ne $controlNow)
         }
-        $planAct = @()
+        $planAct = @(); $recreate = @{}
         foreach ($d in $dbs) {
             $cur = Get-AavExtensionVersion $sel $d
             if (-not $cur) { $planAct += "${d}: CREATE EXTENSION $($script:ExtName) (version $extVersion)" }
             elseif ($cur -eq $extVersion) { $planAct += "${d}: already at $extVersion" }
-            elseif ((Compare-AavVersion $cur $extVersion) -lt 0) { $planAct += "${d}: ALTER EXTENSION $($script:ExtName) UPDATE ($cur -> $extVersion)" }
+            elseif ((Compare-AavVersion $cur $extVersion) -lt 0) {
+                $upgradeScript = Join-Path $sel.sharedir "extension\$($script:ExtName)--$cur--$extVersion.sql"
+                if ($pkgManifest -and -not (Test-Path $upgradeScript)) { $upgradeScript = $null; if ($pkgManifest.files | Where-Object { $_.path -match "--$([regex]::Escape($cur))--$([regex]::Escape($extVersion))\.sql$" }) { $upgradeScript = 'in package' } }
+                if ($upgradeScript -and ($upgradeScript -eq 'in package' -or (Test-Path $upgradeScript))) { $planAct += "${d}: ALTER EXTENSION $($script:ExtName) UPDATE ($cur -> $extVersion)" }
+                else { $planAct += "${d}: DROP EXTENSION + CREATE EXTENSION $($script:ExtName) ($cur -> ${extVersion}: no upgrade script; the old policy and history in this database are deleted)"; $recreate[$d] = $true }
+            }
             else { Stop-Aav $script:ExitCodes.ConfigFailed "database $d has $($script:ExtName) $cur, newer than the package ($extVersion); refusing to downgrade" }
         }
         $filesChange = $false
@@ -658,7 +670,9 @@ function Invoke-AavInstall {
         Write-AavLine ("  Extension files:  {0}" -f $(if ($pkgManifest) { "install $extVersion from package" + $(if ($filesChange) { '' } else { ' (already identical)' }) } else { "already installed ($extVersion)" }))
         Write-AavLine ("  Preload change:   {0}" -f $(if ($preloadChange) { "'$preloadNow' -> '$(Get-AavPreloadAppend $preloadNow)'" } elseif ($preloadPending) { "none (already '$preloadFile' in the configuration file; restart pending)" } else { "none ($($script:ExtName) already listed)" }))
         Write-AavLine ("  Restart:          {0}" -f $(if ($restartNeeded) { if ($P.NoRestart) { 'required, deferred (-NoRestart)' } else { "yes ($($sel.service_name))" } } else { 'not needed' }))
-        if ($planAct.Count) { foreach ($a in $planAct) { Write-AavLine "  Database:         $a" } } else { Write-AavLine '  Database:         none (skipped)' }
+        if ($planAct.Count) { foreach ($a in $planAct) { Write-AavLine "  Control database: $a" } } else { Write-AavLine '  Control database: none (skipped)' }
+        if ($controlChange) { Write-AavLine "  Control setting:  adaptive_autovacuum.control_database '$controlNow' -> '$controlDb'" }
+        if ($duplicates.Count) { Write-AavWarn "  Ignored copies:   the extension also exists in $($duplicates -join ', '); those copies are not the control database and are ignored (DROP EXTENSION $($script:ExtName) there)" }
         Write-AavLine ("  Enable controller: {0}" -f $(if ($P.NoEnable) { 'no' } else { 'yes (adaptive_autovacuum.enabled = on' + $(if ($sel.sql_major -ge 18) { ', track_cost_delay_timing = on' } else { '' }) + ')' }))
         if ($sel.in_recovery) { Write-AavWarn '  standby server: preload only; extension objects are created on the primary' }
         Write-AavLine ''
@@ -717,12 +731,22 @@ function Invoke-AavInstall {
             }
         }
 
-        # ---- 4. activation ----
+        # ---- 3b. control database setting ----
+        if ($controlChange -and -not $P.SkipCreateExtension -and -not $sel.in_recovery) {
+            Set-AavJournal 'control_database_before' $controlNow
+            $script:Journal.mutated = $true
+            Invoke-AavPsql -Candidate $sel -Sql "ALTER SYSTEM SET adaptive_autovacuum.control_database = '$controlDb';" | Out-Null
+            Invoke-AavPsql -Candidate $sel -Sql 'SELECT pg_reload_conf()' | Out-Null
+            Add-AavJournalStep 'control_database' 'done' $controlDb; Write-AavOk "control database set to $controlDb (adaptive_autovacuum.control_database)"
+        }
+
+        # ---- 4. activation (control database only) ----
         $actFailed = $false
         foreach ($d in $dbs) {
             $cur = Get-AavExtensionVersion $sel $d
             try {
                 if (-not $cur) { Invoke-AavPsql -Candidate $sel -Database $d -Sql "CREATE EXTENSION $($script:ExtName);" | Out-Null; Write-AavOk "extension created in $d ($extVersion)"; Add-AavJournalStep "create:$d" 'done' }
+                elseif ($cur -ne $extVersion -and $recreate[$d]) { Invoke-AavPsql -Candidate $sel -Database $d -Sql "DROP EXTENSION $($script:ExtName); CREATE EXTENSION $($script:ExtName);" | Out-Null; Write-AavOk "extension re-created in $d ($cur -> $extVersion; no upgrade script, previous policy and history deleted)"; Add-AavJournalStep "recreate:$d" 'done' }
                 elseif ($cur -ne $extVersion) { Invoke-AavPsql -Candidate $sel -Database $d -Sql "ALTER EXTENSION $($script:ExtName) UPDATE;" | Out-Null; Write-AavOk "extension updated in $d ($cur -> $extVersion); policy and history preserved"; Add-AavJournalStep "update:$d" 'done' }
                 else { Write-AavOk "extension already at $extVersion in $d" }
             } catch { Write-AavFail "activation failed in ${d}: $($_.Exception.Message)"; Add-AavJournalStep "activate:$d" 'failed' $_.Exception.Message; $actFailed = $true }
@@ -744,14 +768,14 @@ function Invoke-AavInstall {
         if ((Test-Path $dll) -and (Test-Path $ctl) -and (Test-Path $sqlf)) { Write-AavOk "extension files installed ($dll, $ctl, $(Split-Path $sqlf -Leaf))" } else { Write-AavFail 'extension files incomplete'; $failures = $true }
         if ($dbs.Count) {
             $deadline = (Get-Date).AddSeconds($P.StartupWait)
-            while ((Get-Date) -lt $deadline) { try { if ((Invoke-AavPsql -Candidate $sel -Database $dbs[0] -Sql "SELECT launcher_running FROM $($script:ExtName).status()") -eq 't') { break } } catch { }; Start-Sleep -Seconds 2 }
+            while ((Get-Date) -lt $deadline) { try { if ((Invoke-AavPsql -Candidate $sel -Database $dbs[0] -Sql "SELECT controller_running FROM $($script:ExtName).status()") -eq 't') { break } } catch { }; Start-Sleep -Seconds 2 }
             foreach ($d in $dbs) { if (Test-AavExtensionPresent $sel $d) { if (-not (Write-AavDoctor $sel $d)) { $failures = $true } } }
         }
         if (-not $failures) {
             Complete-AavJournal 'completed'
             Write-AavLine ''; Write-AavLine 'Installation complete.'; Write-AavLine ''
             Write-AavLine "Diagnose:      adaptive-autovacuum-setup.ps1 doctor"
-            Write-AavLine "SQL status:    SELECT * FROM adaptive_autovacuum.doctor();"
+            Write-AavLine "SQL status:    SELECT * FROM adaptive_autovacuum.doctor();   (in the control database)"
             Write-AavLine "Disable:       adaptive-autovacuum-setup.ps1 disable    (controller off, nothing removed)"
             Write-AavLine "Remove preload: adaptive-autovacuum-setup.ps1 remove-preload"
             return 0
@@ -767,26 +791,31 @@ function Invoke-AavDoctor {
     $rc = 0
     $dll = Join-Path $sel.pkglibdir "$($script:ExtName).dll"; $ctl = Join-Path $sel.sharedir "extension\$($script:ExtName).control"
     $ver = Get-AavInstalledDefaultVersion $sel
-    $dbs = @(); if ($sel.connection_verified) { $dbs = Get-AavDatabases $sel }
+    # Health lives in the control database; copies elsewhere are reported, not checked.
+    $dbs = @(); $controlDb = 'postgres'; $inControl = $false; $dups = @()
+    if ($sel.connection_verified) {
+        $dbs = Get-AavDatabases $sel
+        $controlDb = Invoke-AavPsql -Candidate $sel -Sql "SELECT coalesce(nullif(current_setting('adaptive_autovacuum.control_database', true), ''), 'postgres')"
+        foreach ($d in $dbs) { if (Test-AavExtensionPresent $sel $d) { if ($d -eq $controlDb) { $inControl = $true } else { $dups += $d } } }
+    }
     if ($P.Json) {
         $dbjson = @()
-        foreach ($d in $dbs) {
-            if (-not (Test-AavExtensionPresent $sel $d)) { continue }
-            $checks = Get-AavDoctor $sel $d
-            $st = $null; try { $st = Invoke-AavPsql -Candidate $sel -Database $d -Sql "SELECT row_to_json(s) FROM $($script:ExtName).status() s" | ConvertFrom-Json } catch { }
-            $dbjson += [ordered]@{ database = $d; status = $st; checks = $checks }
+        if ($inControl) {
+            $checks = Get-AavDoctor $sel $controlDb
+            $st = $null; try { $st = Invoke-AavPsql -Candidate $sel -Database $controlDb -Sql "SELECT row_to_json(s) FROM $($script:ExtName).status() s" | ConvertFrom-Json } catch { }
+            $dbjson += [ordered]@{ database = $controlDb; status = $st; checks = $checks }
             if ($checks | Where-Object { $_.status -in @('FAIL', 'RESTART_REQUIRED') }) { $rc = $script:ExitCodes.Health }
-        }
+        } else { $rc = $script:ExitCodes.Health }
         $last = $null; if (Test-Path $script:StateFile) { $j = Get-Content -Raw $script:StateFile | ConvertFrom-Json; $last = [ordered]@{ run_id = (Get-AavProp $j 'run_id'); final_state = (Get-AavProp $j 'final_state'); finished_at = (Get-AavProp $j 'finished_at'); installer_version = (Get-AavProp $j 'installer_version') } }
-        Write-Output ([ordered]@{ helper_version = $script:SetupVersion; cluster = $sel; files = [ordered]@{ library_present = (Test-Path $dll); control_present = (Test-Path $ctl); default_version = $ver }; databases = $dbjson; last_run = $last } | ConvertTo-Json -Depth 8)
+        Write-Output ([ordered]@{ helper_version = $script:SetupVersion; cluster = $sel; files = [ordered]@{ library_present = (Test-Path $dll); control_present = (Test-Path $ctl); default_version = $ver }; control_database = $controlDb; duplicate_installations = $dups; databases = $dbjson; last_run = $last } | ConvertTo-Json -Depth 8)
         return $rc
     }
     Write-AavLine "adaptive-autovacuum-setup $($script:SetupVersion) doctor"; Write-AavSelected $sel
     if ((Test-Path $dll) -and (Test-Path $ctl)) { Write-AavOk "extension files installed ($dll, $ctl, default_version $ver)" } else { Write-AavFail "extension files incomplete under $($sel.pkglibdir) / $($sel.sharedir)\extension"; $rc = $script:ExitCodes.Health }
     if (-not $sel.connection_verified) { Stop-Aav $script:ExitCodes.Privilege 'no database connection; pass -Credential or -PgPassFile' }
-    $any = $false
-    foreach ($d in $dbs) { if (Test-AavExtensionPresent $sel $d) { $any = $true; if (-not (Write-AavDoctor $sel $d)) { $rc = $script:ExitCodes.Health } } }
-    if (-not $any) { Write-AavWarn 'the extension is not created in any database; run: adaptive-autovacuum-setup.ps1 install -Database NAME'; $rc = $script:ExitCodes.Health }
+    if ($inControl) { if (-not (Write-AavDoctor $sel $controlDb)) { $rc = $script:ExitCodes.Health } }
+    else { Write-AavWarn "the extension is not created in the control database $controlDb; run: adaptive-autovacuum-setup.ps1 install"; $rc = $script:ExitCodes.Health }
+    if ($dups.Count) { Write-AavWarn "the extension also exists in $($dups -join ', '); those copies are ignored (one control plane per cluster), drop them with DROP EXTENSION $($script:ExtName)" }
     if (Test-Path $script:StateFile) { $j = Get-Content -Raw $script:StateFile | ConvertFrom-Json; Write-AavLine "Last installer run: $(Get-AavProp $j 'run_id') $(Get-AavProp $j 'final_state')" }
     return $rc
 }

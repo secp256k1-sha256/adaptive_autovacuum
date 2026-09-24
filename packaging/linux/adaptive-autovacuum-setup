@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SETUP_VERSION="1.1.0"
+readonly SETUP_VERSION="1.2.0"
 readonly EXT_NAME="adaptive_autovacuum"
 readonly STATE_DIR="${AAV_STATE_DIR:-/var/lib/adaptive-autovacuum}"
 readonly STATE_FILE="$STATE_DIR/installer-state.json"
@@ -22,7 +22,7 @@ readonly EX_OK=0 EX_ARGS=2 EX_NO_PG=3 EX_AMBIGUOUS=4 EX_UNSUPPORTED=5 EX_DOWNLOA
 COMMAND=""
 OPT_PG_MAJOR="" OPT_PG_CONFIG="" OPT_DATA_DIR="" OPT_CLUSTER="" OPT_SERVICE=""
 OPT_PORT="" OPT_HOST="" OPT_DB_USER="" OPT_PGPASSFILE=""
-OPT_DATABASES=() OPT_ALL_DATABASES=0 OPT_SKIP_CREATE=0
+OPT_CONTROL_DB="" OPT_SKIP_CREATE=0
 OPT_YES=0 OPT_NO_RESTART=0 OPT_NO_ENABLE=0 OPT_DRY_RUN=0 OPT_VERBOSE=0
 OPT_FORMAT="text" OPT_JSON=0 OPT_STARTUP_WAIT=90 OPT_RESTART_TIMEOUT=60
 
@@ -51,8 +51,8 @@ Discovery options:
   --pgpassfile PATH   password file for unattended TCP connections
 
 Install options:
-  --database NAME         activation target; repeatable
-  --all-databases         activate in every connectable non-template database
+  --control-database NAME database that holds the extension and manages the cluster (default: postgres)
+  --database NAME         alias of --control-database
   --skip-create-extension install/preload only
   --no-enable             do not set adaptive_autovacuum.enabled = on
   --no-restart            leave the restart pending (state RESTART_REQUIRED)
@@ -91,8 +91,10 @@ parse_args() {
             --host) OPT_HOST=${2:?}; shift 2 ;;
             --db-user) OPT_DB_USER=${2:?}; shift 2 ;;
             --pgpassfile) OPT_PGPASSFILE=${2:?}; shift 2 ;;
-            --database) OPT_DATABASES+=("${2:?}"); shift 2 ;;
-            --all-databases) OPT_ALL_DATABASES=1; shift ;;
+            --control-database|--database)
+                [[ -z $OPT_CONTROL_DB || $OPT_CONTROL_DB == "${2:?}" ]] || die $EX_ARGS "one control database per cluster: got both '$OPT_CONTROL_DB' and '$2'"
+                OPT_CONTROL_DB=${2:?}; shift 2 ;;
+            --all-databases) die $EX_ARGS "--all-databases was removed: the extension is created once, in the control database, and manages every database from there (see --control-database)" ;;
             --skip-create-extension) OPT_SKIP_CREATE=1; shift ;;
             --no-enable) OPT_NO_ENABLE=1; shift ;;
             --no-restart) OPT_NO_RESTART=1; shift ;;
@@ -739,38 +741,38 @@ cmd_install() {
     if [[ $preload_change -eq 1 ]] && preload_lists "$preload_file"; then preload_change=0; preload_pending=1; fi
     local in_recovery; in_recovery=$(sel .in_recovery)
 
-    # Databases to activate.
+    # The control database: the one place the extension is created; every other database is managed from it.
     local -a dbs=()
+    local d control_db control_now duplicates="" control_change=0
+    control_now=$(sql postgres "SELECT coalesce(nullif(current_setting('adaptive_autovacuum.control_database', true), ''), 'postgres')")
+    control_db=${OPT_CONTROL_DB:-$control_now}
     if [[ $OPT_SKIP_CREATE -eq 0 && $in_recovery != true ]]; then
         local dblist; dblist=$(sql postgres "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
-        if [[ $OPT_ALL_DATABASES -eq 1 ]]; then mapfile -t dbs <<<"$dblist"
-        elif [[ ${#OPT_DATABASES[@]} -gt 0 ]]; then
-            local d
-            for d in "${OPT_DATABASES[@]}"; do
-                grep -qxF -- "$d" <<<"$dblist" || die $EX_ARGS "database '$d' does not exist or does not allow connections"
-                [[ $d != template0 && $d != template1 ]] || die $EX_ARGS "refusing to create the extension in $d"
-                dbs+=("$d")
-            done
-        elif is_interactive && [[ $OPT_YES -eq 0 ]]; then
-            say "Databases that can be managed (the extension is created per database):"
-            local -a all=(); mapfile -t all <<<"$dblist"; local i
-            for ((i=0; i<${#all[@]}; i++)); do say "  $((i+1))) ${all[i]}"; done
-            local pick; read -r -p "Database numbers (space separated, empty = postgres): " pick
-            if [[ -z $pick ]]; then dbs=(postgres); else
-                for i in $pick; do [[ $i =~ ^[0-9]+$ && $i -ge 1 && $i -le ${#all[@]} ]] || die $EX_ARGS "bad selection: $i"; dbs+=("${all[i-1]}"); done
-            fi
-        else
-            die $EX_ARGS "no activation target: pass --database NAME (repeatable), --all-databases, or --skip-create-extension"
+        if [[ -z $OPT_CONTROL_DB ]] && is_interactive && [[ $OPT_YES -eq 0 ]]; then
+            say "The extension is created once, in the control database; every other database is managed from there."
+            local pick; read -r -p "Control database (empty = $control_db): " pick
+            [[ -z $pick ]] || control_db=$pick
         fi
+        grep -qxF -- "$control_db" <<<"$dblist" || die $EX_ARGS "control database '$control_db' does not exist or does not allow connections"
+        [[ $control_db != template0 && $control_db != template1 ]] || die $EX_ARGS "refusing to use $control_db as the control database"
+        dbs=("$control_db")
+        # Copies of the extension outside the control database are ignored by the controller.
+        while IFS= read -r d; do
+            [[ -n $d && $d != "$control_db" ]] || continue
+            [[ -n $(sql "$d" "SELECT 1 FROM pg_extension WHERE extname = '$EXT_NAME'" 2>/dev/null) ]] && duplicates+="$d "
+        done <<<"$dblist"
+        [[ $control_db == "$control_now" ]] || control_change=1
     fi
 
-    # Per-database version facts and refusal to downgrade.
-    local d cur planned_act=()
+    # Version facts for the control database; no downgrade; re-create when no upgrade script exists.
+    local cur planned_act=()
     for d in "${dbs[@]}"; do
         cur=$(sql "$d" "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = '$EXT_NAME'), '')")
         if [[ -z $cur ]]; then planned_act+=("$d: CREATE EXTENSION $EXT_NAME (version $ext_version)")
         elif [[ $cur == "$ext_version" ]]; then planned_act+=("$d: already at $ext_version")
-        elif [[ $(printf '%s\n%s\n' "$cur" "$ext_version" | sort -V | head -1) == "$cur" ]]; then planned_act+=("$d: ALTER EXTENSION $EXT_NAME UPDATE ($cur -> $ext_version)")
+        elif [[ $(printf '%s\n%s\n' "$cur" "$ext_version" | sort -V | head -1) == "$cur" ]]; then
+            if [[ -f "$(sel .sharedir)/extension/$EXT_NAME--$cur--$ext_version.sql" ]]; then planned_act+=("$d: ALTER EXTENSION $EXT_NAME UPDATE ($cur -> $ext_version)")
+            else planned_act+=("$d: DROP EXTENSION + CREATE EXTENSION $EXT_NAME ($cur -> $ext_version: no upgrade script; the old policy and history in this database are deleted)"); fi
         else die $EX_CONFIG_FAILED "database $d has $EXT_NAME $cur, newer than the installed files ($ext_version); refusing to downgrade"; fi
     done
 
@@ -790,7 +792,9 @@ cmd_install() {
     elif [[ $preload_pending -eq 1 ]]; then say "  Preload change:   none (already '$preload_file' in the configuration file; restart pending)"
     else say "  Preload change:   none ($EXT_NAME already listed)"; fi
     say "  Restart:          $( [[ $restart_needed -eq 1 ]] && { [[ $OPT_NO_RESTART -eq 1 ]] && echo "required, deferred (--no-restart)" || echo "yes ($(sel .service_name))"; } || echo "not needed" )"
-    if [[ ${#planned_act[@]} -gt 0 ]]; then for d in "${planned_act[@]}"; do say "  Database:         $d"; done; else say "  Database:         none (skipped)"; fi
+    if [[ ${#planned_act[@]} -gt 0 ]]; then for d in "${planned_act[@]}"; do say "  Control database: $d"; done; else say "  Control database: none (skipped)"; fi
+    if [[ $control_change -eq 1 ]]; then say "  Control setting:  adaptive_autovacuum.control_database '$control_now' -> '$control_db'"; fi
+    if [[ -n $duplicates ]]; then warn "  Ignored copies:   the extension also exists in ${duplicates% }; those copies are not the control database and are ignored (DROP EXTENSION $EXT_NAME there)"; fi
     say "  Enable controller: $( [[ $OPT_NO_ENABLE -eq 1 ]] && echo no || echo "yes (adaptive_autovacuum.enabled = on$( [[ $(sel .sql_major) -ge 18 ]] && echo ', track_cost_delay_timing = on'))" )"
     if [[ $in_recovery == true ]]; then warn "  standby server: preload only; extension objects are created on the primary"; fi
     say ""
@@ -860,13 +864,25 @@ cmd_install() {
         fi
     fi
 
-    # ---- 3. activation ----
+    # ---- 2b. control database setting ----
+    if [[ $control_change -eq 1 && $OPT_SKIP_CREATE -eq 0 && $in_recovery != true ]]; then
+        journal_set '.control_database_before = $v' --arg v "$control_now"
+        sql postgres "ALTER SYSTEM SET adaptive_autovacuum.control_database = '$control_db'" >/dev/null || die $EX_CONFIG_FAILED "ALTER SYSTEM SET adaptive_autovacuum.control_database failed"
+        sql postgres "SELECT pg_reload_conf()" >/dev/null
+        journal_step control_database 'done'; ok "control database set to $control_db (adaptive_autovacuum.control_database)"
+    fi
+
+    # ---- 3. activation (control database only) ----
     local act_failed=0
     for d in "${dbs[@]}"; do
         cur=$(sql "$d" "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = '$EXT_NAME'), '')")
         if [[ -z $cur ]]; then
             if sql "$d" "CREATE EXTENSION $EXT_NAME" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension created in $d ($ext_version)"; journal_step "create:$d" 'done'
             else fail "CREATE EXTENSION failed in $d (see $LOG_FILE)"; journal_step "create:$d" failed; act_failed=1; fi
+        elif [[ $cur != "$ext_version" && ! -f "$(sel .sharedir)/extension/$EXT_NAME--$cur--$ext_version.sql" ]]; then
+            if sql "$d" "DROP EXTENSION $EXT_NAME" >/dev/null 2>>"${LOG_FILE:-/dev/null}" && sql "$d" "CREATE EXTENSION $EXT_NAME" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then
+                ok "extension re-created in $d ($cur -> $ext_version; no upgrade script, previous policy and history deleted)"; journal_step "recreate:$d" 'done'
+            else fail "DROP + CREATE EXTENSION failed in $d (see $LOG_FILE)"; journal_step "recreate:$d" failed; act_failed=1; fi
         elif [[ $cur != "$ext_version" ]]; then
             if sql "$d" "ALTER EXTENSION $EXT_NAME UPDATE" >/dev/null 2>>"${LOG_FILE:-/dev/null}"; then ok "extension updated in $d ($cur -> $ext_version); policy and history preserved"; journal_step "update:$d" 'done'
             else fail "ALTER EXTENSION UPDATE failed in $d (see $LOG_FILE)"; journal_step "update:$d" failed; act_failed=1; fi
@@ -896,7 +912,7 @@ cmd_install() {
         # Bounded wait for the launcher after a restart.
         local deadline=$(( $(date +%s) + OPT_STARTUP_WAIT ))
         while (( $(date +%s) < deadline )); do
-            [[ $(sql "${dbs[0]}" "SELECT launcher_running FROM $EXT_NAME.status()" 2>/dev/null) == t ]] && break
+            [[ $(sql "${dbs[0]}" "SELECT controller_running FROM $EXT_NAME.status()" 2>/dev/null) == t ]] && break
             sleep 2
         done
         for d in "${dbs[@]}"; do
@@ -908,7 +924,7 @@ cmd_install() {
         journal_final completed
         say ""; say "Installation complete."
         say ""; say "Diagnose:      sudo adaptive-autovacuum-setup doctor"
-        say "SQL status:    SELECT * FROM adaptive_autovacuum.doctor();"
+        say "SQL status:    SELECT * FROM adaptive_autovacuum.doctor();   (in the control database)"
         say "Disable:       sudo adaptive-autovacuum-setup disable    (controller off, nothing removed)"
         say "Remove preload: sudo adaptive-autovacuum-setup remove-preload"
         exit 0
@@ -931,7 +947,7 @@ print_doctor() {  # db -> 0 when no FAIL rows
     local d=$1 rows rc=0
     if ! rows=$(sql "$d" "SELECT check_name, status, detail, coalesce(remediation, '') FROM $EXT_NAME.doctor()" 2>&1); then
         local ver; ver=$(sql "$d" "SELECT coalesce((SELECT extversion FROM pg_extension WHERE extname = '$EXT_NAME'), '?')" 2>/dev/null || echo '?')
-        warn "database $d: installed extension $ver has no doctor() (pre-1.1.0 objects); run ALTER EXTENSION $EXT_NAME UPDATE (development snapshots need DROP + CREATE EXTENSION)"
+        warn "database $d: installed extension $ver is older than 1.2.0; rerun 'adaptive-autovacuum-setup install', which re-creates the extension (no upgrade script)"
         return 0
     fi
     say "Health of database $d:"
@@ -953,34 +969,40 @@ cmd_doctor() {
     local lib ctl ver=""
     lib="$(sel .pkglibdir)/$EXT_NAME.so"; ctl="$(sel .sharedir)/extension/$EXT_NAME.control"
     [[ -f $ctl ]] && ver=$(installed_default_version)
-    local rc=0 dbs=() d
+    local rc=0 dbs=() d control_db=postgres in_control=0 dups=""
     if [[ $(sel .connection_verified) == true ]]; then
+        control_db=$(sql postgres "SELECT coalesce(nullif(current_setting('adaptive_autovacuum.control_database', true), ''), 'postgres')")
         mapfile -t dbs < <(sql postgres "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname")
     fi
+    # Health lives in the control database; copies elsewhere are reported, not checked.
+    for d in "${dbs[@]}"; do
+        [[ -n $(sql "$d" "SELECT 1 FROM pg_extension WHERE extname = '$EXT_NAME'" 2>/dev/null) ]] || continue
+        if [[ $d == "$control_db" ]]; then in_control=1; else dups+="$d "; fi
+    done
     if [[ $OPT_FORMAT == json ]]; then
         local dbjson='[]' rows
-        for d in "${dbs[@]}"; do
-            [[ -n $(sql "$d" "SELECT 1 FROM pg_extension WHERE extname = '$EXT_NAME'" 2>/dev/null) ]] || continue
+        if [[ $in_control -eq 1 ]]; then
+            d=$control_db
             rows=$(sql "$d" "SELECT coalesce(json_agg(json_build_object('check_name', check_name, 'status', status, 'detail', detail, 'remediation', remediation)), '[]') FROM $EXT_NAME.doctor()" 2>/dev/null || echo '[]')
             local st; st=$(sql "$d" "SELECT row_to_json(s) FROM $EXT_NAME.status() s" 2>/dev/null || echo 'null')
             dbjson=$(jq --arg d "$d" --argjson r "$rows" --argjson s "$st" '. + [{database:$d, status:$s, checks:$r}]' <<<"$dbjson")
             jq -e 'any(.[]; .status == "FAIL" or .status == "RESTART_REQUIRED")' <<<"$rows" >/dev/null && rc=$EX_HEALTH
-        done
-        jq -n --argjson c "$SELECTED" --argjson dbs "$dbjson" --arg v "$SETUP_VERSION" --arg ver "$ver" \
+        else
+            rc=$EX_HEALTH
+        fi
+        jq -n --argjson c "$SELECTED" --argjson dbs "$dbjson" --arg v "$SETUP_VERSION" --arg ver "$ver" --arg cdb "$control_db" \
+              --argjson dups "$(printf '%s\n' $dups | jq -R . | jq -s .)" \
               --argjson lib "$( [[ -f $lib ]] && echo true || echo false )" --argjson ctl "$( [[ -f $ctl ]] && echo true || echo false )" \
               --argjson journal "$( [[ -f $STATE_FILE ]] && jq '{run_id, final_state, finished_at, installer_version}' "$STATE_FILE" || echo null )" \
-              '{helper_version:$v, cluster:$c, files:{library_present:$lib, control_present:$ctl, default_version:$ver}, databases:$dbs, last_run:$journal}'
+              '{helper_version:$v, cluster:$c, files:{library_present:$lib, control_present:$ctl, default_version:$ver}, control_database:$cdb, duplicate_installations:$dups, databases:$dbs, last_run:$journal}'
         exit $rc
     fi
     say "adaptive-autovacuum-setup $SETUP_VERSION doctor"; print_selected
     verify_files || rc=$EX_HEALTH
     [[ $(sel .connection_verified) == true ]] || die $EX_PRIVILEGE "no database connection; pass --db-user/--host/--pgpassfile"
-    local any=0
-    for d in "${dbs[@]}"; do
-        [[ -n $(sql "$d" "SELECT 1 FROM pg_extension WHERE extname = '$EXT_NAME'" 2>/dev/null) ]] || continue
-        any=1; print_doctor "$d" || rc=$EX_HEALTH
-    done
-    [[ $any -eq 1 ]] || { warn "the extension is not created in any database; run: adaptive-autovacuum-setup install --database NAME"; rc=$EX_HEALTH; }
+    if [[ $in_control -eq 1 ]]; then print_doctor "$control_db" || rc=$EX_HEALTH
+    else warn "the extension is not created in the control database $control_db; run: adaptive-autovacuum-setup install"; rc=$EX_HEALTH; fi
+    [[ -z $dups ]] || warn "the extension also exists in ${dups% }; those copies are ignored (one control plane per cluster), drop them with DROP EXTENSION $EXT_NAME"
     if [[ -f $STATE_FILE ]]; then say "Last installer run: $(jq -r '"\(.run_id) \(.final_state)"' "$STATE_FILE")"; fi
     exit $rc
 }
@@ -1017,7 +1039,7 @@ cmd_remove_preload() {
     MUTATED=1
     set_preload_value postgres "$newval" >/dev/null
     journal_step remove-preload 'done' "$newval"; ok "shared_preload_libraries set to '$newval'"
-    warn "extension objects stay in every database; DROP EXTENSION $EXT_NAME is a separate, destructive step (it deletes the policy and history tables)"
+    warn "extension objects stay in the control database; DROP EXTENSION $EXT_NAME is a separate, destructive step (it deletes the policy and history tables)"
     if [[ $OPT_NO_RESTART -eq 1 ]] || ! confirm "Restart $(sel .service_name) now?"; then journal_final restart_required; warn "restart pending"; exit 0; fi
     restart_selected || { journal_final failed; die $EX_RESTART "restart failed; check the service log"; }
     journal_final preload_removed; ok "PostgreSQL restarted without $EXT_NAME"
