@@ -21,8 +21,10 @@ SELECT recommendation_delay_min_ms = 0.5 AS delay_floor_default,
        recommendation_buffer_usage_limit_max_mb = 256 AS buffer_ring_cap_default,
        high_wal_mbps = 0 AS wal_guardrail_off_by_default,
        recommendation_max_vacuum_mbps = 3200 AS throughput_cap_default,
-       cost_raise_min_io_gain_percent = 10 AS io_gain_default,
-       max_backlog_drain_seconds = 180 AS drain_target_default
+       cost_raise_min_activity_gain_percent = 10 AS activity_gain_default,
+       max_backlog_drain_seconds = 180 AS drain_target_default,
+       included_databases IS NULL AS all_databases_included_by_default,
+       excluded_databases = ARRAY[]::text[] AS no_databases_excluded_by_default
 FROM adaptive_autovacuum.policy;
 
 SELECT adaptive_autovacuum.vacuum_cost_ceiling_mbps(200, 2) = 781.25 AS pg_default_ceiling_is_781_mib_s,
@@ -128,10 +130,11 @@ FROM adaptive_autovacuum.changed_tables;
 SELECT count(*) = 0 AS global_apply_queue_empty
 FROM adaptive_autovacuum.global_apply_queue;
 
--- Summary-slot status works with and without preload (capacity 0 = not preloaded).
-SELECT available = (capacity > 0) AND used >= 0 AND NOT overflow
-       AS cluster_summary_status_sane
-FROM adaptive_autovacuum.cluster_summary_status();
+-- Controller status works with and without preload (controller_state names the situation).
+SELECT available IS NOT NULL AND controller_state IS NOT NULL
+       AND (available OR controller_state = 'not preloaded')
+       AS controller_status_sane
+FROM adaptive_autovacuum.controller_status();
 
 -- Size estimate: relpages when known; exact size only for unanalyzed relations with enough tuples.
 SELECT adaptive_autovacuum._relation_bytes(10, 0, 0, 67108864, 8192, 'aav_test'::regclass) = 81920
@@ -148,7 +151,7 @@ SELECT emergency_xid_age = 1000000000
        AS emergency_trigger_defaults
 FROM adaptive_autovacuum.policy;
 
-SELECT count(*) = 1 AND bool_and(last_xid8 IS NULL)
+SELECT count(*) = 1 AND bool_and(last_xid8 IS NULL) AND bool_and(cluster_generation = 0)
        AND bool_and(last_debt_tuples IS NULL AND backlog_free_cycles = 0
                     AND autovacuum_off_cycles = 0 AND baseline_settings = '{}'::jsonb)
        AS controller_state_seeded
@@ -166,10 +169,11 @@ SET enabled = true,
     min_table_bytes = 9223372036854775807;
 
 INSERT INTO adaptive_autovacuum.emergency_queue
-    (relid, relation_name, reason, status, started_at, worker_pid,
+    (database_oid, database_name, relid, relation_name, reason, status, started_at, worker_pid,
      work_mem_mb, cost_limit, cost_delay_ms, lock_timeout_ms)
 VALUES
-    ('aav_test'::regclass, 'public.aav_test', 'regression stale request',
+    ((SELECT oid FROM pg_database WHERE datname = current_database()), current_database(),
+     'aav_test'::regclass, 'public.aav_test', 'regression stale request',
      'running', clock_timestamp() - interval '1 minute', 2147483647,
      128, 1000, 0, 1000);
 
@@ -188,35 +192,58 @@ WHERE relation_name = 'public.aav_test';
 SELECT count(*) = 1 AS recommendation_recorded
 FROM adaptive_autovacuum.global_recommendations;
 
--- table_policy fingerprint: trigger-filled, refreshed on touch, dropped relations cleaned up.
-CREATE TABLE aav_policy_target(id integer);
-INSERT INTO adaptive_autovacuum.table_policy(relid) VALUES ('aav_policy_target'::regclass);
+-- table_policy is keyed by database, schema and relation name and applied by the database program.
+CREATE TABLE aav_policy_target(id integer, payload text);
+INSERT INTO aav_policy_target SELECT g, g::text FROM generate_series(1, 5000) g;
+SELECT pg_stat_force_next_flush();
+VACUUM ANALYZE aav_policy_target;
+UPDATE adaptive_autovacuum.policy SET min_table_bytes = 0;
 
-SELECT schema_name = 'public' AND relation_name = 'aav_policy_target'
-       AS table_policy_identity_filled
-FROM adaptive_autovacuum.table_policy
-WHERE relid = 'aav_policy_target'::regclass;
+SELECT o_eligible >= 1 AS policy_target_eligible_without_override
+FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+
+INSERT INTO adaptive_autovacuum.table_policy(database_name, schema_name, relation_name, enabled)
+VALUES (current_database(), 'public', 'aav_policy_target', false);
+SELECT o_eligible AS aav_eligible_excluded FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0) \gset
 
 ALTER TABLE aav_policy_target RENAME TO aav_policy_renamed;
+SELECT o_eligible = :aav_eligible_excluded + 1 AS renamed_relation_no_longer_matches_policy
+FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
 
-UPDATE adaptive_autovacuum.table_policy
-SET enabled = enabled
-WHERE relid = 'aav_policy_renamed'::regclass;
-
-SELECT relation_name = 'aav_policy_renamed' AS table_policy_readopted
-FROM adaptive_autovacuum.table_policy
-WHERE relid = 'aav_policy_renamed'::regclass;
+UPDATE adaptive_autovacuum.table_policy SET relation_name = 'aav_policy_renamed'
+WHERE database_name = current_database() AND relation_name = 'aav_policy_target';
+SELECT o_eligible = :aav_eligible_excluded AS readopted_policy_applies_again
+FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
 
 DROP TABLE aav_policy_renamed;
-
-DO $$
-BEGIN
-    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
-END
-$$;
-
-SELECT count(*) = 0 AS table_policy_dropped_relation_cleaned
+SELECT count(*) = 1 AS table_policy_row_kept_after_drop
 FROM adaptive_autovacuum.table_policy;
+DELETE FROM adaptive_autovacuum.table_policy;
+UPDATE adaptive_autovacuum.policy SET min_table_bytes = 9223372036854775807;
+
+-- The database program uses no extension objects and never allocates a transaction ID.
+SELECT position('adaptive_autovacuum.' IN regexp_replace(adaptive_autovacuum._database_program(),
+                                                          'adaptive_autovacuum\.worker_(in|out)put', '', 'g')) = 0
+       AS program_uses_no_extension_objects,
+       position('pg_current_xact_id(' IN adaptive_autovacuum._database_program()) = 0
+       AS program_allocates_no_xid,
+       position('$aav_program$' IN adaptive_autovacuum._database_program()) = 0
+       AS program_free_of_quoting_tag;
+SELECT position('pg_current_xact_id(' IN p.prosrc) = 0 AS controller_allocates_no_xid
+FROM pg_proc p WHERE p.oid = 'adaptive_autovacuum._global_controller'::regproc;
+
+-- Discovery: every connectable database is managed unless the policy excludes it.
+SELECT excluded = false AS current_database_managed_by_default
+FROM adaptive_autovacuum._discover_databases() WHERE database_name = current_database();
+UPDATE adaptive_autovacuum.policy SET excluded_databases = ARRAY[current_database()::text];
+SELECT excluded AS current_database_excluded_by_pattern
+FROM adaptive_autovacuum._discover_databases() WHERE database_name = current_database();
+SELECT status = 'excluded' AS excluded_database_marked
+FROM adaptive_autovacuum.database_status WHERE database_name = current_database();
+UPDATE adaptive_autovacuum.policy SET excluded_databases = ARRAY[]::text[];
+SELECT excluded = false AS current_database_managed_again
+FROM adaptive_autovacuum._discover_databases() WHERE database_name = current_database();
+
 
 CREATE TABLE aav_no_stats(id integer, payload text);
 INSERT INTO aav_no_stats SELECT g, g::text FROM generate_series(1, 1000) g;
@@ -293,7 +320,7 @@ FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0,
 
 SELECT recommended_vacuum_scale_factor BETWEEN 0.0099 AND 0.0101
        AND recommended_vacuum_threshold = 500
-       AND reason LIKE '%Cluster-wide evidence: 3 databases%'
+       AND reason LIKE '%Cluster-wide evidence (sweep %): 3 databases%'
        AS cluster_merge_drives_recommendation
 FROM adaptive_autovacuum.latest_global_recommendation;
 
@@ -347,8 +374,8 @@ END
 $$;
 
 SELECT count(*) = 0 AS healthy_relation_has_no_state_row
-FROM adaptive_autovacuum.relation_state
-WHERE relid = 'aav_healthy'::regclass;
+FROM adaptive_autovacuum.table_state
+WHERE relation_oid = 'aav_healthy'::regclass;
 
 SELECT count(*) = 0 AS healthy_relation_has_no_decisions
 FROM adaptive_autovacuum.decisions
@@ -358,8 +385,8 @@ SELECT state LIKE 'backlog_%'
        AND consecutive_overdue = 2
        AND last_action = 'autovacuum_disabled'
        AS overdue_relation_state_row
-FROM adaptive_autovacuum.relation_state
-WHERE relid = 'aav_overdue'::regclass;
+FROM adaptive_autovacuum.table_state
+WHERE relation_oid = 'aav_overdue'::regclass;
 
 SELECT count(*) = 1 AS overdue_episode_logged_once
 FROM adaptive_autovacuum.decisions
@@ -377,8 +404,8 @@ END
 $$;
 
 SELECT count(*) = 0 AS recovered_relation_row_removed
-FROM adaptive_autovacuum.relation_state
-WHERE relid = 'aav_overdue'::regclass;
+FROM adaptive_autovacuum.table_state
+WHERE relation_oid = 'aav_overdue'::regclass;
 
 SELECT count(*) = 2 AS overdue_relation_two_decisions_total
 FROM adaptive_autovacuum.decisions
@@ -395,15 +422,15 @@ SELECT pg_stat_force_next_flush();
 SELECT n_tup_ins = 1 AND n_tup_upd = 1 AND n_tup_del = 1
        AS state_row_written_only_on_transitions
 FROM pg_stat_all_tables
-WHERE relid = 'adaptive_autovacuum.relation_state'::regclass;
+WHERE relid = 'adaptive_autovacuum.table_state'::regclass;
 
 -- Debt trend: a synthetic previous sample makes the same backlog read as growing, then shrinking.
 DELETE FROM aav_overdue WHERE id > 100;
 SELECT pg_stat_force_next_flush();
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -418,10 +445,10 @@ SELECT backlog_trend = 'growing'
        AS growing_debt_raises_cost_limit
 FROM adaptive_autovacuum.latest_global_recommendation;
 
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = last_debt_tuples * 100,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = debt_tuples * 100, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -436,10 +463,10 @@ SELECT backlog_trend = 'shrinking'
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- Shrinking 10% per 60 s check projects a 600 s drain, above the 180 s target: keep raising.
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = round(last_debt_tuples * 1.1),
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = round(debt_tuples * 1.1), debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -457,10 +484,10 @@ SELECT current_setting('vacuum_cost_limit')::integer AS aav_limit \gset
 SELECT setting::double precision AS aav_delay FROM pg_settings
 WHERE name = 'autovacuum_vacuum_cost_delay' \gset
 UPDATE adaptive_autovacuum.policy SET recommendation_max_vacuum_mbps = 1600;
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -476,10 +503,10 @@ SELECT backlog_trend = 'growing'
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 UPDATE adaptive_autovacuum.policy SET recommendation_max_vacuum_mbps = 780;
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -498,15 +525,16 @@ INSERT INTO adaptive_autovacuum.global_apply_queue
     (guc_name, desired_value, status, requested_at, applied_at)
 VALUES ('autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit'), 'applied',
         clock_timestamp() - interval '120 seconds', clock_timestamp() - interval '119 seconds');
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL,
-    last_vacuum_io_bytes = 0,
+SET     last_vacuum_activity_units = 0,
     last_cost_raise_at = clock_timestamp() - interval '120 seconds',
     last_raise_cost_limit = :aav_limit,
     last_raise_cost_delay = :aav_delay,
-    io_rate_before_raise = 1e15;
+    activity_before_raise = 1e15;
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -515,17 +543,18 @@ $$;
 
 SELECT recommended_cost_limit = :aav_limit
        AND recommended_cost_delay_ms = :aav_delay
-       AND autovacuum_io_mbps IS NOT NULL
-       AND reason LIKE '%did not increase observed autovacuum throughput%holding%'
-       AS no_io_gain_holds_cost_raise
+       AND vacuum_activity_rate IS NOT NULL
+       AND reason LIKE '%did not produce a meaningful increase in autovacuum activity%holding%'
+       AS no_activity_gain_holds_cost_raise
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- A raise younger than the previous sample has not been observed over a full interval yet.
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL,
-    last_cost_raise_at = clock_timestamp() - interval '30 seconds';
+SET     last_cost_raise_at = clock_timestamp() - interval '30 seconds';
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -542,13 +571,14 @@ INSERT INTO adaptive_autovacuum.global_apply_queue
     (guc_name, desired_value, status, requested_at, applied_at)
 VALUES ('autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit'), 'applied',
         clock_timestamp() - interval '59.5 seconds', clock_timestamp() - interval '59 seconds');
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL,
-    last_vacuum_io_bytes = 0,
+SET     last_vacuum_activity_units = 0,
     last_cost_raise_at = clock_timestamp() - interval '59.5 seconds',
-    io_rate_before_raise = 1e15;
+    activity_before_raise = 1e15;
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -556,18 +586,19 @@ END
 $$;
 
 SELECT recommended_cost_limit = :aav_limit
-       AND reason LIKE '%did not increase observed autovacuum throughput%'
+       AND reason LIKE '%did not produce a meaningful increase in autovacuum activity%'
        AS raise_early_in_interval_is_judged
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- A -1 MB seed guarantees a measured rate above a zero pre-raise rate: the raise is allowed.
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL,
-    last_vacuum_io_bytes = -1048576,
+SET     last_vacuum_activity_units = -1000000,
     last_cost_raise_at = clock_timestamp() - interval '120 seconds',
-    io_rate_before_raise = 0;
+    activity_before_raise = 0;
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -575,17 +606,18 @@ END
 $$;
 
 SELECT recommended_cost_limit = 2 * :aav_limit
-       AND autovacuum_io_mbps > 0
-       AS observed_io_gain_allows_raise
+       AND vacuum_activity_rate > 0
+       AS observed_activity_gain_allows_raise
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- A record that no longer matches the live settings (operator change, failed apply) is ignored.
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL,
-    last_raise_cost_limit = 12345,
-    io_rate_before_raise = 1e15;
+SET     last_raise_cost_limit = 12345,
+    activity_before_raise = 1e15;
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -631,7 +663,7 @@ SELECT backlog_free_cycles = 0 AS decay_step_resets_counter
 FROM adaptive_autovacuum.controller_state;
 
 SELECT last_cost_raise_at IS NULL AND last_raise_cost_limit IS NULL
-       AND io_rate_before_raise IS NULL
+       AND activity_before_raise IS NULL
        AS backlog_free_check_clears_raise_record
 FROM adaptive_autovacuum.controller_state;
 
@@ -660,10 +692,10 @@ $$;
 SELECT pg_stat_force_next_flush();
 SELECT setting::integer AS aav_workers FROM pg_settings WHERE name = 'autovacuum_max_workers' \gset
 
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -679,10 +711,10 @@ SELECT overdue_relations >= 8
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- Host pressure (load 10 on 1 CPU) still blocks the raise.
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(10, 1, 0, 0);
@@ -699,10 +731,10 @@ SELECT 3 * 1024 * CASE WHEN a.setting::integer < 0 THEN m.setting::bigint ELSE a
        AS aav_mem
 FROM pg_settings a, pg_settings m
 WHERE a.name = 'autovacuum_work_mem' AND m.name = 'maintenance_work_mem' \gset
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 SELECT o_overdue >= 8 AS memory_capped_cycle_ran
 FROM adaptive_autovacuum._run_cycle(0, 1, :aav_mem, :aav_mem);
 
@@ -712,10 +744,10 @@ FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- recommendation_workers_max stays a hard ceiling.
 UPDATE adaptive_autovacuum.policy SET recommendation_workers_max = :aav_workers + 1;
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = 0,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -728,10 +760,10 @@ FROM adaptive_autovacuum.latest_global_recommendation;
 UPDATE adaptive_autovacuum.policy SET recommendation_workers_max = 16;
 
 -- A shrinking backlog holds the pool even under queue pressure.
-UPDATE adaptive_autovacuum.controller_state
-SET last_sample_at = clock_timestamp() - interval '60 seconds',
-    last_debt_tuples = last_debt_tuples * 100,
-    debt_velocity = NULL;
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = debt_tuples * 100, debt_velocity = NULL
+WHERE database_name = current_database();
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -752,27 +784,47 @@ SELECT bool_and(relpersistence = 'p') AS control_tables_logged
 FROM pg_class
 WHERE oid IN ('adaptive_autovacuum.policy'::regclass,
               'adaptive_autovacuum.table_policy'::regclass,
-              'adaptive_autovacuum.relation_state'::regclass,
+              'adaptive_autovacuum.table_state'::regclass,
+              'adaptive_autovacuum.database_state'::regclass,
               'adaptive_autovacuum.global_apply_queue'::regclass,
               'adaptive_autovacuum.emergency_queue'::regclass,
               'adaptive_autovacuum.controller_state'::regclass);
 
-/* 1.1.0 operator API: fixed check set, valid vocabulary, preload check agrees with shared memory. */
-SELECT count(*) = 15 AS doctor_check_count,
+/* Operator API: fixed check set, valid vocabulary, preload check agrees with shared memory. */
+SELECT count(*) = 18 AS doctor_check_count,
        bool_and(status IN ('OK', 'WARN', 'FAIL', 'RESTART_REQUIRED')) AS doctor_statuses_valid,
        bool_and(detail IS NOT NULL) AS doctor_details_present
 FROM adaptive_autovacuum.doctor();
 
 SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'library_preloaded')
-       = CASE WHEN (SELECT available FROM adaptive_autovacuum.cluster_summary_status())
+       = CASE WHEN (SELECT available FROM adaptive_autovacuum.controller_status())
               THEN 'OK' ELSE 'FAIL' END AS preload_check_matches_shared_memory;
 
-SELECT extension_version = '1.1.0' AS status_version,
-       available_version = '1.1.0' AS status_available_version,
-       library_preloaded = (SELECT available FROM adaptive_autovacuum.cluster_summary_status()) AS status_preload_matches,
+SELECT extension_version = '1.2.0' AS status_version,
+       available_version = '1.2.0' AS status_available_version,
+       library_preloaded = (SELECT available FROM adaptive_autovacuum.controller_status()) AS status_preload_matches,
        launcher_running IS NOT NULL AS status_launcher_known,
+       controller_running IS NOT NULL AS status_controller_known,
+       control_database = 'postgres' AS status_default_control_database,
+       NOT is_control_database AS regression_database_is_not_the_control_database,
+       cluster_generation > 0 AS status_generation_counts,
+       managed_databases >= 1 AS status_sees_managed_databases,
        wraparound_status IN ('ok', 'watch', 'alarm') AS status_wraparound_known
 FROM adaptive_autovacuum.status();
+
+-- Cluster-first observability: the current database has a row, actions has the applied table changes.
+SELECT status IN ('healthy', 'backlog', 'emergency') AND scan_generation IS NOT NULL
+       AND table_count >= 1 AND NOT stale
+       AS database_status_row_for_current_database
+FROM adaptive_autovacuum.database_status
+WHERE database_name = current_database();
+
+SELECT count(*) >= 1 AS actions_view_lists_table_actions
+FROM adaptive_autovacuum.actions
+WHERE action_scope = 'table' AND database_name = current_database() AND status = 'applied';
+
+SELECT count(*) <= 10 AS aging_tables_is_top_ten
+FROM adaptive_autovacuum.aging_tables;
 
 SELECT adaptive_autovacuum._preload_lists_library('pg_stat_statements, "$libdir/adaptive_autovacuum"') AS preload_parse_quoted_libdir,
        adaptive_autovacuum._preload_lists_library('adaptive_autovacuum.so') AS preload_parse_suffix,

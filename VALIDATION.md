@@ -1048,3 +1048,71 @@ x86_64/amd64 and 24.04 job (`include` entries without a matrix key overwrite eac
 
 Beta exit criteria (unchanged): 30 days on at least two external clusters with the controller active and no unexplained cluster
 changes or failed applies, one field upgrade through `ALTER EXTENSION UPDATE`, CI green on every platform.
+
+## Validation performed 2026-09-24 (cluster-global redesign, SQL 1.2.0, working tree)
+
+Scope: the review's cluster-global redesign (one control plane per cluster) plus its four targeted fixes (no
+`pg_current_xact_id()` for XID velocity; cost-weighted `vacuum_activity_rate` instead of a buffer-hit MB/s figure;
+corrected `global_recommendations` comment; compiled `enabled` default already on). Version 1.2.0 has no upgrade path
+from 1.1.0 (beta): the 1.0.0/1.1.0 scripts and the `upgrade` regression test were removed.
+
+Regression (`test/sql/adaptive_autovacuum.sql`, 40 assertions rewritten or added: name-keyed `table_policy` applied by the
+database program, discovery include/exclude, program hygiene - no extension objects, no XID allocation, no quoting tag -
+`database_status`, `actions`, `aging_tables`, cluster-first `status()`, 18 `doctor()` checks): green on WSL AlmaLinux 9
+PG 17.11 and PG 18.6 (pass 1 on-demand load, pass 2 preloaded with the controller off) and on Windows 11 PG 18.4 (MSVC DLL,
+both passes). The result file is identical across the two majors and the two passes.
+
+Live cluster drill (WSL PG 18.6, `naptime_seconds = 5`, control database `postgres`, three tenant databases without the
+extension): the launcher (no database connection) started the controller, which logged "extension objects are missing"
+until `CREATE EXTENSION` ran in `postgres`, then discovered all four databases and completed sweeps 1-4 with 4/4 databases
+each (`controller_status()`: `running|4|4|4|4|0`). A 200 K-row table with `autovacuum_enabled = false` and 99.5 % dead rows
+in `tenant_002` appeared in the central `table_state` as `backlog_critical` / `autovacuum_disabled`; a never-analyzed table in
+`app` received `set_reloptions` (insert threshold/scale) and `analyze`, both executed by the worker connected to `app`,
+while `pg_namespace` in the tenants stayed free of extension objects. The controller alone queued and applied the cluster
+settings in sweep 1 (`autovacuum_vacuum_cost_limit -1 -> 400`, `_cost_delay 2 -> 1`, `_max_threshold -> 5000`), then held
+with the new activity-based reason ("did not produce a meaningful increase in autovacuum activity ... the extra budget is
+not being used yet"). A hand-queued `emergency_queue` row for the tenant table was claimed by the controller, run by an
+emergency worker connected to `tenant_002` (worker PID recorded), and finished `completed` with `age(relfrozenxid) = 10`.
+`CREATE EXTENSION` in `tenant_001` raised the install-time WARNING, `doctor()` there reported `control_database FAIL`, the
+control database reported `duplicate_installations WARN`, and the controller logged the duplicate once per sweep.
+`excluded_databases = ARRAY['tenant_00%']` marked both tenants `excluded` and dropped the sweep to two databases. Pointing
+`adaptive_autovacuum.control_database` at a nonexistent database and terminating the controller left the launcher in
+"waiting for control database" with a backoff WARNING and no controller; resetting the GUC brought the controller back
+(`running`, generation continued at 10). `DROP DATABASE app` removed its `database_state` row on the next sweep. No
+unexpected ERROR/WARNING lines; `pg_stat_tmp/adaptive_autovacuum/` held only `program.sql` afterwards (per-database
+handoff files are removed after absorption).
+
+Windows live check (EDB PG 18.4 scratch cluster, preloaded, `enabled = on`): identical start-up sequence, three databases
+per sweep in 0.7-0.8 s, `analyze` applied in a tenant database, `doctor()` clean apart from `track_cost_delay_timing`.
+
+Drill-script lessons (not product defects): `psql -c` with several statements runs them in one implicit transaction, so
+`VACUUM` and `ALTER SYSTEM` must be issued as separate `-c` calls; the extension itself uses the server's `vacuum()` and
+`AlterSystemSetConfigFile()` entry points and is unaffected.
+
+Not yet covered: a sustained multi-tenant soak (hundreds of databases) and the emergency takeover path (stalled anti-wraparound
+autovacuum) under the new dispatcher; packaging and installer changes for the single-control-database install are deferred
+to the next release.
+
+### pgbench worker/cost ladder drill, cluster-global controller (2026-09-24)
+
+Replay of the Ubuntu `aavtest.sql` method against the redesigned controller on both hosts: control database `postgres`
+(extension there only), workload database `aavtest` with NO extension objects, 100 tables x 100K rows with
+`autovacuum_vacuum_threshold = 1000, scale_factor = 0`, `pgbench -c 16 -j 8 -T 150`, start `autovacuum_max_workers = 1`,
+`autovacuum_vacuum_cost_limit = 10`, `autovacuum_vacuum_cost_delay = 100ms`, `adaptive_autovacuum.naptime_seconds = 10`,
+`policy.min_table_bytes = 8 MB`. Samples every 5 s for 300 s (`C:\cld\aav_results\{wsl,win}_pg18.csv`, charts
+`aav_drill_linux_pg18.png`, `aav_drill_windows_pg18.png`, `aav_drill_both_hosts.png`, scripts `aav_wsl_pgbench_drill.sh`,
+`aav_win_pgbench_drill.ps1`, `aav_plot.py`).
+
+WSL AlmaLinux 9 / PG 18.6 (24 CPUs, 1,837 tps): the controller alone applied every change through one queue:
+sweep 5 workers 1->2, cost 10/100 ms -> 200/50 ms, insert scale factor 0.2 -> 0.09, max_threshold -> 5000; sweeps 6-9
+workers 2->4->8->12->16 (one doubling-bounded step per sweep, queue pressure of 100 overdue relations); sweep 12
+400/25 ms; sweep 13 800/12.5 ms plus the mistuned-baseline correction (vacuum scale 0.2 -> 0.045, threshold 50 -> 500,
+analyze 0.1/50 -> 0.0225/250); sweep 14 1600/6.25 ms; then held by the activity feedback while the debt shrank from
+10 M tuples to 50 K and overdue relations from 100 to 0 by the end of the load; after 10 backlog-free sweeps (sweep 29)
+one decay step 1600/6.25 -> 800/12.5 ms. Windows 11 / PG 18.4 (6,308 tps): the same ladder one sweep earlier at each
+step (sweeps 4-8 for workers 1->16, cost 10/100 -> 200/50 -> 400/25 -> 800/12.5 -> 1600/6.25 -> 2560/6.25 ms, the last
+being the 3,200 MiB/s page-rate cap keeping the delay and taking only the limit), backlog cleared 30 s after the load
+stopped, decay 2560/6.25 -> 1280/12.5 ms at sweep 29. Observed cost-weighted activity tracked the budget the pair
+allows during the load (about 100 K cost units/s on both hosts) and fell to single digits afterwards, which is what the
+hold reason reports. Worker count was never lowered; no controller errors in either server log (the 57 Windows log
+errors are the drill's own PowerShell monitor sending malformed statements, visible as `STATEMENT: 0`).

@@ -1,16 +1,32 @@
 # Required at startup
 shared_preload_libraries = 'adaptive_autovacuum'
 
-# Cluster switch, on by default. Set off to pause every database without removing anything.
+# Cluster switch, on by default. Set off to pause the whole cluster without removing anything.
 adaptive_autovacuum.enabled = on
+
+# The one database that holds the extension and its state; CREATE EXTENSION there only.
+# Every connectable, non-template database in the cluster is managed from it.
 adaptive_autovacuum.control_database = 'postgres'
+
+# Sleep after a complete sweep of all databases; a database is revisited after sweep time plus this.
 adaptive_autovacuum.naptime_seconds = 60
+
+# Database workers the controller runs concurrently (1 = serial scan, max 16).
+adaptive_autovacuum.max_database_workers = 2
+
+# Maximum wait for one database scan; a slower database counts as failed for that sweep.
 adaptive_autovacuum.database_worker_timeout_seconds = 3600
+
+# Maximum runtime of one emergency VACUUM in the dedicated emergency worker; 0 = unlimited.
+adaptive_autovacuum.emergency_timeout_seconds = 86400
+
+# One log line per database scan and per sweep.
 adaptive_autovacuum.log_cycle_summary = on
 
-# Required to interpret pg_stat_progress_vacuum.delay_time.
+# Required to interpret pg_stat_progress_vacuum.delay_time (PostgreSQL 18).
 track_cost_delay_timing = on
 
-# Reserve enough general background-worker capacity for the launcher plus one
-# dynamic database worker, in addition to other extensions and parallel work.
+# Reserve general background-worker capacity for the launcher, the controller,
+# max_database_workers database workers and one emergency worker (5 with the
+# defaults), in addition to other extensions and parallel query workers.
 # max_worker_processes = 16

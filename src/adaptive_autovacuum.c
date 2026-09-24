@@ -1,29 +1,34 @@
-/* adaptive_autovacuum.c: orchestration, host metrics, guarded emergency VACUUM; policy is SQL. */
+/* adaptive_autovacuum.c: one launcher, one cluster controller, per-database workers; policy is SQL. */
 
 #include "postgres.h"
 
 #include <errno.h>
 #include <signal.h>
+#include <sys/stat.h>
 #ifdef WIN32
 #include <windows.h>
 #else
 #include <unistd.h>
 #endif
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/tableam.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_database.h"
-#include "commands/dbcommands.h"
 #include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
-#include "access/htup_details.h"
+#include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -35,8 +40,10 @@
 #include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
@@ -52,27 +59,35 @@ PG_MODULE_MAGIC;
 
 PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void adaptive_autovacuum_launcher_main(Datum main_arg);
+PGDLLEXPORT void adaptive_autovacuum_controller_main(Datum main_arg);
 PGDLLEXPORT void adaptive_autovacuum_database_main(Datum main_arg);
 PGDLLEXPORT void adaptive_autovacuum_emergency_main(Datum main_arg);
 
 PG_FUNCTION_INFO_V1(adaptive_autovacuum_host_metrics);
-PG_FUNCTION_INFO_V1(adaptive_autovacuum_cluster_summary_status);
+PG_FUNCTION_INFO_V1(adaptive_autovacuum_controller_status);
 
 static bool aav_enabled = true;
 static char *aav_control_database = NULL;
-static char *aav_global_settings_database = NULL;
 static int aav_naptime_seconds = 60;
-static int aav_max_database_workers = 1;
+static int aav_max_database_workers = 2;
 static int aav_database_worker_timeout_seconds = 3600;
 static int aav_emergency_timeout_seconds = 86400;
 static bool aav_log_cycle_summary = true;
+/* Session-level handoff between the worker process and the SQL program it runs. */
+static char *aav_worker_input = NULL;
+static char *aav_worker_output = NULL;
 
 static volatile sig_atomic_t aav_got_sigterm = false;
 static volatile sig_atomic_t aav_got_sighup = false;
 static volatile sig_atomic_t aav_emergency_timed_out = false;
 
+/* Worker handoff files live under pg_stat_tmp: excluded from base backups, cleaned at startup. */
+#define AAV_TMP_DIR PG_STAT_TMP_DIR "/adaptive_autovacuum"
+#define AAV_PROGRAM_TAG "$aav_program$"
+#define AAV_STATE_LEN 64
 
-/* ---------- host metrics ---------- */
+
+/* ---------- shared types ---------- */
 
 typedef struct AAVHostMetrics
 {
@@ -86,78 +101,47 @@ typedef struct AAVDatabaseEntry
 {
     Oid dboid;
     char *dbname;
+    bool excluded;
 } AAVDatabaseEntry;
 
+/* Handed to the emergency worker through bgw_extra. */
 typedef struct AAVEmergencyRequest
 {
     int64 request_id;
+    Oid dboid;
     Oid relid;
-    int work_mem_mb;
-    int cost_limit;
-    int cost_delay_ms;
-    int lock_timeout_ms;
+    int32 work_mem_mb;
+    int32 cost_limit;
+    int32 cost_delay_ms;
+    int32 lock_timeout_ms;
     bool is_wraparound;
 } AAVEmergencyRequest;
 
-/* Fixed capacity for per-GUC apply timestamps; must cover the whitelist. */
-#define AAV_GLOBAL_GUC_SLOTS 16
+StaticAssertDecl(sizeof(AAVEmergencyRequest) <= BGW_EXTRALEN,
+                 "AAVEmergencyRequest does not fit in bgw_extra");
 
-/* One database's latest cycle summary, published for the other databases' cluster merges. */
-typedef struct AAVDbSummary
-{
-    Oid dboid;
-    TimestampTz updated_at;
-    int32 eligible;
-    int32 overdue;
-    int32 dead_overdue;
-    int32 insert_overdue;
-    int64 fleet_max_target;
-    double median_scale;
-    double median_thresh;
-    double median_ins_scale;
-    double median_ins_thresh;
-    /* Maintenance debt (dead + inserted-since-vacuum tuples) and its smoothed rate in tuples/s. */
-    int64 debt_tuples;
-    double debt_velocity;
-} AAVDbSummary;
-
-/* Aggregate of the other databases' summaries handed to the SQL policy. */
-typedef struct AAVClusterAgg
-{
-    int db_count;
-    bool complete;
-    int64 eligible;
-    int64 overdue;
-    int64 dead_overdue;
-    int64 insert_overdue;
-    int64 fleet_max_target;
-    double w_scale_sum;
-    double w_thresh_sum;
-    double w_ins_scale_sum;
-    double w_ins_thresh_sum;
-    int64 debt_tuples;
-    double debt_velocity;
-} AAVClusterAgg;
-
+/* One control plane per cluster: identity, sweep generation, emergency slot. */
 typedef struct AAVSharedState
 {
     slock_t mutex;
+    pid_t launcher_pid;
+    pid_t controller_pid;
+    Oid control_database_oid;
+    char controller_state[AAV_STATE_LEN];
+    int controller_failures;
+    TimestampTz controller_restart_at;
     pid_t emergency_worker_pid;
     Oid emergency_database_oid;
-    /* Last cluster-wide apply per whitelisted GUC (one apply per cooldown window). */
-    TimestampTz global_applied_at[AAV_GLOBAL_GUC_SLOTS];
-    /* Summary capacity (adaptive_autovacuum.max_tracked_databases) and overflow bookkeeping. */
-    int summary_capacity;
-    int64 summary_overflow_count;
-    TimestampTz summary_overflow_at;
-    /* Latest per-database cycle summaries, summary_capacity entries. */
-    AAVDbSummary summaries[FLEXIBLE_ARRAY_MEMBER];
+    int64 current_generation;
+    int64 last_complete_generation;
+    int expected_databases;
+    int completed_databases;
+    int failed_databases;
+    TimestampTz generation_started_at;
+    TimestampTz generation_completed_at;
+    double observed_sweep_seconds;
 } AAVSharedState;
 
-#define AAV_SHARED_STATE_SIZE(n) \
-    (offsetof(AAVSharedState, summaries) + sizeof(AAVDbSummary) * (n))
-
-static int aav_max_tracked_databases = 256;
 static bool aav_preloaded = false;
 static AAVSharedState *aav_shared_state = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -168,8 +152,10 @@ static void aav_sighup(SIGNAL_ARGS);
 static void aav_shmem_request(void);
 static void aav_shmem_startup(void);
 static void aav_attach_shared_state(void);
+static void aav_set_controller_state(const char *state);
 static bool aav_try_acquire_emergency_slot(Oid dboid);
 static void aav_release_emergency_slot(int code, Datum arg);
+static void aav_release_controller_slot(int code, Datum arg);
 static void aav_collect_host_metrics(AAVHostMetrics *metrics);
 #ifdef __linux__
 static bool aav_read_int64_file(const char *path, int64 *value);
@@ -178,34 +164,46 @@ static void aav_apply_cgroup_memory_limit(AAVHostMetrics *metrics);
 #ifdef WIN32
 static double aav_windows_cpu_busy_fraction(void);
 #endif
-static List *aav_list_databases(void);
-static void aav_run_database_workers(List *databases);
+static bool aav_lookup_control_database(const char *name, Oid *dboid, char **problem);
+static bool aav_start_controller(Oid dboid, BackgroundWorkerHandle **handle);
+static void aav_ensure_tmp_dir(void);
+static void aav_tmp_path(char *buf, size_t len, const char *name);
+static bool aav_write_file(const char *path, const char *text);
+static char *aav_read_file(const char *path);
+static bool aav_control_plane_ready(void);
+static bool aav_policy_enabled(void);
+static void aav_run_sweep(MemoryContext sweep_context);
+static List *aav_discover_databases(void);
+static char *aav_fetch_text(const char *sql, int nargs, Oid *argtypes, Datum *values, const char *nulls);
+static bool aav_prepare_worker_input(const AAVDatabaseEntry *entry, int64 generation,
+                                     const AAVHostMetrics *metrics);
+static bool aav_absorb_worker_result(const AAVDatabaseEntry *entry, int64 generation,
+                                     int *dup_installs, bool *emergency_pending);
 static bool aav_start_database_worker(Oid dboid, const char *dbname,
                                       BackgroundWorkerHandle **handle);
-static bool aav_extension_enabled_in_database(void);
-static void aav_execute_policy_cycle(const AAVHostMetrics *metrics);
-static int aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg);
-static void aav_publish_summary(const AAVDbSummary *summary);
+static void aav_run_database_workers(List *databases, int64 generation,
+                                     const AAVHostMetrics *metrics, int *completed, int *failed,
+                                     int *dup_installs);
+static void aav_run_global_controller(const AAVHostMetrics *metrics, int64 generation,
+                                      bool complete);
 static void aav_apply_global_settings(void);
-static bool aav_has_pending_emergency_request(void);
-static bool aav_start_emergency_worker(Oid dboid);
+static void aav_service_emergency(void);
+static bool aav_start_emergency_worker(const AAVEmergencyRequest *request, const char *dbname,
+                                       BackgroundWorkerHandle **handle);
 static void aav_emergency_timeout_handler(void);
-static bool aav_claim_emergency_request(AAVEmergencyRequest *request);
-static void aav_finish_emergency_request(const AAVEmergencyRequest *request,
-                                         const char *status,
-                                         const char *error_text);
 static void aav_run_emergency_vacuum(const AAVEmergencyRequest *request);
 static void aav_abort_transaction_if_needed(void);
+static char *aav_copy_error_message(void);
 
 PGDLLEXPORT void
 _PG_init(void)
 {
     BackgroundWorker worker;
 
-    /* On by default: installing (preload + CREATE EXTENSION) is the opt-in; off pauses every database. */
+    /* On by default: installing (preload + CREATE EXTENSION) is the opt-in; off pauses the cluster. */
     DefineCustomBoolVariable("adaptive_autovacuum.enabled",
-                             "Enable the adaptive autovacuum launcher.",
-                             "Cluster-wide switch, on by default; the SQL policy in each database must also be enabled.",
+                             "Enable the adaptive autovacuum controller.",
+                             "Cluster-wide switch, on by default; the cluster policy in the control database must also be enabled.",
                              &aav_enabled,
                              true,
                              PGC_SIGHUP,
@@ -214,10 +212,10 @@ _PG_init(void)
                              NULL,
                              NULL);
 
-    /* PGC_SIGHUP: a PGC_POSTMASTER custom GUC is FATAL when loaded on demand; read at launcher start. */
+    /* PGC_SIGHUP: a PGC_POSTMASTER custom GUC is FATAL when loaded on demand; read at controller start. */
     DefineCustomStringVariable("adaptive_autovacuum.control_database",
-                               "Database used by the cluster launcher.",
-                               "The launcher reads pg_database here and starts one database worker at a time.",
+                               "Database holding the extension's persistent state.",
+                               "Install the extension once, here; every connectable database is managed from it.",
                                &aav_control_database,
                                "postgres",
                                PGC_SIGHUP,
@@ -226,21 +224,9 @@ _PG_init(void)
                                NULL,
                                NULL);
 
-    /* Optional designated database that alone queues and applies cluster settings; empty = legacy. */
-    DefineCustomStringVariable("adaptive_autovacuum.global_settings_database",
-                               "Only this database's worker manages cluster-wide settings.",
-                               "Empty means every database with manage_global_settings enabled may queue and apply them.",
-                               &aav_global_settings_database,
-                               "",
-                               PGC_SIGHUP,
-                               0,
-                               NULL,
-                               NULL,
-                               NULL);
-
     /* Real revisit period = runtime of the databases ahead plus this naptime. */
     DefineCustomIntVariable("adaptive_autovacuum.naptime_seconds",
-                            "Seconds the launcher sleeps after finishing one scan of all databases.",
+                            "Seconds the controller sleeps after finishing one sweep of all databases.",
                             NULL,
                             &aav_naptime_seconds,
                             60,
@@ -254,7 +240,7 @@ _PG_init(void)
 
     /* Concurrent database workers so one slow database cannot delay the others; 1 = serial. */
     DefineCustomIntVariable("adaptive_autovacuum.max_database_workers",
-                            "Database workers the launcher may run concurrently.",
+                            "Database workers the controller may run concurrently.",
                             NULL,
                             &aav_max_database_workers,
                             2,
@@ -267,8 +253,8 @@ _PG_init(void)
                             NULL);
 
     DefineCustomIntVariable("adaptive_autovacuum.database_worker_timeout_seconds",
-                            "Maximum time the launcher waits for one database worker.",
-                            "Covers the policy cycle only; emergency VACUUMs run in a "
+                            "Maximum time the controller waits for one database worker.",
+                            "Covers the policy scan only; emergency VACUUMs run in a "
                             "dedicated worker governed by emergency_timeout_seconds.",
                             &aav_database_worker_timeout_seconds,
                             3600,
@@ -295,7 +281,7 @@ _PG_init(void)
                             NULL);
 
     DefineCustomBoolVariable("adaptive_autovacuum.log_cycle_summary",
-                             "Log one summary line for every database cycle.",
+                             "Log one summary line per database scan and per sweep.",
                              NULL,
                              &aav_log_cycle_summary,
                              true,
@@ -305,25 +291,32 @@ _PG_init(void)
                              NULL,
                              NULL);
 
-    /* Sizes shared memory, so postmaster-only; defining it on demand-load would be FATAL. */
-    aav_preloaded = process_shared_preload_libraries_in_progress;
-    if (aav_preloaded)
-        DefineCustomIntVariable("adaptive_autovacuum.max_tracked_databases",
-                                "Shared-memory capacity for per-database cycle summaries.",
-                                "Above this many managed databases the cluster evidence is incomplete and cluster-wide changes are recorded only.",
-                                &aav_max_tracked_databases,
-                                256,
-                                1,
-                                65536,
-                                PGC_POSTMASTER,
-                                0,
-                                NULL,
-                                NULL,
-                                NULL);
+    /* Handoff slots for the database program: set by the worker, read by the program, and back. */
+    DefineCustomStringVariable("adaptive_autovacuum.worker_input",
+                               "Internal: input document of the running database program.",
+                               NULL,
+                               &aav_worker_input,
+                               "",
+                               PGC_SUSET,
+                               GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+                               NULL,
+                               NULL,
+                               NULL);
+    DefineCustomStringVariable("adaptive_autovacuum.worker_output",
+                               "Internal: output document of the running database program.",
+                               NULL,
+                               &aav_worker_output,
+                               "",
+                               PGC_SUSET,
+                               GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+                               NULL,
+                               NULL,
+                               NULL);
 
     MarkGUCPrefixReserved("adaptive_autovacuum");
 
-    if (!process_shared_preload_libraries_in_progress)
+    aav_preloaded = process_shared_preload_libraries_in_progress;
+    if (!aav_preloaded)
         return;
 
     prev_shmem_request_hook = shmem_request_hook;
@@ -353,7 +346,7 @@ aav_shmem_request(void)
     if (prev_shmem_request_hook != NULL)
         prev_shmem_request_hook();
 
-    RequestAddinShmemSpace(MAXALIGN(AAV_SHARED_STATE_SIZE(aav_max_tracked_databases)));
+    RequestAddinShmemSpace(MAXALIGN(sizeof(AAVSharedState)));
 }
 
 static void
@@ -372,31 +365,36 @@ aav_attach_shared_state(void)
 
     LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
     aav_shared_state = ShmemInitStruct("adaptive autovacuum shared state",
-                                      AAV_SHARED_STATE_SIZE(aav_max_tracked_databases),
+                                      sizeof(AAVSharedState),
                                       &found);
     if (!found)
     {
-        MemSet(aav_shared_state, 0, AAV_SHARED_STATE_SIZE(aav_max_tracked_databases));
+        MemSet(aav_shared_state, 0, sizeof(AAVSharedState));
         SpinLockInit(&aav_shared_state->mutex);
-        aav_shared_state->summary_capacity = aav_max_tracked_databases;
+        strlcpy(aav_shared_state->controller_state, "not started", AAV_STATE_LEN);
     }
     LWLockRelease(AddinShmemInitLock);
 }
 
-/* SQL: adaptive_autovacuum.cluster_summary_status() - summary slot capacity, usage and overflow. */
+static void
+aav_set_controller_state(const char *state)
+{
+    if (aav_shared_state == NULL)
+        return;
+    SpinLockAcquire(&aav_shared_state->mutex);
+    strlcpy(aav_shared_state->controller_state, state, AAV_STATE_LEN);
+    SpinLockRelease(&aav_shared_state->mutex);
+}
+
+/* SQL: adaptive_autovacuum.controller_status() - controller identity and sweep-generation tracking. */
 Datum
-adaptive_autovacuum_cluster_summary_status(PG_FUNCTION_ARGS)
+adaptive_autovacuum_controller_status(PG_FUNCTION_ARGS)
 {
     TupleDesc tupdesc;
-    Datum values[7];
-    bool nulls[7];
+    Datum values[15];
+    bool nulls[15];
+    AAVSharedState snap;
     bool available = false;
-    int capacity = 0;
-    int used = 0;
-    bool overflow = false;
-    int64 overflow_count = 0;
-    TimestampTz overflow_at = 0;
-    TimestampTz oldest = 0;
 
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         elog(ERROR, "return type must be a row type");
@@ -405,42 +403,44 @@ adaptive_autovacuum_cluster_summary_status(PG_FUNCTION_ARGS)
     if (aav_shared_state == NULL && aav_preloaded)
         aav_attach_shared_state();
 
+    MemSet(&snap, 0, sizeof(snap));
     if (aav_shared_state != NULL)
     {
-        TimestampTz now = GetCurrentTimestamp();
-        int i;
-
         available = true;
         SpinLockAcquire(&aav_shared_state->mutex);
-        capacity = aav_shared_state->summary_capacity;
-        overflow_count = aav_shared_state->summary_overflow_count;
-        overflow_at = aav_shared_state->summary_overflow_at;
-        for (i = 0; i < capacity; i++)
-        {
-            const AAVDbSummary *s = &aav_shared_state->summaries[i];
-
-            if (s->dboid == InvalidOid)
-                continue;
-            used++;
-            if (oldest == 0 || s->updated_at < oldest)
-                oldest = s->updated_at;
-        }
+        snap = *aav_shared_state;
         SpinLockRelease(&aav_shared_state->mutex);
-        overflow = overflow_at != 0
-                   && !TimestampDifferenceExceeds(overflow_at, now,
-                                                  10 * aav_naptime_seconds * 1000);
     }
 
     MemSet(nulls, 0, sizeof(nulls));
     values[0] = BoolGetDatum(available);
-    values[1] = Int32GetDatum(capacity);
-    values[2] = Int32GetDatum(used);
-    values[3] = BoolGetDatum(overflow);
-    values[4] = Int64GetDatum(overflow_count);
-    values[5] = TimestampTzGetDatum(overflow_at);
-    nulls[5] = overflow_at == 0;
-    values[6] = TimestampTzGetDatum(oldest);
-    nulls[6] = oldest == 0;
+    values[1] = Int32GetDatum((int32) snap.launcher_pid);
+    nulls[1] = !available || snap.launcher_pid == 0;
+    values[2] = Int32GetDatum((int32) snap.controller_pid);
+    nulls[2] = !available || snap.controller_pid == 0;
+    values[3] = CStringGetTextDatum(available ? snap.controller_state : "not preloaded");
+    values[4] = ObjectIdGetDatum(snap.control_database_oid);
+    nulls[4] = !available || snap.control_database_oid == InvalidOid;
+    values[5] = Int64GetDatum(snap.current_generation);
+    nulls[5] = !available;
+    values[6] = Int64GetDatum(snap.last_complete_generation);
+    nulls[6] = !available || snap.last_complete_generation == 0;
+    values[7] = Int32GetDatum(snap.expected_databases);
+    nulls[7] = !available;
+    values[8] = Int32GetDatum(snap.completed_databases);
+    nulls[8] = !available;
+    values[9] = Int32GetDatum(snap.failed_databases);
+    nulls[9] = !available;
+    values[10] = TimestampTzGetDatum(snap.generation_started_at);
+    nulls[10] = !available || snap.generation_started_at == 0;
+    values[11] = TimestampTzGetDatum(snap.generation_completed_at);
+    nulls[11] = !available || snap.generation_completed_at == 0;
+    values[12] = Float8GetDatum(snap.observed_sweep_seconds);
+    nulls[12] = !available || snap.observed_sweep_seconds <= 0;
+    values[13] = Int32GetDatum((int32) snap.emergency_worker_pid);
+    nulls[13] = !available || snap.emergency_worker_pid == 0;
+    values[14] = ObjectIdGetDatum(snap.emergency_database_oid);
+    nulls[14] = !available || snap.emergency_database_oid == InvalidOid;
 
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -456,7 +456,7 @@ aav_try_acquire_emergency_slot(Oid dboid)
     if (aav_shared_state == NULL)
     {
         elog(WARNING,
-             "adaptive autovacuum shared state is unavailable; emergency VACUUM is disabled for this cycle");
+             "adaptive autovacuum shared state is unavailable; emergency VACUUM is disabled for this request");
         return false;
     }
 
@@ -507,6 +507,24 @@ aav_release_emergency_slot(int code, Datum arg)
 }
 
 static void
+aav_release_controller_slot(int code, Datum arg)
+{
+    (void) code;
+    (void) arg;
+
+    if (aav_shared_state == NULL)
+        return;
+
+    SpinLockAcquire(&aav_shared_state->mutex);
+    if (aav_shared_state->controller_pid == MyProcPid)
+    {
+        aav_shared_state->controller_pid = 0;
+        strlcpy(aav_shared_state->controller_state, "stopped", AAV_STATE_LEN);
+    }
+    SpinLockRelease(&aav_shared_state->mutex);
+}
+
+static void
 aav_sigterm(SIGNAL_ARGS)
 {
     int save_errno = errno;
@@ -528,6 +546,8 @@ aav_sighup(SIGNAL_ARGS)
     errno = save_errno;
 }
 
+
+/* ---------- host metrics ---------- */
 
 #ifdef __linux__
 static bool
@@ -805,12 +825,74 @@ adaptive_autovacuum_host_metrics(PG_FUNCTION_ARGS)
 }
 
 
-/* ---------- launcher ---------- */
+/* ---------- launcher: supervises the one controller, never touches a database ---------- */
+
+/* Shared-catalog lookup from a backend without a database (like core autovacuum's launcher). */
+static bool
+aav_lookup_control_database(const char *name, Oid *dboid, char **problem)
+{
+    Relation rel;
+    TableScanDesc scan;
+    HeapTuple tup;
+    bool found = false;
+
+    *dboid = InvalidOid;
+    *problem = NULL;
+
+    StartTransactionCommand();
+    rel = table_open(DatabaseRelationId, AccessShareLock);
+    scan = table_beginscan_catalog(rel, 0, NULL);
+    while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+    {
+        Form_pg_database pgdb = (Form_pg_database) GETSTRUCT(tup);
+
+        if (strcmp(NameStr(pgdb->datname), name) != 0)
+            continue;
+        found = true;
+        if (pgdb->datistemplate)
+            *problem = "is a template database";
+        else if (!pgdb->datallowconn)
+            *problem = "does not allow connections";
+        else
+            *dboid = pgdb->oid;
+        break;
+    }
+    table_endscan(scan);
+    table_close(rel, AccessShareLock);
+    CommitTransactionCommand();
+
+    if (!found)
+        *problem = "does not exist";
+    return OidIsValid(*dboid);
+}
+
+static bool
+aav_start_controller(Oid dboid, BackgroundWorkerHandle **handle)
+{
+    BackgroundWorker worker;
+
+    MemSet(&worker, 0, sizeof(worker));
+    snprintf(worker.bgw_name, BGW_MAXLEN, "adaptive autovacuum controller");
+    snprintf(worker.bgw_type, BGW_MAXLEN, "adaptive autovacuum controller");
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+                       BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    snprintf(worker.bgw_library_name, MAXPGPATH, "adaptive_autovacuum");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN,
+             "adaptive_autovacuum_controller_main");
+    worker.bgw_main_arg = ObjectIdGetDatum(dboid);
+    worker.bgw_notify_pid = MyProcPid;
+
+    return RegisterDynamicBackgroundWorker(&worker, handle);
+}
 
 PGDLLEXPORT void
 adaptive_autovacuum_launcher_main(Datum main_arg)
 {
-    MemoryContext cycle_context;
+    BackgroundWorkerHandle *controller = NULL;
+    TimestampTz restart_at = 0;
+    int failures = 0;
 
     (void) main_arg;
 
@@ -818,18 +900,23 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
     pqsignal(SIGHUP, aav_sighup);
     BackgroundWorkerUnblockSignals();
 
-    BackgroundWorkerInitializeConnection(aav_control_database, NULL, 0);
+    /* No database: pg_database is a shared catalog, which is all the launcher needs. */
+    BackgroundWorkerInitializeConnection(NULL, NULL, 0);
 
-    cycle_context = AllocSetContextCreate(TopMemoryContext,
-                                          "adaptive autovacuum launcher cycle",
-                                          ALLOCSET_DEFAULT_SIZES);
+    if (aav_shared_state != NULL)
+    {
+        SpinLockAcquire(&aav_shared_state->mutex);
+        aav_shared_state->launcher_pid = MyProcPid;
+        SpinLockRelease(&aav_shared_state->mutex);
+    }
 
-    elog(LOG, "adaptive autovacuum launcher started on control database \"%s\"",
+    elog(LOG, "adaptive autovacuum launcher started (control database \"%s\")",
          aav_control_database);
 
     while (!aav_got_sigterm)
     {
         int rc;
+        long wait_ms = 10000L;
 
         if (aav_got_sighup)
         {
@@ -837,27 +924,85 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        /* Standby guard (defense in depth): stay observational during recovery. */
-        if (aav_enabled && RecoveryInProgress())
+        if (controller != NULL)
         {
-            elog(LOG,
-                 "adaptive autovacuum launcher is idle: the server is in recovery");
-        }
-        else if (aav_enabled)
-        {
-            MemoryContext old_context;
-            List *databases;
+            pid_t pid;
+            BgwHandleStatus status = GetBackgroundWorkerPid(controller, &pid);
 
-            MemoryContextReset(cycle_context);
-            old_context = MemoryContextSwitchTo(cycle_context);
-            databases = aav_list_databases();
-            aav_run_database_workers(databases);
-            MemoryContextSwitchTo(old_context);
+            if (status == BGWH_POSTMASTER_DIED)
+                proc_exit(1);
+            if (status == BGWH_STOPPED)
+            {
+                long backoff_s;
+
+                pfree(controller);
+                controller = NULL;
+                failures = Min(failures + 1, 8);
+                backoff_s = Min(10L << (failures - 1), 600L);
+                restart_at = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), backoff_s * 1000);
+                if (!aav_got_sigterm)
+                    elog(WARNING,
+                         "adaptive autovacuum controller exited; restarting in %ld s (check the server log for its error)",
+                         backoff_s);
+                aav_set_controller_state("restarting after exit");
+            }
+        }
+
+        /* Standby guard (defense in depth): stay observational during recovery. */
+        if (RecoveryInProgress())
+        {
+            aav_set_controller_state("idle: server in recovery");
+        }
+        else if (!aav_enabled)
+        {
+            if (controller == NULL)
+                aav_set_controller_state("disabled (adaptive_autovacuum.enabled = off)");
+        }
+        else if (controller == NULL && GetCurrentTimestamp() >= restart_at)
+        {
+            Oid dboid;
+            char *problem;
+
+            /* Never start a controller toward a database that cannot be reached. */
+            if (!aav_lookup_control_database(aav_control_database, &dboid, &problem))
+            {
+                long backoff_s;
+
+                failures = Min(failures + 1, 8);
+                backoff_s = Min(10L << (failures - 1), 600L);
+                restart_at = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), backoff_s * 1000);
+                ereport(WARNING,
+                        (errmsg("adaptive autovacuum control database \"%s\" %s; the controller is not started (retry in %ld s)",
+                                aav_control_database, problem, backoff_s),
+                         errhint("Create the database or point adaptive_autovacuum.control_database at an existing one and reload.")));
+                aav_set_controller_state("waiting for control database");
+            }
+            else if (!aav_start_controller(dboid, &controller))
+            {
+                failures = Min(failures + 1, 8);
+                restart_at = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 30 * 1000);
+                elog(WARNING,
+                     "adaptive autovacuum could not register the controller worker; check max_worker_processes (retry in 30 s)");
+                aav_set_controller_state("waiting for a background worker slot");
+            }
+            else
+            {
+                aav_set_controller_state("starting");
+            }
+        }
+
+        /* Forget the failure history once the restarted controller has completed a sweep. */
+        if (controller != NULL && failures > 0 && aav_shared_state != NULL)
+        {
+            SpinLockAcquire(&aav_shared_state->mutex);
+            if (aav_shared_state->generation_completed_at > restart_at)
+                failures = 0;
+            SpinLockRelease(&aav_shared_state->mutex);
         }
 
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-                       (long) aav_naptime_seconds * 1000L,
+                       wait_ms,
                        PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
 
@@ -868,12 +1013,179 @@ adaptive_autovacuum_launcher_main(Datum main_arg)
         CHECK_FOR_INTERRUPTS();
     }
 
+    if (controller != NULL)
+    {
+        TerminateBackgroundWorker(controller);
+        (void) WaitForBackgroundWorkerShutdown(controller);
+    }
+
     elog(LOG, "adaptive autovacuum launcher shutting down");
     proc_exit(0);
 }
 
+
+/* ---------- handoff files ---------- */
+
+static void
+aav_ensure_tmp_dir(void)
+{
+    struct stat st;
+
+    if (stat(AAV_TMP_DIR, &st) == 0)
+        return;
+    if (MakePGDirectory(AAV_TMP_DIR) < 0 && errno != EEXIST)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("adaptive autovacuum could not create directory \"%s\": %m", AAV_TMP_DIR)));
+}
+
+static void
+aav_tmp_path(char *buf, size_t len, const char *name)
+{
+    snprintf(buf, len, "%s/%s", AAV_TMP_DIR, name);
+}
+
+/* Write-then-rename so a reader never sees a half-written file. */
+static bool
+aav_write_file(const char *path, const char *text)
+{
+    char tmp[MAXPGPATH];
+    FILE *file;
+    size_t len = strlen(text);
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    file = AllocateFile(tmp, "wb");
+    if (file == NULL)
+    {
+        elog(WARNING, "adaptive autovacuum could not create \"%s\": %m", tmp);
+        return false;
+    }
+    if (len > 0 && fwrite(text, 1, len, file) != len)
+    {
+        elog(WARNING, "adaptive autovacuum could not write \"%s\": %m", tmp);
+        FreeFile(file);
+        unlink(tmp);
+        return false;
+    }
+    if (FreeFile(file) != 0)
+    {
+        elog(WARNING, "adaptive autovacuum could not close \"%s\": %m", tmp);
+        unlink(tmp);
+        return false;
+    }
+    unlink(path);
+    if (rename(tmp, path) != 0)
+    {
+        elog(WARNING, "adaptive autovacuum could not rename \"%s\" to \"%s\": %m", tmp, path);
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* Whole file as a palloc'd string, NULL when absent or unreadable. */
+static char *
+aav_read_file(const char *path)
+{
+    FILE *file;
+    StringInfoData buf;
+    char chunk[8192];
+    size_t n;
+
+    file = AllocateFile(path, "rb");
+    if (file == NULL)
+        return NULL;
+    initStringInfo(&buf);
+    while ((n = fread(chunk, 1, sizeof(chunk), file)) > 0)
+        appendBinaryStringInfo(&buf, chunk, (int) n);
+    if (ferror(file))
+    {
+        elog(WARNING, "adaptive autovacuum could not read \"%s\": %m", path);
+        FreeFile(file);
+        pfree(buf.data);
+        return NULL;
+    }
+    FreeFile(file);
+    return buf.data;
+}
+
+
+/* ---------- controller: discovery, scheduling, absorption, the one global decision ---------- */
+
+static char *
+aav_copy_error_message(void)
+{
+    ErrorData *edata;
+    MemoryContext old_context;
+    char *message;
+
+    old_context = MemoryContextSwitchTo(TopMemoryContext);
+    edata = CopyErrorData();
+    message = pstrdup(edata->message ? edata->message : "unknown error");
+    MemoryContextSwitchTo(old_context);
+    FlushErrorState();
+    FreeErrorData(edata);
+    return message;
+}
+
+/* One-row, one-column text query in its own transaction; NULL when no row or NULL. */
+static char *
+aav_fetch_text(const char *sql, int nargs, Oid *argtypes, Datum *values, const char *nulls)
+{
+    MemoryContext caller_context = CurrentMemoryContext;
+    char *result = NULL;
+    int spi_rc;
+
+    StartTransactionCommand();
+    SPI_connect();
+    PushActiveSnapshot(GetTransactionSnapshot());
+
+    spi_rc = SPI_execute_with_args(sql, nargs, argtypes, values, nulls, false, 1);
+    if (spi_rc < 0)
+        elog(ERROR, "adaptive autovacuum query failed: SPI code %d", spi_rc);
+    if (SPI_processed >= 1 && SPI_tuptable != NULL)
+    {
+        char *value = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+        if (value != NULL)
+        {
+            MemoryContext old_context = MemoryContextSwitchTo(caller_context);
+
+            result = pstrdup(value);
+            MemoryContextSwitchTo(old_context);
+        }
+    }
+
+    PopActiveSnapshot();
+    SPI_finish();
+    CommitTransactionCommand();
+    return result;
+}
+
+/* The 1.2.0 SQL objects exist in the control database. */
+static bool
+aav_control_plane_ready(void)
+{
+    char *value = aav_fetch_text(
+        "SELECT (to_regprocedure('adaptive_autovacuum._begin_generation()') IS NOT NULL"
+        "        AND to_regclass('adaptive_autovacuum.database_state') IS NOT NULL)::text",
+        0, NULL, NULL, NULL);
+
+    return value != NULL && strcmp(value, "true") == 0;
+}
+
+static bool
+aav_policy_enabled(void)
+{
+    char *value = aav_fetch_text(
+        "SELECT p.enabled::text FROM adaptive_autovacuum.policy p WHERE p.singleton",
+        0, NULL, NULL, NULL);
+
+    return value != NULL && strcmp(value, "true") == 0;
+}
+
 static List *
-aav_list_databases(void)
+aav_discover_databases(void)
 {
     MemoryContext caller_context = CurrentMemoryContext;
     List *result = NIL;
@@ -884,19 +1196,12 @@ aav_list_databases(void)
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* Oldest databases first: the ones nearest wraparound get the earliest check of every sweep. */
     spi_rc = SPI_execute(
-        "SELECT oid, datname "
-        "FROM pg_catalog.pg_database "
-        "WHERE datallowconn "
-        "  AND NOT datistemplate "
-        "ORDER BY GREATEST(age(datfrozenxid), mxid_age(datminmxid)) DESC, oid",
-        true,
+        "SELECT database_oid, database_name, excluded FROM adaptive_autovacuum._discover_databases()",
+        false,
         0);
-
     if (spi_rc != SPI_OK_SELECT)
-        elog(ERROR, "adaptive autovacuum could not list databases: SPI code %d",
-             spi_rc);
+        elog(ERROR, "adaptive autovacuum could not discover databases: SPI code %d", spi_rc);
 
     for (i = 0; i < SPI_processed; i++)
     {
@@ -905,21 +1210,25 @@ aav_list_databases(void)
         bool isnull;
         Oid dboid;
         char *dbname;
+        bool excluded;
         MemoryContext old_context;
         AAVDatabaseEntry *entry;
 
         dboid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 1, &isnull));
         if (isnull)
             continue;
-
         dbname = SPI_getvalue(tuple, tupdesc, 2);
         if (dbname == NULL)
             continue;
+        excluded = DatumGetBool(SPI_getbinval(tuple, tupdesc, 3, &isnull));
+        if (isnull)
+            excluded = false;
 
         old_context = MemoryContextSwitchTo(caller_context);
         entry = palloc0(sizeof(*entry));
         entry->dboid = dboid;
         entry->dbname = pstrdup(dbname);
+        entry->excluded = excluded;
         result = lappend(result, entry);
         MemoryContextSwitchTo(old_context);
     }
@@ -929,6 +1238,136 @@ aav_list_databases(void)
     CommitTransactionCommand();
 
     return result;
+}
+
+/* Build the worker's input document in the control database and hand it over as a file. */
+static bool
+aav_prepare_worker_input(const AAVDatabaseEntry *entry, int64 generation,
+                         const AAVHostMetrics *metrics)
+{
+    Oid argtypes[7] = {OIDOID, NAMEOID, INT8OID, FLOAT8OID, INT4OID, INT8OID, INT8OID};
+    Datum values[7];
+    NameData dbname;
+    char *doc;
+    char path[MAXPGPATH];
+    char name[64];
+
+    namestrcpy(&dbname, entry->dbname);
+    values[0] = ObjectIdGetDatum(entry->dboid);
+    values[1] = NameGetDatum(&dbname);
+    values[2] = Int64GetDatum(generation);
+    values[3] = Float8GetDatum(metrics->load1);
+    values[4] = Int32GetDatum(metrics->cpu_count);
+    values[5] = Int64GetDatum(metrics->mem_available_bytes);
+    values[6] = Int64GetDatum(metrics->mem_total_bytes);
+
+    doc = aav_fetch_text(
+        "SELECT adaptive_autovacuum._worker_input($1, $2, $3, $4, $5, $6, $7)",
+        7, argtypes, values, NULL);
+    if (doc == NULL)
+        return false;
+
+    snprintf(name, sizeof(name), "%u.in", entry->dboid);
+    aav_tmp_path(path, sizeof(path), name);
+    return aav_write_file(path, doc);
+}
+
+/* Persist a finished worker's result; a missing or failed result marks the database failed. */
+static bool
+aav_absorb_worker_result(const AAVDatabaseEntry *entry, int64 generation,
+                         int *dup_installs, bool *emergency_pending)
+{
+    char in_path[MAXPGPATH];
+    char out_path[MAXPGPATH];
+    char name[64];
+    NameData dbname;
+    char *doc;
+    bool ok = false;
+
+    namestrcpy(&dbname, entry->dbname);
+    snprintf(name, sizeof(name), "%u.in", entry->dboid);
+    aav_tmp_path(in_path, sizeof(in_path), name);
+    snprintf(name, sizeof(name), "%u.out", entry->dboid);
+    aav_tmp_path(out_path, sizeof(out_path), name);
+
+    doc = aav_read_file(out_path);
+    unlink(in_path);
+    unlink(out_path);
+
+    if (doc == NULL)
+    {
+        Oid argtypes[4] = {OIDOID, NAMEOID, INT8OID, TEXTOID};
+        Datum values[4];
+
+        values[0] = ObjectIdGetDatum(entry->dboid);
+        values[1] = NameGetDatum(&dbname);
+        values[2] = Int64GetDatum(generation);
+        values[3] = CStringGetTextDatum("worker exited without a result (crash, timeout or connection failure)");
+        (void) aav_fetch_text(
+            "SELECT adaptive_autovacuum._record_database_failure($1, $2, $3, $4)",
+            4, argtypes, values, NULL);
+        return false;
+    }
+
+    {
+        Oid argtypes[4] = {OIDOID, NAMEOID, INT8OID, TEXTOID};
+        Datum values[4];
+        int spi_rc;
+
+        values[0] = ObjectIdGetDatum(entry->dboid);
+        values[1] = NameGetDatum(&dbname);
+        values[2] = Int64GetDatum(generation);
+        values[3] = CStringGetTextDatum(doc);
+
+        StartTransactionCommand();
+        SPI_connect();
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        spi_rc = SPI_execute_with_args(
+            "SELECT ok, eligible, overdue, emergency_relations, extension_installed, emergency_pending "
+            "FROM adaptive_autovacuum._absorb_database_result($1, $2, $3, $4::jsonb)",
+            4, argtypes, values, NULL, false, 1);
+        if (spi_rc != SPI_OK_SELECT)
+            elog(ERROR, "adaptive autovacuum could not absorb the result of database \"%s\": SPI code %d",
+                 entry->dbname, spi_rc);
+        if (SPI_processed == 1)
+        {
+            HeapTuple tuple = SPI_tuptable->vals[0];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            bool isnull;
+            Datum d;
+            int eligible = 0, overdue = 0, emergencies = 0;
+            bool installed = false, pending = false;
+
+            d = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+            ok = !isnull && DatumGetBool(d);
+            d = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+            eligible = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+            overdue = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+            emergencies = isnull ? 0 : DatumGetInt32(d);
+            d = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+            installed = !isnull && DatumGetBool(d);
+            d = SPI_getbinval(tuple, tupdesc, 6, &isnull);
+            pending = !isnull && DatumGetBool(d);
+
+            if (installed && entry->dboid != MyDatabaseId)
+                (*dup_installs)++;
+            if (pending)
+                *emergency_pending = true;
+            if (aav_log_cycle_summary && ok)
+                elog(LOG,
+                     "adaptive autovacuum scanned database \"%s\": %d eligible, %d overdue, %d emergency relation(s)",
+                     entry->dbname, eligible, overdue, emergencies);
+        }
+
+        PopActiveSnapshot();
+        SPI_finish();
+        CommitTransactionCommand();
+    }
+    pfree(doc);
+    return ok;
 }
 
 static bool
@@ -967,19 +1406,22 @@ aav_start_database_worker(Oid dboid, const char *dbname,
 typedef struct AAVWorkerSlot
 {
     BackgroundWorkerHandle *handle;
-    const char *dbname;
+    const AAVDatabaseEntry *entry;
     TimestampTz started_at;
     bool in_use;
 } AAVWorkerSlot;
 
-/* Run database workers, at most max_database_workers concurrently, each with its own timeout. */
+/* Run database workers, at most max_database_workers concurrently, absorbing each result as it lands. */
 static void
-aav_run_database_workers(List *databases)
+aav_run_database_workers(List *databases, int64 generation,
+                         const AAVHostMetrics *metrics, int *completed, int *failed,
+                         int *dup_installs)
 {
     int max_workers = Max(aav_max_database_workers, 1);
     AAVWorkerSlot *slots = palloc0(sizeof(AAVWorkerSlot) * max_workers);
     ListCell *next_db = list_head(databases);
     int active = 0;
+    bool emergency_pending = false;
 
     for (;;)
     {
@@ -992,6 +1434,12 @@ aav_run_database_workers(List *databases)
             AAVDatabaseEntry *entry = lfirst(next_db);
             int free_slot = -1;
 
+            if (entry->excluded)
+            {
+                next_db = lnext(databases, next_db);
+                continue;
+            }
+
             for (i = 0; i < max_workers; i++)
             {
                 if (!slots[i].in_use)
@@ -1003,13 +1451,19 @@ aav_run_database_workers(List *databases)
             if (free_slot < 0)
                 break;
 
-            if (aav_start_database_worker(entry->dboid, entry->dbname,
-                                          &slots[free_slot].handle))
+            if (aav_prepare_worker_input(entry, generation, metrics)
+                && aav_start_database_worker(entry->dboid, entry->dbname,
+                                             &slots[free_slot].handle))
             {
-                slots[free_slot].dbname = entry->dbname;
+                slots[free_slot].entry = entry;
                 slots[free_slot].started_at = GetCurrentTimestamp();
                 slots[free_slot].in_use = true;
                 active++;
+            }
+            else
+            {
+                (*failed)++;
+                (void) aav_absorb_worker_result(entry, generation, dup_installs, &emergency_pending);
             }
             next_db = lnext(databases, next_db);
         }
@@ -1034,6 +1488,7 @@ aav_run_database_workers(List *databases)
             BgwHandleStatus status;
             pid_t pid;
             long elapsed_ms;
+            bool finished = false;
 
             if (!slots[i].in_use)
                 continue;
@@ -1043,367 +1498,319 @@ aav_run_database_workers(List *databases)
             if (status == BGWH_POSTMASTER_DIED)
                 proc_exit(1);
             if (status == BGWH_STOPPED)
+                finished = true;
+            else
             {
-                slots[i].in_use = false;
-                active--;
-                continue;
+                elapsed_ms = (long) ((GetCurrentTimestamp() - slots[i].started_at) / 1000);
+                if (aav_got_sigterm ||
+                    elapsed_ms >= (long) aav_database_worker_timeout_seconds * 1000L)
+                {
+                    if (!aav_got_sigterm)
+                        elog(WARNING,
+                             "adaptive autovacuum database worker \"%s\" exceeded timeout; requesting termination",
+                             slots[i].entry->dbname);
+                    TerminateBackgroundWorker(slots[i].handle);
+                    (void) WaitForBackgroundWorkerShutdown(slots[i].handle);
+                    finished = true;
+                }
             }
 
-            elapsed_ms = (long) ((GetCurrentTimestamp() - slots[i].started_at) / 1000);
-            if (aav_got_sigterm ||
-                elapsed_ms >= (long) aav_database_worker_timeout_seconds * 1000L)
+            if (finished)
             {
-                if (!aav_got_sigterm)
-                    elog(WARNING,
-                         "adaptive autovacuum database worker \"%s\" exceeded timeout; requesting termination",
-                         slots[i].dbname);
-                TerminateBackgroundWorker(slots[i].handle);
-                (void) WaitForBackgroundWorkerShutdown(slots[i].handle);
+                if (aav_absorb_worker_result(slots[i].entry, generation, dup_installs,
+                                             &emergency_pending))
+                    (*completed)++;
+                else
+                    (*failed)++;
+                pfree(slots[i].handle);
                 slots[i].in_use = false;
                 active--;
+                if (aav_shared_state != NULL)
+                {
+                    SpinLockAcquire(&aav_shared_state->mutex);
+                    aav_shared_state->completed_databases = *completed;
+                    aav_shared_state->failed_databases = *failed;
+                    SpinLockRelease(&aav_shared_state->mutex);
+                }
             }
         }
+
+        /* Emergency requests are dispatched as soon as a database publishes them. */
+        aav_service_emergency();
     }
 
     pfree(slots);
 }
 
-/* ---------- per-database worker ---------- */
-
-PGDLLEXPORT void
-adaptive_autovacuum_database_main(Datum main_arg)
-{
-    Oid dboid = DatumGetObjectId(main_arg);
-    AAVHostMetrics metrics;
-    bool started_emergency = false;
-
-    pqsignal(SIGTERM, aav_sigterm);
-    pqsignal(SIGHUP, aav_sighup);
-    BackgroundWorkerUnblockSignals();
-
-    BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
-
-    PG_TRY();
-    {
-        if (!aav_extension_enabled_in_database())
-            proc_exit(0);
-
-        aav_collect_host_metrics(&metrics);
-        aav_execute_policy_cycle(&metrics);
-        aav_apply_global_settings();
-
-        /* Emergency VACUUMs run in a dedicated worker; under the worker timeout they livelocked. */
-        if (!aav_got_sigterm && aav_has_pending_emergency_request())
-            started_emergency = aav_start_emergency_worker(dboid);
-
-        if (aav_log_cycle_summary)
-            elog(LOG,
-                 "adaptive autovacuum cycle completed for database %u%s",
-                 dboid,
-                 started_emergency ? "; emergency VACUUM worker started" : "");
-    }
-    PG_CATCH();
-    {
-        ErrorData *edata;
-        MemoryContext old_context;
-        char *message;
-
-        old_context = MemoryContextSwitchTo(TopMemoryContext);
-        edata = CopyErrorData();
-        message = pstrdup(edata->message ? edata->message : "unknown error");
-        MemoryContextSwitchTo(old_context);
-
-        FlushErrorState();
-        aav_abort_transaction_if_needed();
-        elog(WARNING,
-             "adaptive autovacuum database cycle failed for database %u: %s",
-             dboid,
-             message);
-        FreeErrorData(edata);
-    }
-    PG_END_TRY();
-
-    proc_exit(0);
-}
-
-static bool
-aav_extension_enabled_in_database(void)
-{
-    bool installed = false;
-    bool enabled = false;
-    int spi_rc;
-    bool isnull;
-
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    spi_rc = SPI_execute(
-        "SELECT EXISTS ("
-        "  SELECT 1 FROM pg_catalog.pg_extension "
-        "  WHERE extname = 'adaptive_autovacuum'"
-        ")",
-        true,
-        1);
-
-    if (spi_rc == SPI_OK_SELECT && SPI_processed == 1)
-    {
-        installed = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                              SPI_tuptable->tupdesc,
-                                              1,
-                                              &isnull));
-        if (isnull)
-            installed = false;
-    }
-
-    if (installed)
-    {
-        spi_rc = SPI_execute(
-            "SELECT COALESCE(("
-            "  SELECT enabled FROM adaptive_autovacuum.policy WHERE singleton"
-            "), false)",
-            true,
-            1);
-
-        if (spi_rc == SPI_OK_SELECT && SPI_processed == 1)
-        {
-            enabled = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                                SPI_tuptable->tupdesc,
-                                                1,
-                                                &isnull));
-            if (isnull)
-                enabled = false;
-        }
-    }
-
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
-
-    return installed && enabled;
-}
-
-/* Sum the other databases' summaries (slots older than ten naptimes ignored); returns the count. */
-static int
-aav_collect_cluster_summary(Oid exclude_dboid, AAVClusterAgg *agg)
-{
-    TimestampTz now = GetCurrentTimestamp();
-    int i;
-
-    MemSet(agg, 0, sizeof(*agg));
-    agg->complete = true;
-
-    if (aav_shared_state == NULL)
-        aav_attach_shared_state();
-    if (aav_shared_state == NULL)
-        return 0;
-
-    SpinLockAcquire(&aav_shared_state->mutex);
-    /* Complete unless a summary was dropped for lack of a slot within the staleness window. */
-    agg->complete = (aav_shared_state->summary_overflow_at == 0
-                     || TimestampDifferenceExceeds(aav_shared_state->summary_overflow_at, now,
-                                                   10 * aav_naptime_seconds * 1000));
-    for (i = 0; i < aav_shared_state->summary_capacity; i++)
-    {
-        const AAVDbSummary *s = &aav_shared_state->summaries[i];
-
-        if (s->dboid == InvalidOid || s->dboid == exclude_dboid)
-            continue;
-        if (TimestampDifferenceExceeds(s->updated_at, now,
-                                       10 * aav_naptime_seconds * 1000))
-            continue;
-
-        agg->db_count++;
-        agg->eligible += s->eligible;
-        agg->overdue += s->overdue;
-        agg->dead_overdue += s->dead_overdue;
-        agg->insert_overdue += s->insert_overdue;
-        agg->fleet_max_target = Max(agg->fleet_max_target,
-                                    s->fleet_max_target);
-        agg->w_scale_sum += s->median_scale * s->dead_overdue;
-        agg->w_thresh_sum += s->median_thresh * s->dead_overdue;
-        agg->w_ins_scale_sum += s->median_ins_scale * s->insert_overdue;
-        agg->w_ins_thresh_sum += s->median_ins_thresh * s->insert_overdue;
-        agg->debt_tuples += s->debt_tuples;
-        agg->debt_velocity += s->debt_velocity;
-    }
-    SpinLockRelease(&aav_shared_state->mutex);
-
-    return agg->db_count;
-}
-
 static void
-aav_publish_summary(const AAVDbSummary *summary)
+aav_run_global_controller(const AAVHostMetrics *metrics, int64 generation, bool complete)
 {
-    static bool overflow_warned = false;
-    int i;
-    int free_slot = -1;
-    int oldest_slot = 0;
-    TimestampTz oldest = 0;
-    TimestampTz now = GetCurrentTimestamp();
-    int capacity;
-    int64 overflow_count = 0;
-
-    if (aav_shared_state == NULL)
-        aav_attach_shared_state();
-    if (aav_shared_state == NULL)
-        return;
-
-    SpinLockAcquire(&aav_shared_state->mutex);
-    capacity = aav_shared_state->summary_capacity;
-    for (i = 0; i < capacity; i++)
-    {
-        AAVDbSummary *s = &aav_shared_state->summaries[i];
-
-        if (s->dboid == summary->dboid)
-        {
-            free_slot = i;
-            break;
-        }
-        if (s->dboid == InvalidOid && free_slot < 0)
-            free_slot = i;
-        if (i == 0 || s->updated_at < oldest)
-        {
-            oldest = s->updated_at;
-            oldest_slot = i;
-        }
-    }
-    /* Only a stale slot (database gone or disabled) is reused; live evidence is never evicted. */
-    if (free_slot < 0
-        && TimestampDifferenceExceeds(oldest, now, 10 * aav_naptime_seconds * 1000))
-        free_slot = oldest_slot;
-    if (free_slot >= 0)
-        aav_shared_state->summaries[free_slot] = *summary;
-    else
-    {
-        aav_shared_state->summary_overflow_count++;
-        aav_shared_state->summary_overflow_at = now;
-        overflow_count = aav_shared_state->summary_overflow_count;
-    }
-    SpinLockRelease(&aav_shared_state->mutex);
-
-    if (free_slot < 0 && !overflow_warned)
-    {
-        overflow_warned = true;
-        ereport(WARNING,
-                (errmsg("adaptive autovacuum: no free summary slot for database %u (capacity %d, %ld drops so far)",
-                        summary->dboid, capacity, (long) overflow_count),
-                 errhint("Raise adaptive_autovacuum.max_tracked_databases; cluster-wide changes are recorded only while the evidence is incomplete.")));
-    }
-}
-
-static void
-aav_execute_policy_cycle(const AAVHostMetrics *metrics)
-{
-    Oid argtypes[5] = {FLOAT8OID, INT4OID, INT8OID, INT8OID, TEXTOID};
-    Datum values[5];
-    char nulls[5] = {' ', ' ', ' ', ' ', ' '};
-    AAVClusterAgg agg;
-    int spi_rc;
+    Oid argtypes[7] = {FLOAT8OID, INT4OID, INT8OID, INT8OID, INT8OID, BOOLOID, INT8OID};
+    Datum values[7];
 
     values[0] = Float8GetDatum(metrics->load1);
     values[1] = Int32GetDatum(metrics->cpu_count);
     values[2] = Int64GetDatum(metrics->mem_available_bytes);
     values[3] = Int64GetDatum(metrics->mem_total_bytes);
+    values[4] = Int64GetDatum(generation);
+    values[5] = BoolGetDatum(complete);
+    /* The next XID, read from shared memory: no transaction ID is assigned to measure the rate. */
+    values[6] = Int64GetDatum((int64) U64FromFullTransactionId(ReadNextFullTransactionId()));
 
-    if (aav_collect_cluster_summary(MyDatabaseId, &agg) > 0 || !agg.complete)
-    {
-        char *summary_json = psprintf(
-            "{\"db_count\":%d,"
-            "\"evidence_complete\":%s,"
-            "\"eligible\":" INT64_FORMAT ","
-            "\"overdue\":" INT64_FORMAT ","
-            "\"dead_overdue\":" INT64_FORMAT ","
-            "\"insert_overdue\":" INT64_FORMAT ","
-            "\"fleet_max_target\":" INT64_FORMAT ","
-            "\"w_scale_sum\":%.9g,"
-            "\"w_thresh_sum\":%.9g,"
-            "\"w_ins_scale_sum\":%.9g,"
-            "\"w_ins_thresh_sum\":%.9g,"
-            "\"debt_tuples\":" INT64_FORMAT ","
-            "\"debt_velocity\":%.9g}",
-            agg.db_count,
-            agg.complete ? "true" : "false",
-            agg.eligible,
-            agg.overdue,
-            agg.dead_overdue,
-            agg.insert_overdue,
-            agg.fleet_max_target,
-            agg.w_scale_sum,
-            agg.w_thresh_sum,
-            agg.w_ins_scale_sum,
-            agg.w_ins_thresh_sum,
-            agg.debt_tuples,
-            agg.debt_velocity);
-
-        values[4] = CStringGetTextDatum(summary_json);
-    }
-    else
-    {
-        values[4] = (Datum) 0;
-        nulls[4] = 'n';
-    }
-
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    spi_rc = SPI_execute_with_args(
-        "SELECT * FROM adaptive_autovacuum._run_cycle($1, $2, $3, $4, $5::jsonb)",
-        5,
-        argtypes,
-        values,
-        nulls,
-        false,
-        0);
-
-    if (spi_rc != SPI_OK_SELECT)
-        elog(ERROR, "adaptive autovacuum policy cycle returned SPI code %d",
-             spi_rc);
-
-    /* Publish this database's summary (zero rows = policy disabled). */
-    if (SPI_processed == 1)
-    {
-        HeapTuple tuple = SPI_tuptable->vals[0];
-        TupleDesc tupdesc = SPI_tuptable->tupdesc;
-        AAVDbSummary summary;
-        bool isnull;
-        Datum datum;
-
-        MemSet(&summary, 0, sizeof(summary));
-        summary.dboid = MyDatabaseId;
-        summary.updated_at = GetCurrentTimestamp();
-
-        datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-        summary.eligible = isnull ? 0 : DatumGetInt32(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
-        summary.overdue = isnull ? 0 : DatumGetInt32(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
-        summary.dead_overdue = isnull ? 0 : DatumGetInt32(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
-        summary.insert_overdue = isnull ? 0 : DatumGetInt32(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
-        summary.fleet_max_target = isnull ? 0 : DatumGetInt64(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 6, &isnull);
-        summary.median_scale = isnull ? 0.0 : DatumGetFloat8(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 7, &isnull);
-        summary.median_thresh = isnull ? 0.0 : DatumGetFloat8(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 8, &isnull);
-        summary.median_ins_scale = isnull ? 0.0 : DatumGetFloat8(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 9, &isnull);
-        summary.median_ins_thresh = isnull ? 0.0 : DatumGetFloat8(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 10, &isnull);
-        summary.debt_tuples = isnull ? 0 : DatumGetInt64(datum);
-        datum = SPI_getbinval(tuple, tupdesc, 11, &isnull);
-        summary.debt_velocity = isnull ? 0.0 : DatumGetFloat8(datum);
-
-        aav_publish_summary(&summary);
-    }
-
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    (void) aav_fetch_text(
+        "SELECT adaptive_autovacuum._global_controller($1, $2, $3, $4, $5, $6, $7)",
+        7, argtypes, values, NULL);
 }
+
+/* One sweep generation: discover, scan every database, decide once, apply once. */
+static void
+aav_run_sweep(MemoryContext sweep_context)
+{
+    MemoryContext old_context;
+    AAVHostMetrics metrics;
+    List *databases;
+    ListCell *lc;
+    char *generation_text;
+    int64 generation;
+    int expected = 0;
+    int completed = 0;
+    int failed = 0;
+    int dup_installs = 0;
+    char *program;
+    char path[MAXPGPATH];
+    TimestampTz started_at = GetCurrentTimestamp();
+
+    MemoryContextReset(sweep_context);
+    old_context = MemoryContextSwitchTo(sweep_context);
+
+    (void) aav_fetch_text("SELECT adaptive_autovacuum._recover_stale_emergencies()::text",
+                          0, NULL, NULL, NULL);
+
+    if (!aav_policy_enabled())
+    {
+        aav_set_controller_state("idle: policy.enabled = false");
+        MemoryContextSwitchTo(old_context);
+        return;
+    }
+
+    /* The database program is fetched once per sweep and shared by every worker through a file. */
+    program = aav_fetch_text("SELECT adaptive_autovacuum._database_program()", 0, NULL, NULL, NULL);
+    if (program == NULL || strstr(program, AAV_PROGRAM_TAG) != NULL)
+        elog(ERROR, "adaptive autovacuum database program is missing or contains the quoting tag");
+    aav_tmp_path(path, sizeof(path), "program.sql");
+    if (!aav_write_file(path, program))
+        elog(ERROR, "adaptive autovacuum could not publish the database program");
+
+    generation_text = aav_fetch_text("SELECT adaptive_autovacuum._begin_generation()::text",
+                                     0, NULL, NULL, NULL);
+    if (generation_text == NULL)
+        elog(ERROR, "adaptive autovacuum could not begin a sweep generation");
+    generation = strtoll(generation_text, NULL, 10);
+
+    aav_collect_host_metrics(&metrics);
+    databases = aav_discover_databases();
+    foreach(lc, databases)
+    {
+        AAVDatabaseEntry *entry = lfirst(lc);
+
+        if (!entry->excluded)
+            expected++;
+    }
+
+    if (aav_shared_state != NULL)
+    {
+        SpinLockAcquire(&aav_shared_state->mutex);
+        aav_shared_state->current_generation = generation;
+        aav_shared_state->expected_databases = expected;
+        aav_shared_state->completed_databases = 0;
+        aav_shared_state->failed_databases = 0;
+        aav_shared_state->generation_started_at = started_at;
+        aav_shared_state->generation_completed_at = 0;
+        SpinLockRelease(&aav_shared_state->mutex);
+    }
+    aav_set_controller_state("sweeping");
+
+    aav_run_database_workers(databases, generation, &metrics, &completed, &failed, &dup_installs);
+
+    if (aav_got_sigterm)
+    {
+        MemoryContextSwitchTo(old_context);
+        return;
+    }
+
+    /* Decide once, from fresh host metrics and the evidence this sweep collected. */
+    aav_collect_host_metrics(&metrics);
+    aav_run_global_controller(&metrics, generation, failed == 0 && completed == expected);
+    aav_apply_global_settings();
+
+    if (aav_shared_state != NULL)
+    {
+        TimestampTz now = GetCurrentTimestamp();
+        double seconds = (double) (now - started_at) / 1000000.0;
+
+        SpinLockAcquire(&aav_shared_state->mutex);
+        aav_shared_state->generation_completed_at = now;
+        aav_shared_state->observed_sweep_seconds =
+            aav_shared_state->observed_sweep_seconds > 0
+            ? 0.5 * seconds + 0.5 * aav_shared_state->observed_sweep_seconds
+            : seconds;
+        if (failed == 0 && completed == expected)
+            aav_shared_state->last_complete_generation = generation;
+        aav_shared_state->controller_failures = 0;
+        SpinLockRelease(&aav_shared_state->mutex);
+    }
+
+    if (dup_installs > 0)
+        ereport(WARNING,
+                (errmsg("adaptive autovacuum: the extension is also created in %d database(s) other than the control database; those copies are ignored",
+                        dup_installs),
+                 errhint("Install adaptive_autovacuum once per cluster, in the control database; see adaptive_autovacuum.doctor().")));
+
+    if (aav_log_cycle_summary)
+        elog(LOG,
+             "adaptive autovacuum sweep " INT64_FORMAT " completed: %d database(s) scanned, %d failed, %.1f s",
+             generation, completed, failed,
+             (double) (GetCurrentTimestamp() - started_at) / 1000000.0);
+
+    MemoryContextSwitchTo(old_context);
+}
+
+PGDLLEXPORT void
+adaptive_autovacuum_controller_main(Datum main_arg)
+{
+    Oid control_oid = DatumGetObjectId(main_arg);
+    MemoryContext sweep_context;
+    MemoryContext loop_context;
+    int not_ready_warnings = 0;
+
+    pqsignal(SIGTERM, aav_sigterm);
+    pqsignal(SIGHUP, aav_sighup);
+    BackgroundWorkerUnblockSignals();
+
+    BackgroundWorkerInitializeConnectionByOid(control_oid, InvalidOid, 0);
+
+    if (aav_shared_state != NULL)
+    {
+        SpinLockAcquire(&aav_shared_state->mutex);
+        aav_shared_state->controller_pid = MyProcPid;
+        aav_shared_state->control_database_oid = control_oid;
+        SpinLockRelease(&aav_shared_state->mutex);
+        before_shmem_exit(aav_release_controller_slot, (Datum) 0);
+    }
+    aav_set_controller_state("starting");
+
+    sweep_context = AllocSetContextCreate(TopMemoryContext,
+                                          "adaptive autovacuum sweep",
+                                          ALLOCSET_DEFAULT_SIZES);
+    loop_context = AllocSetContextCreate(TopMemoryContext,
+                                         "adaptive autovacuum controller loop",
+                                         ALLOCSET_DEFAULT_SIZES);
+
+    elog(LOG, "adaptive autovacuum controller started on control database \"%s\"",
+         aav_control_database);
+
+    while (!aav_got_sigterm)
+    {
+        int rc;
+        long wait_ms = (long) aav_naptime_seconds * 1000L;
+
+        /* Per-iteration scratch: a transaction abort may have left us in TopMemoryContext. */
+        MemoryContextReset(loop_context);
+        MemoryContextSwitchTo(loop_context);
+
+        if (aav_got_sighup)
+        {
+            aav_got_sighup = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
+
+        PG_TRY();
+        {
+            if (RecoveryInProgress())
+            {
+                aav_set_controller_state("idle: server in recovery");
+            }
+            else if (!aav_enabled)
+            {
+                aav_set_controller_state("disabled (adaptive_autovacuum.enabled = off)");
+            }
+            else
+            {
+                aav_ensure_tmp_dir();
+                if (!aav_control_plane_ready())
+                {
+                    aav_set_controller_state("waiting for CREATE EXTENSION in the control database");
+                    if (not_ready_warnings++ % 10 == 0)
+                        ereport(WARNING,
+                                (errmsg("adaptive autovacuum: the extension objects are missing or outdated in control database \"%s\"; nothing is managed",
+                                        aav_control_database),
+                                 errhint("Run CREATE EXTENSION adaptive_autovacuum (or ALTER EXTENSION adaptive_autovacuum UPDATE) in that database.")));
+                }
+                else
+                {
+                    not_ready_warnings = 0;
+                    aav_run_sweep(sweep_context);
+                    if (!aav_got_sigterm)
+                        aav_set_controller_state("running");
+                }
+            }
+        }
+        PG_CATCH();
+        {
+            char *message = aav_copy_error_message();
+
+            aav_abort_transaction_if_needed();
+            elog(WARNING, "adaptive autovacuum sweep failed: %s", message);
+            aav_set_controller_state("sweep failed; retrying after naptime");
+            pfree(message);
+        }
+        PG_END_TRY();
+
+        /* Emergency work keeps flowing between sweeps; wake on worker exit or the naptime. */
+        while (!aav_got_sigterm && wait_ms > 0)
+        {
+            TimestampTz before = GetCurrentTimestamp();
+
+            PG_TRY();
+            {
+                if (aav_enabled && !RecoveryInProgress() && aav_control_plane_ready())
+                    aav_service_emergency();
+            }
+            PG_CATCH();
+            {
+                char *message = aav_copy_error_message();
+
+                aav_abort_transaction_if_needed();
+                elog(WARNING, "adaptive autovacuum emergency dispatch failed: %s", message);
+                pfree(message);
+            }
+            PG_END_TRY();
+
+            rc = WaitLatch(MyLatch,
+                           WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+                           wait_ms,
+                           PG_WAIT_EXTENSION);
+            ResetLatch(MyLatch);
+            if (rc & WL_POSTMASTER_DEATH)
+                proc_exit(1);
+            /* Absorb interrupts (ProcSignalBarriers) or DROP DATABASE waits forever. */
+            CHECK_FOR_INTERRUPTS();
+            /* A reload takes effect here; it does not trigger an extra sweep. */
+            if (aav_got_sighup)
+            {
+                aav_got_sighup = false;
+                ProcessConfigFile(PGC_SIGHUP);
+            }
+            wait_ms -= (long) ((GetCurrentTimestamp() - before) / 1000);
+        }
+    }
+
+    elog(LOG, "adaptive autovacuum controller shutting down");
+    proc_exit(0);
+}
+
+
+/* ---------- cluster settings: applied only by the controller ---------- */
 
 /* GUCs the policy may change cluster-wide; anything else is marked failed. */
 static const char *const aav_allowed_global_gucs[] = {
@@ -1422,9 +1829,6 @@ static const char *const aav_allowed_global_gucs[] = {
     /* Repair only: the policy queues 'on' and the apply path refuses any other value. */
     "autovacuum",
 };
-
-StaticAssertDecl(lengthof(aav_allowed_global_gucs) <= AAV_GLOBAL_GUC_SLOTS,
-                 "aav_allowed_global_gucs exceeds AAV_GLOBAL_GUC_SLOTS");
 
 /* Whitelist position, or -1 when the GUC is not managed. */
 static int
@@ -1480,7 +1884,6 @@ static void
 aav_apply_global_settings(void)
 {
     int spi_rc;
-    bool isnull;
     uint64 nrows;
     uint64 i;
     int64 *ids;
@@ -1491,37 +1894,6 @@ aav_apply_global_settings(void)
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
-
-    /* Only the designated database's worker may run ALTER SYSTEM. */
-    if (aav_global_settings_database != NULL &&
-        aav_global_settings_database[0] != '\0')
-    {
-        char *dbname = get_database_name(MyDatabaseId);
-
-        if (dbname == NULL ||
-            strcmp(dbname, aav_global_settings_database) != 0)
-        {
-            PopActiveSnapshot();
-            SPI_finish();
-            CommitTransactionCommand();
-            return;
-        }
-    }
-
-    /* Tolerate an older extension SQL version without the queue table. */
-    spi_rc = SPI_execute(
-        "SELECT to_regclass('adaptive_autovacuum.global_apply_queue') IS NOT NULL",
-        true, 1);
-    if (spi_rc != SPI_OK_SELECT || SPI_processed != 1 ||
-        !DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                    SPI_tuptable->tupdesc, 1, &isnull)) ||
-        isnull)
-    {
-        PopActiveSnapshot();
-        SPI_finish();
-        CommitTransactionCommand();
-        return;
-    }
 
     spi_rc = SPI_execute(
         "SELECT q.id, q.guc_name, q.desired_value "
@@ -1547,6 +1919,7 @@ aav_apply_global_settings(void)
     {
         HeapTuple tuple = SPI_tuptable->vals[i];
         TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        bool isnull;
 
         ids[i] = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
         names[i] = SPI_getvalue(tuple, tupdesc, 2);
@@ -1570,24 +1943,6 @@ aav_apply_global_settings(void)
             aav_mark_global_change(ids[i], "failed", NULL,
                                    "GUC is not in the managed whitelist.");
             continue;
-        }
-
-        /* Cross-database cooldown: one apply per GUC per two naptimes; skipped rows stay pending. */
-        if (aav_shared_state == NULL)
-            aav_attach_shared_state();
-        if (aav_shared_state != NULL)
-        {
-            TimestampTz last_applied;
-
-            SpinLockAcquire(&aav_shared_state->mutex);
-            last_applied = aav_shared_state->global_applied_at[guc_index];
-            SpinLockRelease(&aav_shared_state->mutex);
-
-            if (last_applied != 0 &&
-                !TimestampDifferenceExceeds(last_applied,
-                                            GetCurrentTimestamp(),
-                                            2 * aav_naptime_seconds * 1000))
-                continue;
         }
 
         /* autovacuum is repair-only: 'on' is the single accepted value. */
@@ -1680,13 +2035,6 @@ aav_apply_global_settings(void)
             continue;
         }
 
-        if (aav_shared_state != NULL)
-        {
-            SpinLockAcquire(&aav_shared_state->mutex);
-            aav_shared_state->global_applied_at[guc_index] = GetCurrentTimestamp();
-            SpinLockRelease(&aav_shared_state->mutex);
-        }
-
         aav_mark_global_change(ids[i], "applied", old_value, NULL);
         applied_count++;
 
@@ -1704,54 +2052,127 @@ aav_apply_global_settings(void)
         (void) kill(PostmasterPid, SIGHUP);
 }
 
-/* ---------- emergency worker ---------- */
 
-static bool
-aav_has_pending_emergency_request(void)
+/* ---------- per-database worker: collector and executor, never a controller ---------- */
+
+PGDLLEXPORT void
+adaptive_autovacuum_database_main(Datum main_arg)
 {
-    bool pending = false;
-    int spi_rc;
-    bool isnull;
+    Oid dboid = DatumGetObjectId(main_arg);
+    char in_path[MAXPGPATH];
+    char out_path[MAXPGPATH];
+    char program_path[MAXPGPATH];
+    char name[64];
+    char *volatile output = NULL;
 
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
+    pqsignal(SIGTERM, aav_sigterm);
+    pqsignal(SIGHUP, aav_sighup);
+    BackgroundWorkerUnblockSignals();
 
-    spi_rc = SPI_execute(
-        "SELECT EXISTS ("
-        "  SELECT 1 FROM adaptive_autovacuum.emergency_queue "
-        "  WHERE status = 'pending' "
-        "    AND next_retry_at <= clock_timestamp()"
-        ")",
-        true,
-        1);
+    BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
-    if (spi_rc == SPI_OK_SELECT && SPI_processed == 1)
+    snprintf(name, sizeof(name), "%u.in", dboid);
+    aav_tmp_path(in_path, sizeof(in_path), name);
+    snprintf(name, sizeof(name), "%u.out", dboid);
+    aav_tmp_path(out_path, sizeof(out_path), name);
+    aav_tmp_path(program_path, sizeof(program_path), "program.sql");
+
+    PG_TRY();
     {
-        pending = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
-                                             SPI_tuptable->tupdesc,
-                                             1,
-                                             &isnull));
-        if (isnull)
-            pending = false;
+        Oid argtypes[1] = {TEXTOID};
+        Datum values[1];
+        char *input;
+        char *program;
+        StringInfoData stmt;
+        const char *result;
+        int spi_rc;
+
+        input = aav_read_file(in_path);
+        if (input == NULL)
+            elog(ERROR, "input document \"%s\" is missing", in_path);
+        program = aav_read_file(program_path);
+        if (program == NULL)
+            elog(ERROR, "database program \"%s\" is missing", program_path);
+        if (strstr(program, AAV_PROGRAM_TAG) != NULL)
+            elog(ERROR, "database program contains the quoting tag");
+
+        initStringInfo(&stmt);
+        appendStringInfoString(&stmt, "DO " AAV_PROGRAM_TAG);
+        appendStringInfoString(&stmt, program);
+        appendStringInfoString(&stmt, AAV_PROGRAM_TAG);
+
+        /* The whole scan is one transaction; the program isolates each DDL in its own subtransaction. */
+        StartTransactionCommand();
+        SPI_connect();
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        values[0] = CStringGetTextDatum(input);
+        spi_rc = SPI_execute_with_args(
+            "SELECT pg_catalog.set_config('adaptive_autovacuum.worker_input', $1, false)",
+            1, argtypes, values, NULL, false, 0);
+        if (spi_rc != SPI_OK_SELECT)
+            elog(ERROR, "could not hand the input document to the program: SPI code %d", spi_rc);
+        spi_rc = SPI_execute(
+            "SELECT pg_catalog.set_config('adaptive_autovacuum.worker_output', '', false)",
+            false, 0);
+        if (spi_rc != SPI_OK_SELECT)
+            elog(ERROR, "could not reset the output slot: SPI code %d", spi_rc);
+
+        spi_rc = SPI_execute(stmt.data, false, 0);
+        if (spi_rc != SPI_OK_UTILITY)
+            elog(ERROR, "database program returned SPI code %d", spi_rc);
+
+        result = GetConfigOption("adaptive_autovacuum.worker_output", true, false);
+        if (result == NULL || result[0] == '\0')
+            elog(ERROR, "database program produced no output");
+        output = MemoryContextStrdup(TopMemoryContext, result);
+
+        PopActiveSnapshot();
+        SPI_finish();
+        CommitTransactionCommand();
     }
+    PG_CATCH();
+    {
+        char *message = aav_copy_error_message();
+        StringInfoData doc;
 
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+        aav_abort_transaction_if_needed();
+        MemoryContextSwitchTo(TopMemoryContext);
+        elog(WARNING,
+             "adaptive autovacuum database scan failed for database %u: %s",
+             dboid, message);
+        initStringInfo(&doc);
+        appendStringInfoString(&doc, "{\"ok\": false, \"error\": ");
+        escape_json(&doc, message);
+        appendStringInfoString(&doc, "}");
+        output = doc.data;
+    }
+    PG_END_TRY();
 
-    return pending;
+    (void) aav_write_file(out_path, output);
+
+    if (aav_log_cycle_summary)
+        elog(DEBUG1, "adaptive autovacuum database scan completed for database %u", dboid);
+
+    proc_exit(0);
 }
 
-/* Fire-and-forget: register the emergency worker and exit; the shmem slot serializes. */
+
+/* ---------- emergency worker: one request per process, dispatched by the controller ---------- */
+
+static BackgroundWorkerHandle *aav_emergency_handle = NULL;
+static AAVEmergencyRequest aav_emergency_current;
+static bool aav_emergency_pid_recorded = false;
+
 static bool
-aav_start_emergency_worker(Oid dboid)
+aav_start_emergency_worker(const AAVEmergencyRequest *request, const char *dbname,
+                           BackgroundWorkerHandle **handle)
 {
     BackgroundWorker worker;
 
     MemSet(&worker, 0, sizeof(worker));
     snprintf(worker.bgw_name, BGW_MAXLEN,
-             "adaptive autovacuum emergency worker");
+             "adaptive autovacuum emergency %s", dbname);
     snprintf(worker.bgw_type, BGW_MAXLEN,
              "adaptive autovacuum emergency worker");
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
@@ -1761,18 +2182,155 @@ aav_start_emergency_worker(Oid dboid)
     snprintf(worker.bgw_library_name, MAXPGPATH, "adaptive_autovacuum");
     snprintf(worker.bgw_function_name, BGW_MAXLEN,
              "adaptive_autovacuum_emergency_main");
-    worker.bgw_main_arg = ObjectIdGetDatum(dboid);
-    worker.bgw_notify_pid = 0;
+    worker.bgw_main_arg = ObjectIdGetDatum(request->dboid);
+    memcpy(worker.bgw_extra, request, sizeof(*request));
+    worker.bgw_notify_pid = MyProcPid;
 
-    if (!RegisterDynamicBackgroundWorker(&worker, NULL))
+    return RegisterDynamicBackgroundWorker(&worker, handle);
+}
+
+/* Finish the running emergency request if its worker is done, then dispatch the next one. */
+static void
+aav_service_emergency(void)
+{
+    if (aav_emergency_handle != NULL)
     {
-        elog(WARNING,
-             "adaptive autovacuum could not register the emergency worker for database %u; check max_worker_processes",
-             dboid);
-        return false;
+        pid_t pid;
+        BgwHandleStatus status = GetBackgroundWorkerPid(aav_emergency_handle, &pid);
+
+        if (status == BGWH_POSTMASTER_DIED)
+            proc_exit(1);
+        if (status == BGWH_STARTED && !aav_emergency_pid_recorded)
+        {
+            Oid argtypes[2] = {INT8OID, INT4OID};
+            Datum values[2];
+
+            values[0] = Int64GetDatum(aav_emergency_current.request_id);
+            values[1] = Int32GetDatum((int32) pid);
+            (void) aav_fetch_text("SELECT adaptive_autovacuum._set_emergency_worker_pid($1, $2)",
+                                  2, argtypes, values, NULL);
+            aav_emergency_pid_recorded = true;
+        }
+        if (status == BGWH_STOPPED)
+        {
+            char path[MAXPGPATH];
+            char name[64];
+            char *result;
+            const char *outcome = "failed";
+            const char *error_text = "emergency worker exited without a result";
+            Oid argtypes[3] = {INT8OID, TEXTOID, TEXTOID};
+            Datum values[3];
+            char nulls[3] = {' ', ' ', ' '};
+
+            snprintf(name, sizeof(name), "emergency_" INT64_FORMAT ".out",
+                     aav_emergency_current.request_id);
+            aav_tmp_path(path, sizeof(path), name);
+            result = aav_read_file(path);
+            unlink(path);
+            if (result != NULL)
+            {
+                char *newline = strchr(result, '\n');
+
+                if (newline != NULL)
+                {
+                    *newline = '\0';
+                    error_text = newline + 1;
+                }
+                else
+                    error_text = NULL;
+                outcome = result;
+            }
+
+            values[0] = Int64GetDatum(aav_emergency_current.request_id);
+            values[1] = CStringGetTextDatum(outcome);
+            if (error_text != NULL && error_text[0] != '\0')
+                values[2] = CStringGetTextDatum(error_text);
+            else
+            {
+                values[2] = (Datum) 0;
+                nulls[2] = 'n';
+            }
+            (void) aav_fetch_text("SELECT adaptive_autovacuum._finish_emergency_request($1, $2, $3)",
+                                  3, argtypes, values, nulls);
+            if (aav_log_cycle_summary)
+                elog(LOG,
+                     "adaptive autovacuum emergency VACUUM of relation %u in database %u %s%s%s",
+                     aav_emergency_current.relid, aav_emergency_current.dboid, outcome,
+                     error_text != NULL && error_text[0] != '\0' ? ": " : "",
+                     error_text != NULL ? error_text : "");
+            pfree(aav_emergency_handle);
+            aav_emergency_handle = NULL;
+        }
     }
 
-    return true;
+    if (aav_emergency_handle == NULL && !aav_got_sigterm)
+    {
+        int spi_rc;
+
+        StartTransactionCommand();
+        SPI_connect();
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        spi_rc = SPI_execute(
+            "SELECT id, database_oid, database_name, relid, work_mem_mb, cost_limit, "
+            "       cost_delay_ms, lock_timeout_ms, is_wraparound "
+            "FROM adaptive_autovacuum._claim_emergency_request()",
+            false, 1);
+        if (spi_rc != SPI_OK_SELECT)
+            elog(ERROR, "adaptive autovacuum could not claim an emergency request: SPI code %d", spi_rc);
+
+        if (SPI_processed == 1)
+        {
+            HeapTuple tuple = SPI_tuptable->vals[0];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+            bool isnull;
+            AAVEmergencyRequest request;
+            char *dbname;
+
+            MemSet(&request, 0, sizeof(request));
+            request.request_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+            request.dboid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 2, &isnull));
+            dbname = SPI_getvalue(tuple, tupdesc, 3);
+            request.relid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 4, &isnull));
+            request.work_mem_mb = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
+            request.cost_limit = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 6, &isnull));
+            request.cost_delay_ms = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 7, &isnull));
+            request.lock_timeout_ms = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 8, &isnull));
+            request.is_wraparound = DatumGetBool(SPI_getbinval(tuple, tupdesc, 9, &isnull));
+
+            {
+                MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+
+                if (aav_start_emergency_worker(&request, dbname != NULL ? dbname : "?",
+                                               &aav_emergency_handle))
+                {
+                    aav_emergency_current = request;
+                    aav_emergency_pid_recorded = false;
+                }
+                MemoryContextSwitchTo(old_context);
+            }
+
+            if (aav_emergency_handle == NULL)
+            {
+                Oid argtypes[3] = {INT8OID, TEXTOID, TEXTOID};
+                Datum values[3];
+
+                values[0] = Int64GetDatum(request.request_id);
+                values[1] = CStringGetTextDatum("failed");
+                values[2] = CStringGetTextDatum("could not register the emergency worker; check max_worker_processes");
+                (void) SPI_execute_with_args(
+                    "SELECT adaptive_autovacuum._finish_emergency_request($1, $2, $3)",
+                    3, argtypes, values, NULL, false, 0);
+                elog(WARNING,
+                     "adaptive autovacuum could not register the emergency worker for database %u; check max_worker_processes",
+                     request.dboid);
+            }
+        }
+
+        PopActiveSnapshot();
+        SPI_finish();
+        CommitTransactionCommand();
+    }
 }
 
 /* SIGALRM context: flags only; the cancel surfaces at the next CHECK_FOR_INTERRUPTS(). */
@@ -1791,204 +2349,75 @@ adaptive_autovacuum_emergency_main(Datum main_arg)
     Oid dboid = DatumGetObjectId(main_arg);
     AAVEmergencyRequest request;
     TimeoutId timeout_id;
-    int processed = 0;
+    char path[MAXPGPATH];
+    char name[64];
+    StringInfoData result;
 
     pqsignal(SIGTERM, aav_sigterm);
     pqsignal(SIGHUP, aav_sighup);
     BackgroundWorkerUnblockSignals();
 
+    memcpy(&request, MyBgworkerEntry->bgw_extra, sizeof(request));
+    snprintf(name, sizeof(name), "emergency_" INT64_FORMAT ".out", request.request_id);
+    aav_tmp_path(path, sizeof(path), name);
+    MemoryContextSwitchTo(TopMemoryContext);
+    initStringInfo(&result);
+
     BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 
     /* One emergency VACUUM cluster-wide; slot released by the before_shmem_exit hook. */
     if (!aav_try_acquire_emergency_slot(dboid))
+    {
+        appendStringInfoString(&result, "failed\nanother emergency VACUUM is already running in this cluster");
+        (void) aav_write_file(path, result.data);
         proc_exit(0);
+    }
 
     timeout_id = RegisterTimeout(USER_TIMEOUT, aav_emergency_timeout_handler);
 
-    /* Drain the queue serially; each request gets its own timeout budget. */
-    while (!aav_got_sigterm && aav_claim_emergency_request(&request))
+    PG_TRY();
     {
-        PG_TRY();
+        aav_emergency_timed_out = false;
+        if (aav_emergency_timeout_seconds > 0)
+            enable_timeout_after(timeout_id, aav_emergency_timeout_seconds * 1000);
+
+        aav_run_emergency_vacuum(&request);
+
+        disable_timeout(timeout_id, false);
+        if (aav_emergency_timed_out)
         {
+            /* Vacuum finished as the timeout fired; ignore the stale cancel. */
             aav_emergency_timed_out = false;
-            if (aav_emergency_timeout_seconds > 0)
-                enable_timeout_after(timeout_id,
-                                     aav_emergency_timeout_seconds * 1000);
-
-            aav_run_emergency_vacuum(&request);
-
-            disable_timeout(timeout_id, false);
-            if (aav_emergency_timed_out)
-            {
-                /* Vacuum finished as the timeout fired; ignore the stale cancel. */
-                aav_emergency_timed_out = false;
-                QueryCancelPending = false;
-            }
-            aav_finish_emergency_request(&request, "completed", NULL);
-        }
-        PG_CATCH();
-        {
-            ErrorData *edata;
-            MemoryContext old_context;
-            char *message;
-
-            disable_timeout(timeout_id, false);
             QueryCancelPending = false;
-
-            old_context = MemoryContextSwitchTo(TopMemoryContext);
-            edata = CopyErrorData();
-            message = pstrdup(edata->message ? edata->message : "unknown error");
-            MemoryContextSwitchTo(old_context);
-
-            FlushErrorState();
-            aav_abort_transaction_if_needed();
-
-            if (aav_emergency_timed_out)
-            {
-                message = psprintf("adaptive_autovacuum.emergency_timeout_seconds (%d s) exceeded: %s",
-                                   aav_emergency_timeout_seconds, message);
-                aav_emergency_timed_out = false;
-            }
-
-            aav_finish_emergency_request(&request, "failed", message);
-            FreeErrorData(edata);
-
-            elog(WARNING,
-                 "adaptive autovacuum emergency VACUUM failed for relation %u: %s",
-                 request.relid,
-                 message);
         }
-        PG_END_TRY();
-
-        processed++;
+        appendStringInfoString(&result, "completed");
     }
-
-    if (aav_log_cycle_summary)
-        elog(LOG,
-             "adaptive autovacuum emergency worker for database %u processed %d request(s)",
-             dboid,
-             processed);
-
-    proc_exit(0);
-}
-
-static bool
-aav_claim_emergency_request(AAVEmergencyRequest *request)
-{
-    int spi_rc;
-    bool isnull;
-    bool claimed = false;
-
-    MemSet(request, 0, sizeof(*request));
-
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    spi_rc = SPI_execute(
-        "WITH candidate AS ("
-        "  SELECT id "
-        "  FROM adaptive_autovacuum.emergency_queue "
-        "  WHERE status = 'pending' "
-        "    AND next_retry_at <= clock_timestamp() "
-        "  ORDER BY deadline_seconds ASC NULLS LAST, priority DESC, requested_at "
-        "  LIMIT 1 "
-        "  FOR UPDATE SKIP LOCKED"
-        ") "
-        "UPDATE adaptive_autovacuum.emergency_queue q "
-        "SET status = 'running', "
-        "    started_at = clock_timestamp(), "
-        "    worker_pid = pg_backend_pid(), "
-        "    attempts = attempts + 1 "
-        "FROM candidate "
-        "WHERE q.id = candidate.id "
-        "RETURNING q.id, q.relid, q.work_mem_mb, q.cost_limit, "
-        "          q.cost_delay_ms, q.lock_timeout_ms, q.is_wraparound",
-        false,
-        1);
-
-    if (spi_rc != SPI_OK_UPDATE_RETURNING)
-        elog(ERROR, "adaptive autovacuum could not claim emergency request: SPI code %d",
-             spi_rc);
-
-    if (SPI_processed == 1)
+    PG_CATCH();
     {
-        HeapTuple tuple = SPI_tuptable->vals[0];
-        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        char *message;
 
-        request->request_id = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-        request->relid = DatumGetObjectId(SPI_getbinval(tuple, tupdesc, 2, &isnull));
-        request->work_mem_mb = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 3, &isnull));
-        request->cost_limit = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 4, &isnull));
-        request->cost_delay_ms = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
-        request->lock_timeout_ms = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 6, &isnull));
-        request->is_wraparound = DatumGetBool(SPI_getbinval(tuple, tupdesc, 7, &isnull));
-        claimed = true;
-    }
+        disable_timeout(timeout_id, false);
+        QueryCancelPending = false;
+        message = aav_copy_error_message();
+        aav_abort_transaction_if_needed();
+        MemoryContextSwitchTo(TopMemoryContext);
 
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+        if (aav_emergency_timed_out)
+        {
+            message = psprintf("adaptive_autovacuum.emergency_timeout_seconds (%d s) exceeded: %s",
+                               aav_emergency_timeout_seconds, message);
+            aav_emergency_timed_out = false;
+        }
 
-    return claimed;
-}
-
-static void
-aav_finish_emergency_request(const AAVEmergencyRequest *request,
-                             const char *status,
-                             const char *error_text)
-{
-    Oid argtypes[3] = {INT8OID, TEXTOID, TEXTOID};
-    Datum values[3];
-    char nulls[3] = {' ', ' ', ' '};
-    int spi_rc;
-
-    values[0] = Int64GetDatum(request->request_id);
-    values[1] = CStringGetTextDatum(status);
-    if (error_text != NULL)
-        values[2] = CStringGetTextDatum(error_text);
-    else
-    {
-        values[2] = (Datum) 0;
-        nulls[2] = 'n';
-    }
-
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    /* Escalating backoff: Nth recent failure waits N x 5 min (cap 2 h). */
-    spi_rc = SPI_execute_with_args(
-        "UPDATE adaptive_autovacuum.emergency_queue q "
-        "SET status = $2, "
-        "    finished_at = clock_timestamp(), "
-        "    last_error = $3, "
-        "    next_retry_at = CASE WHEN $2 = 'failed' "
-        "                         THEN clock_timestamp() "
-        "                              + LEAST(24, 1 + (SELECT count(*) "
-        "                                               FROM adaptive_autovacuum.emergency_queue f "
-        "                                               WHERE f.relid = q.relid "
-        "                                                 AND f.id <> q.id "
-        "                                                 AND f.status = 'failed' "
-        "                                                 AND f.finished_at > clock_timestamp() - interval '24 hours')) "
-        "                                * interval '5 minutes' "
-        "                         ELSE q.next_retry_at END "
-        "WHERE q.id = $1",
-        3,
-        argtypes,
-        values,
-        nulls,
-        false,
-        0);
-
-    if (spi_rc != SPI_OK_UPDATE)
+        appendStringInfo(&result, "failed\n%s", message);
         elog(WARNING,
-             "adaptive autovacuum could not update emergency request " INT64_FORMAT,
-             request->request_id);
+             "adaptive autovacuum emergency VACUUM failed for relation %u in database %u: %s",
+             request.relid, dboid, message);
+    }
+    PG_END_TRY();
 
-    PopActiveSnapshot();
-    SPI_finish();
-    CommitTransactionCommand();
+    (void) aav_write_file(path, result.data);
+    proc_exit(0);
 }
 
 static void
@@ -2056,4 +2485,3 @@ aav_abort_transaction_if_needed(void)
     if (IsTransactionState())
         AbortCurrentTransaction();
 }
-
