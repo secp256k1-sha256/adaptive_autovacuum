@@ -22,8 +22,15 @@ DECLARE
     host_metrics_available boolean;
     host_mem_available_bytes bigint;
     xid_rate double precision;
+    prev_eligible integer;
+    prev_dead_overdue integer;
+    prev_insert_overdue integer;
+    widespread_dead boolean;
+    widespread_insert boolean;
 
     autovacuum_enabled_global boolean;
+    global_cost_limit integer;
+    global_cost_delay double precision;
     freeze_max_age bigint;
     multixact_freeze_max_age bigint;
     current_vacuum_threshold double precision;
@@ -56,6 +63,7 @@ DECLARE
     analyze_count integer := 0;
 
     vacuum_trigger double precision;
+    insert_trigger double precision;
     backlog_ratio double precision;
     insert_ratio double precision;
     pressure_ratio double precision;
@@ -81,14 +89,15 @@ DECLARE
     healthy_cycles integer;
 
     /* Previous table_state row (before-image in r.prev_*, mutable copy here). */
-    pv_original_reloptions text[];
-    pv_original_captured boolean;
-    pv_managed_values jsonb;
-    pv_ownership_conflict boolean;
     pv_state text;
     pv_consecutive_overdue integer;
     pv_consecutive_healthy integer;
-    pv_last_change_at timestamptz;
+    pv_rec_status text;
+    pv_recommended jsonb;
+    pv_previous jsonb;
+    pv_reason text;
+    pv_recommended_at timestamptz;
+    pv_applied_at timestamptz;
     pv_last_vacuum_pid integer;
     pv_last_vacuum_progress text;
     pv_vacuum_stalled_cycles integer;
@@ -107,34 +116,34 @@ DECLARE
     desired_insert_threshold integer;
     desired_insert_scale double precision;
     desired_values jsonb;
+    trigger_keys jsonb;
+    insert_keys jsonb;
+    cost_keys jsonb;
+    keys_match boolean;
+    rec_parts text[];
+    recommend_now boolean;
     relation_json jsonb;
 
-    change_count integer := 0;
+    /* Recommendation lifecycle of this relation (open -> applied -> revert), as decided this cycle. */
+    new_rec_status text;
+    new_recommended jsonb;
+    new_previous jsonb;
+    new_reason text;
+    new_recommended_at timestamptz;
+    new_applied_at timestamptz;
+    recommended_count integer := 0;
+
     cost_boost_count integer := 0;
     wants_cost_boost boolean;
     has_existing_cost_boost boolean;
-    desired_cost_limit integer;
-    desired_cost_delay double precision;
     tier_cost_limit integer;
     tier_cost_delay double precision;
-    prev_boost integer;
-    budget_headroom integer;
-    cost_budget_used integer := 0;
-    cooldown_ok boolean;
-    current_matches_managed boolean;
-    should_apply boolean;
+    eff_cost_limit integer;
+    eff_cost_delay double precision;
     applied boolean;
     action_name text;
     action_error text;
-    apply_kind text;
-    apply_desired jsonb;
-    rec_option_name text;
-    rec_option_value text;
-    rec_original_value text;
-    rec_reset_names text[];
-    rec_set_parts text[];
     state_needed boolean;
-    new_last_change_at timestamptz;
     emergency_work_mem_mb integer;
 
     out_state jsonb := '[]'::jsonb;
@@ -151,13 +160,12 @@ BEGIN
         target_insert_ratio double precision, target_insert_min bigint, target_insert_max bigint,
         threshold_floor integer, min_scale_factor double precision, max_scale_factor double precision,
         backlog_elevated_ratio double precision, backlog_urgent_ratio double precision, backlog_critical_ratio double precision,
-        overdue_cycles_before_change integer, healthy_cycles_before_restore integer,
-        change_cooldown_seconds integer, lock_timeout_ms integer, max_changes_per_cycle integer,
+        overdue_cycles_before_recommend integer, healthy_cycles_before_revert integer,
+        lock_timeout_ms integer,
         analyze_missing_stats boolean, analyze_missing_stats_budget_ms integer,
-        manage_table_costs boolean, max_boosted_relations integer,
+        recommend_table_costs boolean, max_boosted_relations integer,
         elevated_cost_limit integer, urgent_cost_limit integer, critical_cost_limit integer,
         elevated_cost_delay_ms double precision, urgent_cost_delay_ms double precision, critical_cost_delay_ms double precision,
-        boost_ramp_factor double precision, boost_total_cost_limit_budget integer,
         xid_warning_ratio double precision, mxid_warning_ratio double precision,
         emergency_xid_age bigint, emergency_mxid_age bigint, emergency_stall_multiplier double precision,
         emergency_takeover_min_runtime_seconds integer, emergency_takeover_stall_samples integer,
@@ -174,9 +182,14 @@ BEGIN
     host_metrics_available := COALESCE((host_json ->> 'memory_metrics_available')::boolean, false);
     host_mem_available_bytes := COALESCE((host_json ->> 'mem_available_bytes')::bigint, 0);
     xid_rate := (input -> 'cluster' ->> 'xid_rate')::double precision;
-    /* Cost boosts held in the other databases count against the cluster-wide budget. */
+    /* Same rule as the cluster baseline detector: 3 relations and a quarter of the fleet overdue in the last scan. */
+    prev_eligible := COALESCE((input -> 'cluster' ->> 'prev_eligible')::integer, 0);
+    prev_dead_overdue := COALESCE((input -> 'cluster' ->> 'prev_dead_overdue')::integer, 0);
+    prev_insert_overdue := COALESCE((input -> 'cluster' ->> 'prev_insert_overdue')::integer, 0);
+    widespread_dead := prev_dead_overdue >= 3 AND prev_dead_overdue * 4 >= prev_eligible;
+    widespread_insert := prev_insert_overdue >= 3 AND prev_insert_overdue * 4 >= prev_eligible;
+    /* Cost-boost recommendations standing in the other databases share the slot limit. */
     cost_boost_count := COALESCE((input -> 'cluster' ->> 'boosted_relations_elsewhere')::integer, 0);
-    cost_budget_used := COALESCE((input -> 'cluster' ->> 'boost_budget_used_elsewhere')::integer, 0);
 
     SELECT setting::boolean INTO autovacuum_enabled_global
     FROM pg_settings WHERE name = 'autovacuum';
@@ -194,6 +207,15 @@ BEGIN
     FROM pg_settings WHERE name = 'autovacuum_vacuum_insert_threshold';
     SELECT setting::double precision INTO current_insert_scale_factor
     FROM pg_settings WHERE name = 'autovacuum_vacuum_insert_scale_factor';
+    /* The pair a table without its own cost reloptions vacuums under (-1 = the manual-vacuum setting). */
+    SELECT CASE WHEN a.setting::integer < 0 THEN v.setting::integer ELSE a.setting::integer END
+    INTO global_cost_limit
+    FROM pg_settings a, pg_settings v
+    WHERE a.name = 'autovacuum_vacuum_cost_limit' AND v.name = 'vacuum_cost_limit';
+    SELECT CASE WHEN a.setting::double precision < 0 THEN v.setting::double precision ELSE a.setting::double precision END
+    INTO global_cost_delay
+    FROM pg_settings a, pg_settings v
+    WHERE a.name = 'autovacuum_vacuum_cost_delay' AND v.name = 'vacuum_cost_delay';
 
     /* Oldest cleanup-horizon blocker visible from this database, fetched once per cycle. */
     SELECT b.blocker_age, b.blocker_kind, b.blocker_detail
@@ -224,14 +246,13 @@ BEGIN
     ORDER BY b.blocker_age DESC
     LIMIT 1;
 
-    /* This database's own cost boosts, from the previous state rows handed in. */
-    SELECT cost_boost_count + count(*),
-           cost_budget_used + COALESCE(sum((ts.managed_values ->> 'autovacuum_vacuum_cost_limit')::numeric), 0)::integer
-    INTO cost_boost_count, cost_budget_used
+    /* This database's own standing cost-boost recommendations, from the previous state rows handed in. */
+    SELECT cost_boost_count + count(*)
+    INTO cost_boost_count
     FROM jsonb_to_recordset(COALESCE(input -> 'table_state', '[]'::jsonb))
-         AS ts(managed_values jsonb, ownership_conflict boolean)
-    WHERE ts.managed_values ? 'autovacuum_vacuum_cost_limit'
-      AND NOT ts.ownership_conflict;
+         AS ts(recommendation_status text, recommended_reloptions jsonb)
+    WHERE ts.recommendation_status IS NOT NULL
+      AND ts.recommended_reloptions ? 'autovacuum_vacuum_cost_limit';
 
     /* Fleet aggregates over every eligible relation; the loop below only sees the interesting ones. */
     WITH tpol AS MATERIALIZED (
@@ -292,12 +313,13 @@ BEGIN
         ),
         prev_state AS MATERIALIZED (
             SELECT * FROM jsonb_to_recordset(COALESCE(input -> 'table_state', '[]'::jsonb))
-                   AS x(relation_oid oid, relation_name text, original_reloptions text[],
-                        original_captured boolean, managed_values jsonb, ownership_conflict boolean,
+                   AS x(relation_oid oid, relation_name text,
+                        recommendation_status text, recommended_reloptions jsonb, previous_reloptions jsonb,
+                        recommendation_reason text, recommended_at timestamptz, applied_at timestamptz,
                         state text, consecutive_overdue integer, consecutive_healthy integer,
-                        last_seen_at timestamptz, last_change_at timestamptz,
+                        last_seen_at timestamptz,
                         last_vacuum_pid integer, last_vacuum_progress text,
-                        vacuum_stalled_cycles integer, last_error text, last_action text)
+                        vacuum_stalled_cycles integer, last_action text)
         ),
         active_vacuum AS
         (
@@ -392,22 +414,24 @@ BEGIN
             tp.target_dead_tuple_max AS table_target_max,
             tp.min_scale_factor AS table_scale_min,
             tp.max_scale_factor AS table_scale_max,
+            opt.ro_cost_limit AS cost_limit_reloption,
+            opt.ro_cost_delay AS cost_delay_reloption,
             /* Previous state joined once here; NULL = never persisted. */
             rs.relation_oid IS NOT NULL AS state_exists,
             rs.relation_name AS prev_relation_name,
-            rs.original_reloptions AS prev_original_reloptions,
-            rs.original_captured AS prev_original_captured,
-            rs.managed_values AS prev_managed_values,
-            rs.ownership_conflict AS prev_ownership_conflict,
+            rs.recommendation_status AS prev_recommendation_status,
+            rs.recommended_reloptions AS prev_recommended_reloptions,
+            rs.previous_reloptions AS prev_previous_reloptions,
+            rs.recommendation_reason AS prev_recommendation_reason,
+            rs.recommended_at AS prev_recommended_at,
+            rs.applied_at AS prev_applied_at,
             rs.state AS prev_state,
             rs.consecutive_overdue AS prev_consecutive_overdue,
             rs.consecutive_healthy AS prev_consecutive_healthy,
             rs.last_seen_at AS prev_last_seen_at,
-            rs.last_change_at AS prev_last_change_at,
             rs.last_vacuum_pid AS prev_last_vacuum_pid,
             rs.last_vacuum_progress AS prev_last_vacuum_progress,
             rs.vacuum_stalled_cycles AS prev_vacuum_stalled_cycles,
-            rs.last_error AS prev_last_error,
             rs.last_action AS prev_last_action
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -423,7 +447,9 @@ BEGIN
                 max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_scale_factor') AS ro_vacuum_scale_factor,
                 max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_max_threshold') AS ro_vacuum_max_threshold,
                 max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_insert_threshold') AS ro_insert_threshold,
-                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_insert_scale_factor') AS ro_insert_scale_factor
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_insert_scale_factor') AS ro_insert_scale_factor,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_cost_limit') AS ro_cost_limit,
+                max(split_part(o, '=', 2)) FILTER (WHERE split_part(o, '=', 1) = 'autovacuum_vacuum_cost_delay') AS ro_cost_delay
             FROM unnest(c.reloptions) AS o
         ) opt
         CROSS JOIN LATERAL (
@@ -494,13 +520,14 @@ BEGIN
 
         /* Negative effective insert threshold = insert vacuums disabled for this relation. */
         IF r.insert_threshold IS NULL OR r.insert_threshold < 0 THEN
+            insert_trigger := NULL;
             insert_ratio := 0;
         ELSE
-            insert_ratio := r.inserts_since_vacuum /
-                            GREATEST(1, r.insert_threshold
-                                        + r.insert_scale_factor
-                                          * GREATEST(r.reltuples, 0)
-                                          * r.insert_pcnt_unfrozen);
+            insert_trigger := GREATEST(1, r.insert_threshold
+                                          + r.insert_scale_factor
+                                            * GREATEST(r.reltuples, 0)
+                                            * r.insert_pcnt_unfrozen);
+            insert_ratio := r.inserts_since_vacuum / insert_trigger;
         END IF;
         pressure_ratio := GREATEST(backlog_ratio, insert_ratio);
         xid_ratio := r.xid_age::double precision / NULLIF(r.effective_xid_freeze_max_age, 0);
@@ -527,15 +554,16 @@ BEGIN
                 GREATEST(2147483648 - 3000000 - r.xid_age, 0)::double precision / xid_rate;
         END IF;
 
-        /* r.prev_* is the before-image for the write-on-change test; pv_* is mutated this cycle. */
-        pv_original_reloptions := r.prev_original_reloptions;
-        pv_original_captured := COALESCE(r.prev_original_captured, false);
-        pv_managed_values := COALESCE(r.prev_managed_values, '{}'::jsonb);
-        pv_ownership_conflict := COALESCE(r.prev_ownership_conflict, false);
+        /* r.prev_* is the before-image for the write-on-change test; pv_* is the working copy. */
         pv_state := COALESCE(r.prev_state, 'normal');
         pv_consecutive_overdue := COALESCE(r.prev_consecutive_overdue, 0);
         pv_consecutive_healthy := COALESCE(r.prev_consecutive_healthy, 0);
-        pv_last_change_at := r.prev_last_change_at;
+        pv_rec_status := r.prev_recommendation_status;
+        pv_recommended := COALESCE(r.prev_recommended_reloptions, '{}'::jsonb);
+        pv_previous := r.prev_previous_reloptions;
+        pv_reason := r.prev_recommendation_reason;
+        pv_recommended_at := r.prev_recommended_at;
+        pv_applied_at := r.prev_applied_at;
         pv_last_vacuum_pid := r.prev_last_vacuum_pid;
         pv_last_vacuum_progress := r.prev_last_vacuum_progress;
         pv_vacuum_stalled_cycles := COALESCE(r.prev_vacuum_stalled_cycles, 0);
@@ -605,22 +633,22 @@ BEGIN
                              r.xid_age, stall_xid_age, horizon_age, horizon_kind, horizon_detail);
         ELSIF xid_ratio >= p.xid_warning_ratio OR mxid_ratio >= p.mxid_warning_ratio THEN
             relation_state := 'wraparound_warning';
-            reason := format('XID/MXID age ratio vs freeze_max_age is elevated (xid=%s, mxid=%s); the forced autovacuum will handle this - prioritized only.', to_char(xid_ratio, 'FM0.000'), to_char(mxid_ratio, 'FM0.000'));
+            reason := format('XID/MXID age ratio vs freeze_max_age is elevated (xid=%s, mxid=%s); the forced autovacuum will handle this - prioritized only.', to_char(xid_ratio, 'FM990.000'), to_char(mxid_ratio, 'FM990.000'));
         ELSIF pressure_ratio >= p.backlog_critical_ratio THEN
             relation_state := 'backlog_critical';
             reason := format('%s backlog is %sx the current trigger.',
                              CASE WHEN insert_ratio > backlog_ratio THEN 'Insert' ELSE 'Dead-tuple' END,
-                             to_char(pressure_ratio, 'FM0.00'));
+                             to_char(pressure_ratio, 'FM9990.00'));
         ELSIF pressure_ratio >= p.backlog_urgent_ratio THEN
             relation_state := 'backlog_urgent';
             reason := format('%s backlog is %sx the current trigger.',
                              CASE WHEN insert_ratio > backlog_ratio THEN 'Insert' ELSE 'Dead-tuple' END,
-                             to_char(pressure_ratio, 'FM0.00'));
+                             to_char(pressure_ratio, 'FM9990.00'));
         ELSIF pressure_ratio >= p.backlog_elevated_ratio THEN
             relation_state := 'backlog_elevated';
             reason := format('%s backlog is %sx the current trigger.',
                              CASE WHEN insert_ratio > backlog_ratio THEN 'Insert' ELSE 'Dead-tuple' END,
-                             to_char(pressure_ratio, 'FM0.00'));
+                             to_char(pressure_ratio, 'FM9990.00'));
         ELSE
             relation_state := 'normal';
             reason := 'Relation is within configured backlog and wraparound limits.';
@@ -630,27 +658,12 @@ BEGIN
         IF relation_state = 'normal' THEN
             overdue_cycles := 0;
             healthy_cycles := LEAST(pv_consecutive_healthy + 1,
-                                    p.healthy_cycles_before_restore);
+                                    p.healthy_cycles_before_revert);
         ELSE
             overdue_cycles := LEAST(pv_consecutive_overdue + 1,
-                                    p.overdue_cycles_before_change);
+                                    p.overdue_cycles_before_recommend);
             healthy_cycles := 0;
             overdue_relation_count := overdue_relation_count + 1;
-        END IF;
-
-        /* Ownership check: every managed key must still hold the value written last time. */
-        SELECT NOT EXISTS
-        (
-            SELECT 1
-            FROM jsonb_each_text(pv_managed_values) AS managed(option_name, option_value)
-            WHERE (SELECT split_part(o, '=', 2) FROM unnest(r.reloptions) AS o
-                   WHERE split_part(o, '=', 1) = managed.option_name LIMIT 1)::numeric
-                  IS DISTINCT FROM managed.option_value::numeric
-        )
-        INTO current_matches_managed;
-
-        IF pv_managed_values <> '{}'::jsonb AND NOT current_matches_managed THEN
-            pv_ownership_conflict := true;
         END IF;
 
         effective_target_ratio := COALESCE(r.table_target_ratio, p.target_dead_tuple_ratio);
@@ -712,47 +725,77 @@ BEGIN
             overdue_insert_thresholds := overdue_insert_thresholds || desired_insert_threshold;
         END IF;
 
+        /* Trigger recommendation: backlog states with autovacuum active, and never looser than today. */
+        desired_values := '{}'::jsonb;
+        rec_parts := ARRAY[]::text[];
         IF relation_state LIKE 'backlog_%' AND r.normal_autovacuum_enabled THEN
-            desired_values := '{}'::jsonb;
-
             IF backlog_ratio >= p.backlog_elevated_ratio THEN
-                desired_values := desired_values || jsonb_build_object(
+                trigger_keys := jsonb_build_object(
                     'autovacuum_vacuum_threshold', desired_threshold::text,
-                    'autovacuum_vacuum_scale_factor', trim(trailing '.' from to_char(desired_scale_factor, 'FM0.999999999'))
-                );
+                    'autovacuum_vacuum_scale_factor', trim(trailing '.' from to_char(desired_scale_factor, 'FM0.999999999')));
                 /* The per-table trigger ceiling exists only on PG18+. */
                 IF server_vnum >= 180000 THEN
-                    desired_values := desired_values || jsonb_build_object(
-                        'autovacuum_vacuum_max_threshold', desired_max_threshold::text
-                    );
+                    trigger_keys := trigger_keys || jsonb_build_object(
+                        'autovacuum_vacuum_max_threshold', desired_max_threshold::text);
+                END IF;
+                IF widespread_dead THEN
+                    rec_parts := rec_parts || format(
+                        '%s of %s eligible tables were overdue on the dead-tuple side in the last scan: the cluster baseline is being corrected instead of this table''s settings.',
+                        prev_dead_overdue, prev_eligible);
+                ELSIF target_dead_tuples < vacuum_trigger THEN
+                    desired_values := desired_values || trigger_keys;
+                    rec_parts := rec_parts || format(
+                        'Dead tuples %s are %sx the current trigger of %s (threshold %s + scale factor %s x %s rows%s); firing at %s dead tuples (%s%% of the table) needs threshold %s and scale factor %s%s.',
+                        r.dead_tuples, to_char(backlog_ratio, 'FM9990.00'), round(vacuum_trigger)::bigint,
+                        r.vacuum_threshold::bigint,
+                        trim(trailing '.' from to_char(r.vacuum_scale_factor, 'FM0.9999')),
+                        round(GREATEST(r.reltuples, 0))::bigint,
+                        CASE WHEN r.vacuum_max_threshold >= 0
+                             THEN format(', capped at %s', r.vacuum_max_threshold::bigint) ELSE '' END,
+                        target_dead_tuples,
+                        trim(trailing '.' from to_char(100 * effective_target_ratio, 'FM990.99')),
+                        desired_threshold,
+                        trim(trailing '.' from to_char(desired_scale_factor, 'FM0.999999999')),
+                        CASE WHEN server_vnum >= 180000
+                             THEN format(' (max threshold %s)', desired_max_threshold) ELSE '' END);
+                ELSE
+                    rec_parts := rec_parts || format(
+                        'The current trigger (%s dead tuples) is already at or below the policy target (%s), so the table settings are left alone; the cluster cost pair and worker count carry this backlog.',
+                        round(vacuum_trigger)::bigint, target_dead_tuples);
                 END IF;
             END IF;
 
             IF insert_ratio >= p.backlog_elevated_ratio THEN
-                desired_values := desired_values || jsonb_build_object(
+                insert_keys := jsonb_build_object(
                     'autovacuum_vacuum_insert_threshold', desired_insert_threshold::text,
-                    'autovacuum_vacuum_insert_scale_factor', trim(trailing '.' from to_char(desired_insert_scale, 'FM0.999999999'))
-                );
+                    'autovacuum_vacuum_insert_scale_factor', trim(trailing '.' from to_char(desired_insert_scale, 'FM0.999999999')));
+                IF widespread_insert THEN
+                    rec_parts := rec_parts || format(
+                        '%s of %s eligible tables were overdue on the insert side in the last scan: the cluster baseline is being corrected instead of this table''s settings.',
+                        prev_insert_overdue, prev_eligible);
+                ELSIF target_inserts < insert_trigger THEN
+                    desired_values := desired_values || insert_keys;
+                    rec_parts := rec_parts || format(
+                        'Rows inserted since the last vacuum (%s) are %sx the insert trigger of %s; firing at %s inserted rows needs insert threshold %s and insert scale factor %s.',
+                        r.inserts_since_vacuum, to_char(insert_ratio, 'FM9990.00'), round(insert_trigger)::bigint,
+                        target_inserts, desired_insert_threshold,
+                        trim(trailing '.' from to_char(desired_insert_scale, 'FM0.999999999')));
+                ELSE
+                    rec_parts := rec_parts || format(
+                        'The current insert trigger (%s rows) is already at or below the policy target (%s); the insert settings are left alone.',
+                        round(insert_trigger)::bigint, target_inserts);
+                END IF;
             END IF;
-        ELSIF relation_state LIKE 'backlog_%' THEN
-            desired_values := pv_managed_values;
-        ELSIF relation_state LIKE 'wraparound_%' THEN
-            desired_values := pv_managed_values
-                              - 'autovacuum_vacuum_cost_limit'
-                              - 'autovacuum_vacuum_cost_delay';
-        ELSIF relation_state = 'horizon_blocked' THEN
-            /* Horizon blocked: hold as-is, aggression cannot help and a restore would flap. */
-            desired_values := pv_managed_values;
-        ELSE
-            desired_values := '{}'::jsonb;
         END IF;
 
-        has_existing_cost_boost := pv_managed_values ? 'autovacuum_vacuum_cost_limit';
-        wants_cost_boost := p.manage_table_costs
+        /* Cost boost recommendation: severity tier, bounded slots cluster-wide, never below the effective pair. */
+        has_existing_cost_boost := pv_rec_status IS NOT NULL
+                                   AND pv_recommended ? 'autovacuum_vacuum_cost_limit';
+        wants_cost_boost := p.recommend_table_costs
                             AND relation_state <> 'normal'
                             AND relation_state <> 'horizon_blocked'
                             AND (r.normal_autovacuum_enabled OR relation_state LIKE 'wraparound_%')
-                            AND (NOT host_pressure OR relation_state = 'wraparound_critical')
+                            AND (NOT host_pressure OR relation_state = 'wraparound_critical' OR has_existing_cost_boost)
                             AND (has_existing_cost_boost
                                  OR cost_boost_count < p.max_boosted_relations);
 
@@ -768,35 +811,27 @@ BEGIN
                 tier_cost_delay := p.elevated_cost_delay_ms;
             END IF;
 
-            /* Ramp: enter at the elevated tier, multiply per change window, capped by the severity tier. */
-            prev_boost := NULLIF(pv_managed_values ->> 'autovacuum_vacuum_cost_limit', '')::integer;
-            IF prev_boost IS NULL THEN
-                desired_cost_limit := LEAST(tier_cost_limit, p.elevated_cost_limit);
-            ELSE
-                desired_cost_limit := LEAST(tier_cost_limit,
-                                            GREATEST(prev_boost,
-                                                     ceil(prev_boost * p.boost_ramp_factor)::integer));
-            END IF;
-            desired_cost_delay := tier_cost_delay;
-
-            /* Cluster-wide admission budget for simultaneous cost boosts. */
-            budget_headroom := p.boost_total_cost_limit_budget - cost_budget_used
-                               + COALESCE(prev_boost, 0);
-            IF desired_cost_limit > budget_headroom THEN
-                desired_cost_limit := GREATEST(COALESCE(prev_boost, 0), budget_headroom);
-            END IF;
-
-            IF desired_cost_limit >= LEAST(p.elevated_cost_limit, tier_cost_limit) THEN
-                desired_values := desired_values || jsonb_build_object(
-                    'autovacuum_vacuum_cost_limit', desired_cost_limit::text,
-                    'autovacuum_vacuum_cost_delay', trim(trailing '.' from to_char(desired_cost_delay, 'FM0.999'))
-                );
-                cost_budget_used := cost_budget_used - COALESCE(prev_boost, 0)
-                                    + desired_cost_limit;
-
+            /* The pair this table vacuums under today: its own reloptions, else the cluster pair. */
+            eff_cost_limit := CASE WHEN r.cost_limit_reloption IS NULL OR r.cost_limit_reloption::integer < 0
+                                   THEN global_cost_limit ELSE r.cost_limit_reloption::integer END;
+            eff_cost_delay := CASE WHEN r.cost_delay_reloption IS NULL OR r.cost_delay_reloption::double precision < 0
+                                   THEN global_cost_delay ELSE r.cost_delay_reloption::double precision END;
+            cost_keys := jsonb_build_object(
+                'autovacuum_vacuum_cost_limit', tier_cost_limit::text,
+                'autovacuum_vacuum_cost_delay', trim(trailing '.' from to_char(tier_cost_delay, 'FM0.999')));
+            IF tier_cost_limit > eff_cost_limit OR tier_cost_delay < eff_cost_delay THEN
+                desired_values := desired_values || cost_keys;
                 IF NOT has_existing_cost_boost THEN
                     cost_boost_count := cost_boost_count + 1;
                 END IF;
+                rec_parts := rec_parts || format(
+                    '%s tier: a table-level cost limit %s / delay %s ms lets this vacuum run ahead of the effective pair %s / %s ms (boost slot %s of %s); revert it once the table is normal again.',
+                    CASE WHEN relation_state IN ('wraparound_critical', 'backlog_critical') THEN 'Critical'
+                         WHEN relation_state IN ('wraparound_warning', 'backlog_urgent') THEN 'Urgent'
+                         ELSE 'Elevated' END,
+                    tier_cost_limit, trim(trailing '.' from to_char(tier_cost_delay, 'FM0.999')),
+                    eff_cost_limit, trim(trailing '.' from to_char(eff_cost_delay, 'FM990.99')),
+                    cost_boost_count, p.max_boosted_relations);
             END IF;
         END IF;
 
@@ -804,8 +839,7 @@ BEGIN
         relation_json := NULL;
         IF relation_state <> 'normal'
            OR pv_state <> 'normal'
-           OR pv_managed_values <> '{}'::jsonb
-           OR pv_ownership_conflict THEN
+           OR pv_rec_status IS NOT NULL THEN
             relation_json := jsonb_build_object(
                 'total_bytes', r.total_bytes,
                 'live_tuples', r.live_tuples,
@@ -835,168 +869,125 @@ BEGIN
             );
         END IF;
 
-        cooldown_ok := pv_last_change_at IS NULL
-                       OR clock_timestamp() - pv_last_change_at
-                          >= make_interval(secs => p.change_cooldown_seconds);
+        /* Recommendation lifecycle: open (SQL waits) -> applied (reloptions match) -> revert (boost no longer needed). */
+        new_rec_status := NULL;
+        new_recommended := NULL;
+        new_previous := NULL;
+        new_reason := NULL;
+        new_recommended_at := NULL;
+        new_applied_at := NULL;
 
-        should_apply := relation_state <> 'normal'
-                        AND overdue_cycles >= p.overdue_cycles_before_change
-                        AND cooldown_ok
-                        AND r.vacuum_pid IS NULL
-                        AND NOT pv_ownership_conflict
-                        AND change_count < p.max_changes_per_cycle
-                        AND desired_values IS DISTINCT FROM pv_managed_values;
+        /* Is our last recommendation in place, key for key? */
+        keys_match := false;
+        IF pv_rec_status IS NOT NULL THEN
+            SELECT NOT EXISTS (
+                SELECT 1 FROM jsonb_each_text(pv_recommended) AS k(option_name, option_value)
+                WHERE (SELECT split_part(o, '=', 2) FROM unnest(r.reloptions) AS o
+                       WHERE split_part(o, '=', 1) = k.option_name LIMIT 1)::numeric
+                      IS DISTINCT FROM k.option_value::numeric)
+            INTO keys_match;
+        END IF;
 
-        applied := false;
-        action_error := NULL;
-        action_name := 'observe';
-        apply_kind := NULL;
-
-        IF should_apply THEN
-            action_name := CASE WHEN p.dry_run THEN 'propose_reloptions' ELSE 'set_reloptions' END;
-            IF NOT p.dry_run THEN
-                apply_kind := 'set';
-                apply_desired := desired_values;
+        IF keys_match THEN
+            /* Applied: frozen as recommended (never re-tuned behind the operator) until the table is healthy. */
+            IF relation_state <> 'normal' THEN
+                new_rec_status := 'applied';
+                new_recommended := pv_recommended;
+                new_previous := COALESCE(pv_previous, '{}'::jsonb);
+                new_reason := pv_reason;
+                new_recommended_at := COALESCE(pv_recommended_at, clock_timestamp());
+                new_applied_at := COALESCE(pv_applied_at, clock_timestamp());
+            ELSIF pv_recommended ? 'autovacuum_vacuum_cost_limit' THEN
+                /* Trigger settings stay with the operator; the cost boost is incident tuning and gets a revert. */
+                IF pv_rec_status = 'revert' OR healthy_cycles >= p.healthy_cycles_before_revert THEN
+                    new_rec_status := 'revert';
+                    cost_keys := pv_recommended
+                                 - 'autovacuum_vacuum_threshold' - 'autovacuum_vacuum_scale_factor'
+                                 - 'autovacuum_vacuum_max_threshold'
+                                 - 'autovacuum_vacuum_insert_threshold' - 'autovacuum_vacuum_insert_scale_factor';
+                    new_recommended := cost_keys;
+                    SELECT COALESCE(jsonb_object_agg(k, COALESCE(pv_previous, '{}'::jsonb) -> k), '{}'::jsonb)
+                    INTO new_previous
+                    FROM jsonb_object_keys(cost_keys) AS k;
+                    new_reason := CASE WHEN pv_rec_status = 'revert' THEN pv_reason ELSE format(
+                        'The relation has been normal for %s check(s); the table-level cost boost (%s / %s ms) recommended during the backlog is no longer needed and takes budget from other vacuums.',
+                        healthy_cycles, cost_keys ->> 'autovacuum_vacuum_cost_limit',
+                        cost_keys ->> 'autovacuum_vacuum_cost_delay') END;
+                ELSE
+                    new_rec_status := 'applied';
+                    new_recommended := pv_recommended;
+                    new_previous := COALESCE(pv_previous, '{}'::jsonb);
+                    new_reason := pv_reason;
+                END IF;
+                new_recommended_at := COALESCE(pv_recommended_at, clock_timestamp());
+                new_applied_at := COALESCE(pv_applied_at, clock_timestamp());
             END IF;
-        ELSIF relation_state = 'normal'
-           AND healthy_cycles >= p.healthy_cycles_before_restore
-           AND pv_managed_values <> '{}'::jsonb
-           AND NOT pv_ownership_conflict
-           AND current_matches_managed
-           AND cooldown_ok
-           AND r.vacuum_pid IS NULL
-           AND change_count < p.max_changes_per_cycle THEN
-            action_name := CASE WHEN p.dry_run THEN 'propose_restore' ELSE 'restore_reloptions' END;
-            IF NOT p.dry_run THEN
-                apply_kind := 'restore';
-                apply_desired := '{}'::jsonb;
+            /* Trigger-only settings on a healthy table are the operator's now: the row is dropped. */
+        ELSE
+            /* Nothing of ours in place (never recommended, still open, or changed by the operator): recommend afresh. */
+            recommend_now := desired_values <> '{}'::jsonb
+                             AND (overdue_cycles >= p.overdue_cycles_before_recommend OR pv_rec_status = 'open');
+            IF recommend_now THEN
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM jsonb_each_text(desired_values) AS k(option_name, option_value)
+                    WHERE (SELECT split_part(o, '=', 2) FROM unnest(r.reloptions) AS o
+                           WHERE split_part(o, '=', 1) = k.option_name LIMIT 1)::numeric
+                          IS DISTINCT FROM k.option_value::numeric)
+                INTO keys_match;
+                /* Already matching with no earlier recommendation = the operator's own settings; nothing to say. */
+                IF NOT keys_match THEN
+                    new_rec_status := 'open';
+                    new_recommended := desired_values;
+                    /* What the operator has today for these keys; null = not set, so the revert is a RESET. */
+                    SELECT jsonb_object_agg(k.option_name,
+                               (SELECT split_part(o, '=', 2) FROM unnest(r.reloptions) AS o
+                                WHERE split_part(o, '=', 1) = k.option_name LIMIT 1))
+                    INTO new_previous
+                    FROM jsonb_object_keys(desired_values) AS k(option_name);
+                    new_reason := CASE WHEN pv_rec_status = 'open' AND pv_recommended = desired_values THEN pv_reason
+                                       ELSE array_to_string(rec_parts, ' ') END;
+                    new_recommended_at := CASE WHEN pv_rec_status = 'open' THEN pv_recommended_at
+                                               ELSE clock_timestamp() END;
+                END IF;
             END IF;
         END IF;
 
-        /* Reconcile: restore released keys to their original value, set the desired ones, in one ALTER. */
-        IF apply_kind IS NOT NULL THEN
-            BEGIN
-                rec_reset_names := ARRAY[]::text[];
-                rec_set_parts := ARRAY[]::text[];
-                PERFORM set_config('lock_timeout', p.lock_timeout_ms::text || 'ms', true);
-                FOR rec_option_name IN
-                    SELECT key
-                    FROM (SELECT jsonb_object_keys(pv_managed_values) AS key
-                          UNION
-                          SELECT jsonb_object_keys(apply_desired) AS key) keys
-                    ORDER BY key
-                LOOP
-                    IF rec_option_name NOT IN (
-                        'autovacuum_vacuum_threshold',
-                        'autovacuum_vacuum_scale_factor',
-                        'autovacuum_vacuum_max_threshold',
-                        'autovacuum_vacuum_insert_threshold',
-                        'autovacuum_vacuum_insert_scale_factor',
-                        'autovacuum_vacuum_cost_limit',
-                        'autovacuum_vacuum_cost_delay') THEN
-                        RAISE EXCEPTION 'unsupported managed reloption: %', rec_option_name;
-                    END IF;
-                    IF apply_desired ? rec_option_name THEN
-                        rec_option_value := apply_desired ->> rec_option_name;
-                        IF rec_option_value !~ '^-?[0-9]+([.][0-9]+)?$' THEN
-                            RAISE EXCEPTION 'invalid numeric reloption value for %: %', rec_option_name, rec_option_value;
-                        END IF;
-                        rec_set_parts := array_append(rec_set_parts, format('%I = %s', rec_option_name, rec_option_value));
-                    ELSE
-                        SELECT split_part(o, '=', 2) INTO rec_original_value
-                        FROM unnest(pv_original_reloptions) AS o
-                        WHERE split_part(o, '=', 1) = rec_option_name
-                        LIMIT 1;
-                        IF rec_original_value IS NULL THEN
-                            rec_reset_names := array_append(rec_reset_names, rec_option_name);
-                        ELSE
-                            rec_set_parts := array_append(rec_set_parts, format('%I = %s', rec_option_name, rec_original_value));
-                        END IF;
-                    END IF;
-                END LOOP;
-                IF cardinality(rec_reset_names) > 0 THEN
-                    EXECUTE format('ALTER TABLE %s RESET (%s)', r.fqname,
-                                   (SELECT string_agg(format('%I', v), ', ') FROM unnest(rec_reset_names) AS v));
-                END IF;
-                IF cardinality(rec_set_parts) > 0 THEN
-                    EXECUTE format('ALTER TABLE %s SET (%s)', r.fqname, array_to_string(rec_set_parts, ', '));
-                END IF;
-                applied := true;
-                change_count := change_count + 1;
-            EXCEPTION
-                WHEN OTHERS THEN
-                    GET STACKED DIAGNOSTICS action_error = MESSAGE_TEXT;
-            END;
+        IF new_rec_status = 'open' THEN
+            recommended_count := recommended_count + 1;
         END IF;
 
-        IF should_apply THEN
-            /* Transition log: attempted changes always, repeated dry-run proposals once per (state, action). */
-            IF applied
-               OR action_error IS NOT NULL
-               OR pv_state IS DISTINCT FROM relation_state
-               OR pv_last_action IS DISTINCT FROM action_name THEN
-                out_decisions := out_decisions || jsonb_build_object(
-                    'relid', r.relid, 'relation_name', r.fqname, 'state', relation_state,
-                    'action', action_name, 'reason', reason, 'host_metrics', host_json,
-                    'relation_metrics', relation_json, 'proposed_reloptions', desired_values,
-                    'applied', applied, 'error', action_error);
-            END IF;
-            IF applied THEN
-                IF NOT pv_original_captured THEN
-                    pv_original_reloptions := r.reloptions;
-                    pv_original_captured := true;
-                END IF;
-                pv_managed_values := desired_values;
-            END IF;
-        ELSIF apply_kind = 'restore' OR action_name IN ('propose_restore') THEN
-            /* Same transition rule: real restores always, repeated dry-run proposals once. */
-            IF applied
-               OR action_error IS NOT NULL
-               OR pv_state IS DISTINCT FROM relation_state
-               OR pv_last_action IS DISTINCT FROM action_name THEN
-                out_decisions := out_decisions || jsonb_build_object(
-                    'relid', r.relid, 'relation_name', r.fqname, 'state', relation_state,
-                    'action', action_name,
-                    'reason', 'Relation remained healthy for the configured restore window.',
-                    'host_metrics', host_json, 'relation_metrics', relation_json,
-                    'proposed_reloptions', pv_managed_values, 'applied', applied, 'error', action_error);
-            END IF;
-            IF applied THEN
-                pv_original_reloptions := NULL;
-                pv_original_captured := false;
-                pv_managed_values := '{}'::jsonb;
-            END IF;
-        ELSIF relation_state <> 'normal' OR pv_ownership_conflict THEN
-            action_name := CASE
-                WHEN pv_ownership_conflict THEN 'ownership_conflict'
-                WHEN relation_state = 'horizon_blocked' THEN 'horizon_blocked'
-                WHEN relation_state LIKE 'backlog_%' AND NOT r.normal_autovacuum_enabled THEN 'autovacuum_disabled'
-                WHEN r.vacuum_pid IS NOT NULL THEN 'vacuum_already_running'
-                WHEN NOT cooldown_ok THEN 'cooldown'
-                ELSE 'observe'
-            END;
+        action_name := CASE new_rec_status
+                           WHEN 'open' THEN 'recommend_reloptions'
+                           WHEN 'applied' THEN 'recommendation_applied'
+                           WHEN 'revert' THEN 'recommend_revert'
+                           ELSE CASE
+                               WHEN relation_state = 'horizon_blocked' THEN 'horizon_blocked'
+                               WHEN relation_state LIKE 'backlog_%' AND NOT r.normal_autovacuum_enabled THEN 'autovacuum_disabled'
+                               WHEN relation_state = 'normal' THEN 'recovered'
+                               ELSE 'observe'
+                           END
+                       END;
 
-            /* Observation-only: logged on entering this (state, action) pair. */
-            IF pv_state IS DISTINCT FROM relation_state
-               OR pv_last_action IS DISTINCT FROM action_name THEN
-                out_decisions := out_decisions || jsonb_build_object(
-                    'relid', r.relid, 'relation_name', r.fqname, 'state', relation_state,
-                    'action', action_name, 'reason', reason, 'host_metrics', host_json,
-                    'relation_metrics', relation_json, 'proposed_reloptions', desired_values,
-                    'applied', false,
-                    'error', CASE WHEN pv_ownership_conflict
-                                  THEN 'A managed reloption changed outside the controller; automatic writes are suspended.'
-                                  ELSE NULL END);
-            END IF;
-        ELSIF pv_state <> 'normal' THEN
-            /* Return to normal closes the episode. */
-            action_name := 'recovered';
+        IF relation_state = 'normal' AND pv_state <> 'normal' THEN
+            reason := format('Relation returned to normal (was %s).', pv_state)
+                      || CASE WHEN new_rec_status IS NOT NULL
+                              THEN ' The applied table settings stay listed in table_recommendations.'
+                              ELSE '' END;
+        ELSIF new_rec_status = 'revert' THEN
+            reason := new_reason;
+        ELSIF cardinality(rec_parts) > 0 THEN
+            reason := reason || ' ' || array_to_string(rec_parts, ' ');
+        END IF;
+
+        /* Transition log: one row when the (state, action) pair changes; the recommendation itself lives in table_state. */
+        IF (relation_state <> 'normal' OR pv_state <> 'normal' OR new_rec_status IS NOT NULL)
+           AND (pv_state IS DISTINCT FROM relation_state OR pv_last_action IS DISTINCT FROM action_name) THEN
             out_decisions := out_decisions || jsonb_build_object(
                 'relid', r.relid, 'relation_name', r.fqname, 'state', relation_state,
-                'action', action_name,
-                'reason', format('Relation returned to normal (was %s).', pv_state),
-                'host_metrics', host_json, 'relation_metrics', relation_json,
-                'proposed_reloptions', NULL, 'applied', false, 'error', NULL);
+                'action', action_name, 'reason', reason, 'host_metrics', host_json,
+                'relation_metrics', relation_json,
+                'proposed_reloptions', COALESCE(new_recommended, NULLIF(desired_values, '{}'::jsonb)),
+                'applied', false, 'error', NULL);
         END IF;
 
         emergency_gate := COALESCE(input -> 'emergency' -> r.relid::text, '{}'::jsonb);
@@ -1049,19 +1040,10 @@ BEGIN
                 'proposed_reloptions', NULL, 'applied', true, 'error', NULL);
         END IF;
 
-        new_last_change_at := CASE WHEN applied THEN clock_timestamp()
-                                   ELSE pv_last_change_at END;
-
-        /* Persist only what a later cycle needs; rewrite on control change or hourly heartbeat. */
+        /* Persist only what a later cycle needs; rewrite on state change or hourly heartbeat. */
         state_needed := relation_state <> 'normal'
-                        OR pv_managed_values <> '{}'::jsonb
-                        OR pv_ownership_conflict
-                        OR pv_original_captured
-                        OR r.vacuum_pid IS NOT NULL
-                        OR action_error IS NOT NULL
-                        OR (new_last_change_at IS NOT NULL
-                            AND clock_timestamp() - new_last_change_at
-                                < make_interval(secs => p.change_cooldown_seconds));
+                        OR new_rec_status IS NOT NULL
+                        OR r.vacuum_pid IS NOT NULL;
 
         IF NOT state_needed THEN
             IF r.state_exists THEN
@@ -1069,31 +1051,32 @@ BEGIN
             END IF;
         ELSIF NOT r.state_exists
               OR r.prev_relation_name IS DISTINCT FROM r.fqname
-              OR r.prev_original_reloptions IS DISTINCT FROM pv_original_reloptions
-              OR r.prev_original_captured IS DISTINCT FROM pv_original_captured
-              OR r.prev_managed_values IS DISTINCT FROM pv_managed_values
-              OR r.prev_ownership_conflict IS DISTINCT FROM pv_ownership_conflict
+              OR r.prev_recommendation_status IS DISTINCT FROM new_rec_status
+              OR r.prev_recommended_reloptions IS DISTINCT FROM new_recommended
+              OR r.prev_previous_reloptions IS DISTINCT FROM new_previous
+              OR r.prev_recommendation_reason IS DISTINCT FROM new_reason
+              OR r.prev_recommended_at IS DISTINCT FROM new_recommended_at
+              OR r.prev_applied_at IS DISTINCT FROM new_applied_at
               OR r.prev_state IS DISTINCT FROM relation_state
               OR r.prev_consecutive_overdue IS DISTINCT FROM overdue_cycles
               OR r.prev_consecutive_healthy IS DISTINCT FROM healthy_cycles
-              OR r.prev_last_change_at IS DISTINCT FROM new_last_change_at
               OR r.prev_last_vacuum_pid IS DISTINCT FROM r.vacuum_pid
               OR r.prev_last_vacuum_progress IS DISTINCT FROM cur_vacuum_progress
               OR r.prev_vacuum_stalled_cycles IS DISTINCT FROM vacuum_stalled_cycles
-              OR r.prev_last_error IS DISTINCT FROM action_error
               OR r.prev_last_action IS DISTINCT FROM action_name
               OR r.prev_last_seen_at < clock_timestamp() - interval '1 hour'
         THEN
             out_state := out_state || jsonb_build_object(
                 'relation_oid', r.relid, 'relation_name', r.fqname,
-                'original_reloptions', pv_original_reloptions,
-                'original_captured', pv_original_captured,
-                'managed_values', pv_managed_values,
-                'ownership_conflict', pv_ownership_conflict,
+                'recommendation_status', new_rec_status,
+                'recommended_reloptions', new_recommended,
+                'previous_reloptions', new_previous,
+                'recommendation_reason', new_reason,
+                'recommended_at', new_recommended_at,
+                'applied_at', new_applied_at,
                 'state', relation_state,
                 'consecutive_overdue', overdue_cycles,
                 'consecutive_healthy', healthy_cycles,
-                'last_change_at', new_last_change_at,
                 'last_dead_tuples', r.dead_tuples, 'last_live_tuples', r.live_tuples,
                 'last_trigger', vacuum_trigger, 'last_backlog_ratio', backlog_ratio,
                 'last_inserts_since_vacuum', r.inserts_since_vacuum,
@@ -1101,9 +1084,15 @@ BEGIN
                 'last_xid_age', r.xid_age, 'last_mxid_age', r.mxid_age,
                 'last_vacuum_pid', r.vacuum_pid, 'last_vacuum_progress', cur_vacuum_progress,
                 'vacuum_stalled_cycles', vacuum_stalled_cycles,
-                'last_error', action_error, 'last_action', action_name);
+                'last_action', action_name);
         END IF;
     END LOOP;
+
+    /* Rows of relations that no longer exist in this database (dropped or re-created) are removed. */
+    SELECT out_state_delete || COALESCE(jsonb_agg(to_jsonb(x.relation_oid)), '[]'::jsonb)
+    INTO out_state_delete
+    FROM jsonb_to_recordset(COALESCE(input -> 'table_state', '[]'::jsonb)) AS x(relation_oid oid)
+    WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = x.relation_oid);
 
     /* Safety scan: relations the performance scan skipped; emergency branch only, never cancels. */
     FOR r IN
@@ -1367,7 +1356,7 @@ BEGIN
             'critical_seen', critical_seen,
             'max_xid_age', db_max_xid_age,
             'max_mxid_age', db_max_mxid_age,
-            'changes_applied', change_count,
+            'recommended', recommended_count,
             'analyzed', analyze_count,
             'scan_seconds', extract(epoch FROM clock_timestamp() - scan_started_at)),
         'table_state', out_state,
@@ -1378,4 +1367,4 @@ END
 $aav_body$;
 
 COMMENT ON FUNCTION adaptive_autovacuum._database_program() IS
-'Body of the anonymous PL/pgSQL block the database worker runs inside each managed database. It reads adaptive_autovacuum.worker_input (policy, previous table state, gates) and leaves its result in adaptive_autovacuum.worker_output; it uses no extension objects, so managed databases need no CREATE EXTENSION.';
+'Body of the anonymous PL/pgSQL block the database worker runs inside each managed database. It reads adaptive_autovacuum.worker_input (policy, previous table state, gates) and leaves its result in adaptive_autovacuum.worker_output; it uses no extension objects, so managed databases need no CREATE EXTENSION. It never changes table settings: it recommends them (table_recommendations); its only DDL is ANALYZE for never-analyzed tables.';

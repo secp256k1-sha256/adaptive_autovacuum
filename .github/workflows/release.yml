@@ -88,6 +88,11 @@ jobs:
             Install once per cluster; the extension lives in the control database (`postgres` by default) and manages every database.
             Linux: download `install.sh`, read it, then `sudo bash install.sh`
             Windows: download `install.ps1`, read it, then run it from an elevated PowerShell with `-Credential (Get-Credential postgres)`
+            Packages: Ubuntu 24.04 / 26.04, Debian 12 / 13 (amd64, arm64); RHEL / Rocky / AlmaLinux 9 and 10 (x86_64, aarch64); Windows x64.
+            From 1.2.0 the installer upgrades in place (ALTER EXTENSION UPDATE; policy and history are kept).
+            1.3.0: table settings are recommended, never written (`table_recommendations` with ready-to-run SQL);
+            `autovacuum = off` is repaired before the sweep; every table is scored (`min_table_bytes` 0);
+            `autovacuum_naptime` is ramped down while the worker pool is under-filled and worker raises are easier.
             No upgrade path from 1.1.0: the installer re-creates the extension (policy and history of the old copy are deleted).
 
             Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.

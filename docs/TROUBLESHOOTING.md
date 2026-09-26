@@ -36,7 +36,7 @@ every non-OK row carries a remediation command.
 | `relation_errors` | A per-table action failed. | `SELECT decided_at, database_name, relation_name, action, error FROM adaptive_autovacuum.decisions WHERE error IS NOT NULL ORDER BY 1 DESC;` |
 | `emergency_vacuum` | An emergency VACUUM is pending or running. | Expected under wraparound pressure; see `adaptive_autovacuum.emergency_queue` (`database_name`, `relation_name`, `status`). |
 | `wraparound` | A database passed half (`WARN`) or all (`FAIL`) of the emergency age. | `SELECT * FROM adaptive_autovacuum.wraparound_status; SELECT * FROM adaptive_autovacuum.horizon_blocker();` `aging_tables` lists the ten oldest tables (TOAST age included) of the database you query it in. |
-| `autovacuum` | `autovacuum = off`. | The controller repairs it after `repair_disabled_autovacuum_cycles` sweeps; or turn it on yourself. |
+| `autovacuum` | `autovacuum = off`. | The controller repairs it on the first sweep that sees it (`repair_disabled_autovacuum_cycles`, default 1); or turn it on yourself. |
 | `track_cost_delay_timing` | Off on PostgreSQL 18. | `ALTER SYSTEM SET track_cost_delay_timing = on; SELECT pg_reload_conf();` |
 | `recovery` | Standby server. | Nothing; the launcher and controller start after promotion. |
 
@@ -132,8 +132,22 @@ aside; the installer deletes it after the restart. If the restart was deferred, 
 previous values; the helper warns about an `interrupted` or `failed` previous run and re-verifies the real
 host state before each step, so simply rerun the same command.
 
+**A table stays overdue and its settings never change.** The extension does not write table settings. Run
+`SELECT database_name, relation_name, apply_sql, reason FROM adaptive_autovacuum.table_recommendations;`
+in the control database and execute `apply_sql` in the named database; cluster cost and worker changes still
+happen automatically. A table you already tuned tighter than the policy target gets no trigger recommendation
+(the reason says so), only a cost boost.
+
+**`autovacuum` is off.** The controller turns it back on before its next sweep and right after a reload that
+turned it off, as long as `policy.manage_global_settings` and `policy.repair_disabled_autovacuum` are true and
+`dry_run` is false; `actions` shows the `set_autovacuum` row.
+
+**Upgrading from 1.2.0.** `ALTER EXTENSION adaptive_autovacuum UPDATE` in the control database. Table options
+1.2.0 set automatically stay; `SELECT * FROM adaptive_autovacuum.actions WHERE action_type = 'legacy_table_settings'`
+lists them with the SQL that restores the previous values.
+
 **Upgrading from 1.1.0.** 1.2.0 has no upgrade script: the extension changed from one installation per database to
-one per cluster. In every database that has the 1.1.0 objects, note `changed_tables` and
+one per cluster. In every database that has the 1.1.0 objects, note 1.1.0's `changed_tables` and
 `global_apply_queue.old_value`, restore what you do not want to keep, then `DROP EXTENSION adaptive_autovacuum;`.
 Then `CREATE EXTENSION adaptive_autovacuum;` once, in the control database. Policy edits do not carry over; re-apply
 them to the cluster policy and re-create `table_policy` rows with `database_name`, `schema_name`, `relation_name`.
@@ -146,5 +160,5 @@ them to the cluster policy and re-create `table_policy` rows with `database_name
 4. in the control database, if wanted: `DROP EXTENSION adaptive_autovacuum;` (and in any database that still holds
    a stale copy)
 5. cluster settings the controller applied are listed with their previous values in
-   `adaptive_autovacuum.global_apply_queue.old_value`, and table options it still holds in
-   `adaptive_autovacuum.changed_tables`, before step 4.
+   `adaptive_autovacuum.global_apply_queue.old_value`, and table recommendations you applied with their
+   `revert_sql` in `adaptive_autovacuum.table_recommendations`, before step 4.

@@ -53,7 +53,7 @@ $ErrorActionPreference = 'Stop'
 # Any unexpected error is an installation failure with a defined exit code, never a silent exit 0.
 trap { Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 8 }
 
-$InstallerVersion = '1.2.0'
+$InstallerVersion = '1.3.0'
 $Repo = if ($env:AAV_REPO) { $env:AAV_REPO } else { 'secp256k1-sha256/adaptive_autovacuum' }
 $ReleaseBase = "https://github.com/$Repo/releases"
 $AllowedHosts = @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
@@ -70,7 +70,7 @@ function Get-FinalUri($Response, [string]$Requested) {
     return [uri]$Requested
 }
 
-if ($Version -ne 'latest' -and $Version -notmatch '^v?\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') { Fail $Ex.Args '-Version must look like 1.2.0' }
+if ($Version -ne 'latest' -and $Version -notmatch '^v?\d+\.\d+\.\d+([.-][A-Za-z0-9.-]+)?$') { Fail $Ex.Args '-Version must look like 1.3.0' }
 $Version = $Version -replace '^v', ''
 if ($ArtifactDir -and -not (Test-Path $ArtifactDir -PathType Container)) { Fail $Ex.Args '-ArtifactDir is not a directory' }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { Fail $Ex.Unsupported "unsupported CPU architecture: $env:PROCESSOR_ARCHITECTURE (x64 only)" }

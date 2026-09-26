@@ -1,7 +1,7 @@
 # Installing on Linux
 
-Supported by the packaged installer: PostgreSQL 17 and 18 on Ubuntu 24.04 / 26.04 (amd64, arm64) and
-RHEL / Rocky / AlmaLinux 9 (x86_64, aarch64). Other hosts can still build from source (see the README).
+Supported by the packaged installer: PostgreSQL 17 and 18 on Ubuntu 24.04 / 26.04 and Debian 12 / 13 (amd64, arm64) and
+RHEL / Rocky / AlmaLinux / Oracle Linux 9 and 10 (x86_64, aarch64). Other hosts can still build from source (see the README).
 
 ## Quick install
 
@@ -39,7 +39,7 @@ The extension is created **once per cluster**, in the control database (`adaptiv
 
 **Upgrading from 1.1.0.** There is no upgrade script. When the control database holds an older version, the plan
 shows `DROP EXTENSION + CREATE EXTENSION` and the helper re-creates the extension after your confirmation; the old
-policy edits and history in that database are deleted (note `changed_tables` and `global_apply_queue.old_value` first
+policy edits and history in that database are deleted (note 1.1.0's `changed_tables` and `global_apply_queue.old_value` first
 if you want to restore anything). Databases that carried 1.1.0 copies keep them until you drop them.
 
 ## What the helper does (`adaptive-autovacuum-setup install`)
@@ -53,10 +53,10 @@ Detected PostgreSQL:
   Preload now:      ''
 
 Plan:
-  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.2.0)
+  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.3.0)
   Preload change:   '' -> 'adaptive_autovacuum'
   Restart:          yes (postgresql-18.service)
-  Control database: postgres: CREATE EXTENSION adaptive_autovacuum (version 1.2.0)
+  Control database: postgres: CREATE EXTENSION adaptive_autovacuum (version 1.3.0)
   Enable controller: yes (adaptive_autovacuum.enabled = on, track_cost_delay_timing = on)
 
 Continue? [Y/n]
@@ -126,8 +126,8 @@ Log: `/var/log/adaptive-autovacuum/setup.log`.
 ## Package manager only
 
 ```bash
-sudo dnf install ./adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm   # postgresql17-... for PostgreSQL 17
-sudo apt-get install ./adaptive-autovacuum-setup_1.2.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
+sudo dnf install ./adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm   # .el10. on EL10; postgresql17-... for PostgreSQL 17
+sudo apt-get install ./adaptive-autovacuum-setup_1.3.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb   # _debian13_ on Debian 13
 sudo adaptive-autovacuum-setup install
 ```
 

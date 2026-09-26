@@ -5,7 +5,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:SetupVersion = '1.2.0'
+$script:SetupVersion = '1.3.0'
 $script:ExtName = 'adaptive_autovacuum'
 $script:SupportedMajors = @(17, 18)
 if ($env:AAV_SUPPORTED_MAJORS) { $script:SupportedMajors = @($env:AAV_SUPPORTED_MAJORS -split '[ ,]+' | ForEach-Object { [int]$_ }) }

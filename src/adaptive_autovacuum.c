@@ -187,6 +187,7 @@ static void aav_run_database_workers(List *databases, int64 generation,
 static void aav_run_global_controller(const AAVHostMetrics *metrics, int64 generation,
                                       bool complete);
 static void aav_apply_global_settings(void);
+static void aav_repair_autovacuum(void);
 static void aav_service_emergency(void);
 static bool aav_start_emergency_worker(const AAVEmergencyRequest *request, const char *dbname,
                                        BackgroundWorkerHandle **handle);
@@ -1162,12 +1163,13 @@ aav_fetch_text(const char *sql, int nargs, Oid *argtypes, Datum *values, const c
     return result;
 }
 
-/* The 1.2.0 SQL objects exist in the control database. */
+/* The 1.3.0 SQL objects exist in the control database. */
 static bool
 aav_control_plane_ready(void)
 {
     char *value = aav_fetch_text(
         "SELECT (to_regprocedure('adaptive_autovacuum._begin_generation()') IS NOT NULL"
+        "        AND to_regprocedure('adaptive_autovacuum._repair_disabled_autovacuum()') IS NOT NULL"
         "        AND to_regclass('adaptive_autovacuum.database_state') IS NOT NULL)::text",
         0, NULL, NULL, NULL);
 
@@ -1593,6 +1595,9 @@ aav_run_sweep(MemoryContext sweep_context)
         return;
     }
 
+    /* Highest priority: autovacuum = off is repaired before any database is scanned. */
+    aav_repair_autovacuum();
+
     /* The database program is fetched once per sweep and shared by every worker through a file. */
     program = aav_fetch_text("SELECT adaptive_autovacuum._database_program()", 0, NULL, NULL, NULL);
     if (program == NULL || strstr(program, AAV_PROGRAM_TAG) != NULL)
@@ -1795,11 +1800,26 @@ adaptive_autovacuum_controller_main(Datum main_arg)
                 proc_exit(1);
             /* Absorb interrupts (ProcSignalBarriers) or DROP DATABASE waits forever. */
             CHECK_FOR_INTERRUPTS();
-            /* A reload takes effect here; it does not trigger an extra sweep. */
+            /* A reload takes effect here; it does not trigger an extra sweep, but a reload that
+             * turned autovacuum off is repaired right away rather than at the next sweep. */
             if (aav_got_sighup)
             {
                 aav_got_sighup = false;
                 ProcessConfigFile(PGC_SIGHUP);
+                PG_TRY();
+                {
+                    if (aav_enabled && !RecoveryInProgress() && aav_control_plane_ready())
+                        aav_repair_autovacuum();
+                }
+                PG_CATCH();
+                {
+                    char *message = aav_copy_error_message();
+
+                    aav_abort_transaction_if_needed();
+                    elog(WARNING, "adaptive autovacuum repair check failed: %s", message);
+                    pfree(message);
+                }
+                PG_END_TRY();
             }
             wait_ms -= (long) ((GetCurrentTimestamp() - before) / 1000);
         }
@@ -1817,6 +1837,7 @@ static const char *const aav_allowed_global_gucs[] = {
     "autovacuum_vacuum_cost_limit",
     "autovacuum_vacuum_cost_delay",
     "autovacuum_max_workers",
+    "autovacuum_naptime",
     "autovacuum_work_mem",
     "vacuum_buffer_usage_limit",
     "autovacuum_vacuum_scale_factor",
@@ -2050,6 +2071,22 @@ aav_apply_global_settings(void)
 
     if (applied_count > 0)
         (void) kill(PostmasterPid, SIGHUP);
+}
+
+
+/* autovacuum = off is the most dangerous misconfiguration: the SQL side queues 'on', this applies it now. */
+static void
+aav_repair_autovacuum(void)
+{
+    char *queued = aav_fetch_text(
+        "SELECT adaptive_autovacuum._repair_disabled_autovacuum()::text",
+        0, NULL, NULL, NULL);
+
+    if (queued != NULL && strcmp(queued, "true") == 0)
+    {
+        elog(LOG, "adaptive autovacuum: autovacuum is off, repairing it before the sweep");
+        aav_apply_global_settings();
+    }
 }
 
 

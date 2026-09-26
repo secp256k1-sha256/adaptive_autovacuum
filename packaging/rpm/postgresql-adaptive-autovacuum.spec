@@ -4,9 +4,11 @@
 %global extname adaptive_autovacuum
 # Extension packages ship no separate debuginfo/debugsource RPMs.
 %global debug_package %{nil}
+# PGXS links the module with an rpath to %{pgroot}/lib, as PGDG's own packages do; EL10's check-rpaths rejects it.
+%global __brp_check_rpaths %{nil}
 
 Name:           postgresql%{pgmajor}-adaptive-autovacuum
-Version:        1.2.0
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Adaptive autovacuum controller extension for PostgreSQL %{pgmajor}
 License:        PostgreSQL
@@ -84,6 +86,9 @@ if [ "$1" -eq 0 ]; then
 fi
 
 %changelog
+* Sat Sep 26 2026 adaptive_autovacuum maintainers - 1.3.0-1
+- Table settings recommended, never written; autovacuum = off repaired before the sweep; autovacuum_naptime managed;
+  worker raises easier; packages for Debian 12/13 and EL10; upgrade script 1.2.0 -> 1.3.0
 * Thu Sep 24 2026 adaptive_autovacuum maintainers - 1.2.0-1
 - One control plane per cluster: install once in the control database (postgres); every database is discovered and managed, no CREATE EXTENSION elsewhere
 - Cost-weighted vacuum_activity_rate replaces the MB/s signal; XID velocity without allocating XIDs; cluster-first status(), database_status, table_status, actions

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SETUP_VERSION="1.2.0"
+readonly SETUP_VERSION="1.3.0"
 readonly EXT_NAME="adaptive_autovacuum"
 readonly STATE_DIR="${AAV_STATE_DIR:-/var/lib/adaptive-autovacuum}"
 readonly STATE_FILE="$STATE_DIR/installer-state.json"

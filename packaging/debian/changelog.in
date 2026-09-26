@@ -1,3 +1,17 @@
+postgresql-@PGMAJOR@-adaptive-autovacuum (1.3.0-1) unstable; urgency=medium
+
+  * Packages for Debian 12/13 and EL10 (RHEL/Rocky/AlmaLinux 10); upgrade script 1.2.0 -> 1.3.0.
+  * autovacuum_naptime is managed: halved per check while overdue relations wait and the worker
+    pool is under-filled (floor 5 s), decayed back with the cost pair; worker raises need only an
+    overdue queue longer than the pool and are no longer blocked by CPU load alone.
+  * Table settings are recommended, never written: table_recommendations carries apply_sql /
+    revert_sql per database; a recommendation never loosens an operator-set trigger.
+  * autovacuum = off is repaired before the sweep and right after a reload; every table counts
+    (min_table_bytes 0), dead-tuple floor 1000; vacuum_activity_detail rates are true deltas;
+    latest_global_recommendation adds vacuum_read_mbps / vacuum_write_mbps.
+
+ -- adaptive_autovacuum maintainers <noreply@github.com>  Sat, 26 Sep 2026 12:00:00 +0000
+
 postgresql-@PGMAJOR@-adaptive-autovacuum (1.2.0-1) unstable; urgency=medium
 
   * One control plane per cluster: install once in the control database (postgres);

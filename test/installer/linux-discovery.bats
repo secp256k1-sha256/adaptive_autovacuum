@@ -87,7 +87,7 @@ lib() {  # run a snippet with the helper sourced in library mode
 @test "version and help exit 0" {
     run bash "$SETUP" version
     [ "$status" -eq 0 ]
-    [ "$output" = "1.2.0" ]
+    [ "$output" = "1.3.0" ]
     run bash "$SETUP" --help
     [ "$status" -eq 0 ]
 }

@@ -10,6 +10,7 @@ SELECT
     ds.eligible_relations,
     ds.overdue_relations,
     ds.emergency_relations,
+    ds.recommended_relations,
     ds.debt_tuples AS maintenance_debt_tuples,
     ds.debt_velocity AS maintenance_debt_velocity,
     ds.max_xid_age,
@@ -45,7 +46,6 @@ SELECT
     state.consecutive_overdue,
     state.consecutive_healthy,
     state.last_seen_at,
-    state.last_change_at,
     state.last_dead_tuples,
     state.last_live_tuples,
     state.last_trigger,
@@ -54,33 +54,42 @@ SELECT
     state.last_insert_backlog_ratio,
     state.last_xid_age,
     state.last_mxid_age,
-    state.original_captured,
-    state.managed_values,
-    state.ownership_conflict,
-    state.last_error,
+    state.recommendation_status,
+    state.recommended_reloptions,
     state.last_action
 FROM adaptive_autovacuum.table_state state;
 
 COMMENT ON VIEW adaptive_autovacuum.table_status IS
-'Relations in any managed database the controller currently has state for: non-normal, managed, in conflict, being vacuumed, cooling down, or with a failed action. Healthy unmanaged relations are absent by design. The last_* metric columns are as of the last row write (control change or hourly heartbeat), not of the last scan.';
+'Relations in any managed database the controller currently has state for: non-normal, carrying a table recommendation, or being vacuumed. Healthy relations without a recommendation are absent by design. The last_* metric columns are as of the last row write (state change or hourly heartbeat), not of the last scan.';
 
-CREATE VIEW adaptive_autovacuum.changed_tables AS
+/* Table settings are never written by the extension: this is the SQL the operator runs, per database. */
+CREATE VIEW adaptive_autovacuum.table_recommendations AS
 SELECT
     state.database_name,
     state.relation_name,
-    change.option_name,
-    adaptive_autovacuum._option_value(state.original_reloptions,
-                                      change.option_name) AS original_value,
-    change.option_value AS current_value,
     state.state,
-    state.ownership_conflict,
-    state.last_change_at
-FROM adaptive_autovacuum.table_state state,
-     jsonb_each_text(state.managed_values) AS change(option_name, option_value)
-WHERE state.managed_values <> '{}'::jsonb;
+    state.recommendation_status,
+    CASE WHEN state.recommendation_status = 'open'
+         THEN adaptive_autovacuum._reloptions_sql(state.relation_name, state.recommended_reloptions)
+    END AS apply_sql,
+    CASE WHEN state.recommendation_status IN ('applied', 'revert')
+         THEN adaptive_autovacuum._reloptions_sql(state.relation_name, state.previous_reloptions)
+    END AS revert_sql,
+    state.recommended_reloptions,
+    state.previous_reloptions,
+    state.recommendation_reason AS reason,
+    state.recommended_at,
+    state.applied_at,
+    state.last_seen_at,
+    state.database_oid,
+    state.relation_oid
+FROM adaptive_autovacuum.table_state state
+WHERE state.recommendation_status IS NOT NULL
+ORDER BY CASE state.recommendation_status WHEN 'open' THEN 0 WHEN 'revert' THEN 1 ELSE 2 END,
+         state.database_name, state.relation_name;
 
-COMMENT ON VIEW adaptive_autovacuum.changed_tables IS
-'One row per (database, relation, reloption) currently set by the controller: original value (NULL = was inherited from the global default) vs controller-set value.';
+COMMENT ON VIEW adaptive_autovacuum.table_recommendations IS
+'Per-table settings the controller recommends but never writes. open: run apply_sql in database_name (trigger settings always as a threshold + scale factor pair, plus a tiered cost boost). applied: the current reloptions match the recommendation; revert_sql restores the previous values. revert: the table has been normal for healthy_cycles_before_revert checks and the cost boost should be removed with revert_sql. Rows disappear when the table is healthy and nothing of ours is left to revert.';
 
 /* Per-database wraparound board: watch at half the emergency age, alarm at the age itself. */
 CREATE VIEW adaptive_autovacuum.wraparound_status AS
@@ -119,11 +128,20 @@ LIMIT 10;
 COMMENT ON VIEW adaptive_autovacuum.aging_tables IS
 'Top ten relations of the database you query it in (normally the control database) by transaction age, main heap or TOAST table whichever is older. Per-database maxima for every managed database are in database_status.max_xid_age; wraparound urgency is derived from these ages, never by allocating a transaction ID.';
 
+/* The activity detail holds page deltas per second; times the block size they read as MiB/s by kind. */
 CREATE VIEW adaptive_autovacuum.latest_global_recommendation AS
-SELECT recommendation.*
+SELECT recommendation.*,
+       round(((recommendation.vacuum_activity_detail ->> 'reads_per_sec')::numeric
+              * current_setting('block_size')::numeric / 1048576), 2) AS vacuum_read_mbps,
+       round((((recommendation.vacuum_activity_detail ->> 'writes_per_sec')::numeric
+               + (recommendation.vacuum_activity_detail ->> 'extends_per_sec')::numeric)
+              * current_setting('block_size')::numeric / 1048576), 2) AS vacuum_write_mbps
 FROM adaptive_autovacuum.global_recommendations recommendation
 ORDER BY recommendation.created_at DESC
 LIMIT 1;
+
+COMMENT ON VIEW adaptive_autovacuum.latest_global_recommendation IS
+'The newest global_recommendations row plus the autovacuum-worker I/O in MiB/s: vacuum_read_mbps = pages read from storage, vacuum_write_mbps = pages written or extended (pg_stat_io deltas x block size). vacuum_activity_rate and cost_budget_rate stay in vacuum cost units per second, the unit the cost-based delay is defined in.';
 
 CREATE VIEW adaptive_autovacuum.active_vacuums AS
 SELECT
@@ -205,12 +223,12 @@ FROM adaptive_autovacuum.emergency_queue e
 ORDER BY 1 DESC;
 
 COMMENT ON VIEW adaptive_autovacuum.actions IS
-'One place for everything the extension did: cluster settings applied (scope cluster), per-table changes and their failures (scope table), and emergency vacuums (scope emergency), newest first.';
+'One place for everything the extension did: cluster settings applied (scope cluster), per-table ANALYZE runs and their failures (scope table; table settings are only recommended, see table_recommendations), and emergency vacuums (scope emergency), newest first.';
 
 COMMENT ON TABLE adaptive_autovacuum.policy IS
 'One-row cluster policy. enabled and dry_run are independent safety gates; included_databases / excluded_databases (LIKE patterns) choose the managed databases.';
 COMMENT ON TABLE adaptive_autovacuum.table_state IS
-'Controller ownership, hysteresis counters, and reversible reloption state for relations in every managed database, keyed by database OID + relation OID. Rows exist only for relations with something to remember and are rewritten only on a control change or hourly.';
+'Hysteresis counters, vacuum fingerprint and the table-setting recommendation for relations in every managed database, keyed by database OID + relation OID. Rows exist only for relations with something to remember and are rewritten only on a state change or hourly.';
 COMMENT ON TABLE adaptive_autovacuum.database_state IS
 'One row per discovered database: identity, sweep bookkeeping (generation, timing, status) and the latest scan summary the global controller aggregates.';
 COMMENT ON TABLE adaptive_autovacuum.decisions IS
@@ -227,7 +245,7 @@ REVOKE ALL ON ALL FUNCTIONS IN SCHEMA adaptive_autovacuum FROM PUBLIC;
 GRANT USAGE ON SCHEMA adaptive_autovacuum TO PUBLIC;
 GRANT SELECT ON adaptive_autovacuum.database_status,
                 adaptive_autovacuum.table_status,
-                adaptive_autovacuum.changed_tables,
+                adaptive_autovacuum.table_recommendations,
                 adaptive_autovacuum.latest_global_recommendation,
                 adaptive_autovacuum.active_vacuums,
                 adaptive_autovacuum.wraparound_status,
@@ -331,11 +349,13 @@ RETURNS TABLE (
     tables_seen               bigint,
     tables_needing_vacuum     bigint,
     tables_emergency          bigint,
+    open_table_recommendations bigint,
     maintenance_debt_tuples   bigint,
     maintenance_debt_velocity double precision,
     backlog_trend             text,
     autovacuum_workers_running bigint,
     autovacuum_max_workers    integer,
+    autovacuum_naptime_seconds integer,
     cost_limit                integer,
     cost_delay_ms             double precision,
     pending_global_changes    bigint,
@@ -405,11 +425,13 @@ BEGIN
         (SELECT sum(d.table_count) FROM adaptive_autovacuum.database_state d WHERE d.status <> 'excluded'),
         (SELECT sum(d.overdue_relations) FROM adaptive_autovacuum.database_state d WHERE d.status <> 'excluded'),
         (SELECT sum(d.emergency_relations) FROM adaptive_autovacuum.database_state d WHERE d.status <> 'excluded'),
+        (SELECT count(*) FROM adaptive_autovacuum.table_state t WHERE t.recommendation_status = 'open'),
         (SELECT c.last_debt_tuples FROM adaptive_autovacuum.controller_state c WHERE c.only_row),
         (SELECT c.debt_velocity FROM adaptive_autovacuum.controller_state c WHERE c.only_row),
         (SELECT r.backlog_trend FROM adaptive_autovacuum.latest_global_recommendation r),
         (SELECT count(*) FROM pg_stat_activity a WHERE a.backend_type = 'autovacuum worker'),
         (SELECT g.setting::integer FROM pg_settings g WHERE g.name = 'autovacuum_max_workers'),
+        (SELECT g.setting::integer FROM pg_settings g WHERE g.name = 'autovacuum_naptime'),
         (SELECT CASE WHEN g.setting::integer < 0
                      THEN (SELECT v.setting::integer FROM pg_settings v WHERE v.name = 'vacuum_cost_limit')
                      ELSE g.setting::integer END
@@ -430,9 +452,9 @@ END
 $$;
 
 COMMENT ON FUNCTION adaptive_autovacuum.status() IS
-'Installer/operator API: one row describing the whole cluster installation - library, launcher and controller, cluster policy, sweep progress, managed databases, backlog and emergency state. Readable by pg_monitor; meaningful in the control database.';
+'Installer/operator API: one row describing the whole cluster installation - library, launcher and controller, cluster policy, sweep progress, managed databases, backlog, open table recommendations and emergency state. Readable by pg_monitor; meaningful in the control database.';
 
-/* Health checks with a fixed vocabulary: OK, WARN, FAIL, RESTART_REQUIRED. */
+/* Health checks with a fixed vocabulary: OK, WARN, FAIL, RESTART_REQUIRED (19 checks). */
 CREATE FUNCTION adaptive_autovacuum.doctor()
 RETURNS TABLE (check_name text, status text, detail text, remediation text)
 LANGUAGE plpgsql
@@ -569,8 +591,9 @@ BEGIN
             'CREATE EXTENSION adaptive_autovacuum;';
     ELSIF coalesce(s.policy_enabled, false) AND NOT coalesce(s.policy_dry_run, true) THEN
         RETURN QUERY SELECT 'policy', 'OK',
-            'active (enabled, applying changes'
-                || CASE WHEN s.manage_global_settings THEN ', managing cluster settings)' ELSE ', per-table only)' END,
+            'active (enabled'
+                || CASE WHEN s.manage_global_settings THEN ', applying cluster settings' ELSE ', cluster settings recorded only' END
+                || ', table settings recommended only)',
             NULL::text;
     ELSIF coalesce(s.policy_enabled, false) THEN
         RETURN QUERY SELECT 'policy', 'WARN',
@@ -668,7 +691,18 @@ BEGIN
         RETURN QUERY SELECT 'relation_errors', 'OK', 'no failed per-table actions in the last 24 h', NULL::text;
     END IF;
 
-    /* 14. emergency_vacuum */
+    /* 14. table_recommendations */
+    IF s.extension_version IS NULL THEN
+        RETURN QUERY SELECT 'table_recommendations', 'WARN', 'not applicable: the extension is not created here', NULL::text;
+    ELSIF coalesce(s.open_table_recommendations, 0) > 0 THEN
+        RETURN QUERY SELECT 'table_recommendations', 'WARN',
+            s.open_table_recommendations::text || ' table(s) have an open settings recommendation waiting for an operator',
+            'SELECT database_name, relation_name, apply_sql, reason FROM adaptive_autovacuum.table_recommendations WHERE recommendation_status = ''open''; run apply_sql in that database.';
+    ELSE
+        RETURN QUERY SELECT 'table_recommendations', 'OK', 'no open table settings recommendation', NULL::text;
+    END IF;
+
+    /* 15. emergency_vacuum */
     IF s.extension_version IS NULL THEN
         RETURN QUERY SELECT 'emergency_vacuum', 'WARN', 'not applicable: the extension is not created here', NULL::text;
     ELSIF coalesce(s.active_emergencies, 0) > 0 THEN
@@ -679,7 +713,7 @@ BEGIN
         RETURN QUERY SELECT 'emergency_vacuum', 'OK', 'no emergency VACUUM pending or running', NULL::text;
     END IF;
 
-    /* 15. wraparound */
+    /* 16. wraparound */
     IF s.extension_version IS NULL THEN
         RETURN QUERY SELECT 'wraparound', 'WARN', 'not applicable: the extension is not created here', NULL::text;
     ELSIF s.wraparound_status = 'alarm' THEN
@@ -694,17 +728,17 @@ BEGIN
         RETURN QUERY SELECT 'wraparound', 'OK', 'all databases are below the watch threshold', NULL::text;
     END IF;
 
-    /* 16. autovacuum */
+    /* 17. autovacuum */
     autovacuum_on := current_setting('autovacuum')::boolean;
     IF autovacuum_on THEN
         RETURN QUERY SELECT 'autovacuum', 'OK', 'autovacuum = on', NULL::text;
     ELSE
         RETURN QUERY SELECT 'autovacuum', 'WARN',
-            'autovacuum = off; the controller turns it back on after repair_disabled_autovacuum_cycles consecutive sweeps',
+            'autovacuum = off; the controller turns it back on before its next sweep (repair_disabled_autovacuum)',
             'ALTER SYSTEM SET autovacuum = on; SELECT pg_reload_conf();';
     END IF;
 
-    /* 17. track_cost_delay_timing (PG18+) */
+    /* 18. track_cost_delay_timing (PG18+) */
     delay_timing := current_setting('track_cost_delay_timing', true);
     IF delay_timing IS NULL THEN
         RETURN QUERY SELECT 'track_cost_delay_timing', 'OK',
@@ -717,7 +751,7 @@ BEGIN
             'ALTER SYSTEM SET track_cost_delay_timing = on; SELECT pg_reload_conf();';
     END IF;
 
-    /* 18. recovery */
+    /* 19. recovery */
     IF s.in_recovery THEN
         RETURN QUERY SELECT 'recovery', 'WARN',
             'this server is a standby; the controller stays idle until promotion', NULL::text;

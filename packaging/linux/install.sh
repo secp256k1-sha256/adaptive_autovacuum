@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.2.0"
+readonly INSTALLER_VERSION="1.3.0"
 readonly REPO="${AAV_REPO:-secp256k1-sha256/adaptive_autovacuum}"
 readonly RELEASE_BASE="https://github.com/$REPO/releases"
 # Hosts a GitHub release download may legitimately redirect to.
@@ -71,7 +71,7 @@ parse_args() {
             *) die $EX_ARGS "unknown option: $1 (see --help)" ;;
         esac
     done
-    [[ $OPT_VERSION == latest || $OPT_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die $EX_ARGS "--version must look like 1.2.0"
+    [[ $OPT_VERSION == latest || $OPT_VERSION =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die $EX_ARGS "--version must look like 1.3.0"
     OPT_VERSION=${OPT_VERSION#v}
     [[ -z $OPT_PG_MAJOR || $OPT_PG_MAJOR =~ ^[0-9]+$ ]] || die $EX_ARGS "--pg-major must be a number"
     [[ -z $OPT_ARTIFACT_DIR || -d $OPT_ARTIFACT_DIR ]] || die $EX_ARGS "--artifact-dir is not a directory"
@@ -97,7 +97,7 @@ detect_host() {
         ubuntu) PKG_TYPE=deb; DISTRO_TAG="ubuntu${OS_VERSION}" ;;
         debian) PKG_TYPE=deb; DISTRO_TAG="debian${OS_VERSION}" ;;
         rhel|rocky|almalinux|centos|ol) PKG_TYPE=rpm; DISTRO_TAG="el${OS_VERSION%%.*}" ;;
-        *) die $EX_UNSUPPORTED "unsupported distribution: $OS_ID $OS_VERSION (supported: Ubuntu 24.04/26.04, RHEL/Rocky/Alma 9)" ;;
+        *) die $EX_UNSUPPORTED "unsupported distribution: $OS_ID $OS_VERSION (supported: Ubuntu 24.04/26.04, Debian 12/13, RHEL/Rocky/Alma 9/10)" ;;
     esac
     if [[ $PKG_TYPE == deb ]]; then need_cmd apt-get "apt"; need_cmd dpkg "dpkg"; else need_cmd dnf "dnf"; need_cmd rpm "rpm"; fi
 }

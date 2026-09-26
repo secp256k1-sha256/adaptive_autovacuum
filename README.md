@@ -17,7 +17,7 @@
 
 No compiler or manual file copying. Review the installer, then run it.
 
-**🐧 Linux** · Ubuntu 24.04 / 26.04, RHEL / Rocky / AlmaLinux 9
+**🐧 Linux** · Ubuntu 24.04 / 26.04, Debian 12 / 13, RHEL / Rocky / AlmaLinux 9 / 10
 
 ```bash
 curl -fsSLO https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.sh
@@ -60,8 +60,8 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 | 📊 | **Repair missing statistics** | Runs `ANALYZE` on eligible tables that have never been analyzed. |
 | 🖥️ | **Respect host capacity** | Considers CPU, memory, active vacuum work and optional WAL-rate pressure before increasing normal maintenance. |
 | 🚨 | **Protect against wraparound** | Detects dangerous XID/MXID conditions and intervenes when built-in protection is demonstrably failing. |
-| ♻️ | **Clean up after itself** | Restores owned table options and gradually unwinds temporary incident cost tuning. |
-| 🔎 | **Explain every decision** | Exposes cluster status, actions, previous values, recommendations and errors through SQL. |
+| ♻️ | **Clean up after itself** | Gradually unwinds incident cost tuning and tells you when an applied table boost can be reverted. |
+| 🔎 | **Explain every decision** | Exposes cluster status, actions, previous values, table recommendations with ready-to-run SQL, and errors through SQL. |
 
 > 🎯 **The goal:** keep maintenance debt under control, use spare host capacity when needed and intervene before neglected vacuum work becomes an outage, not chase a benchmark score.
 
@@ -69,9 +69,9 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 
 - **Evidence before action.** Global changes require a complete, successful cluster sweep; incomplete evidence produces advice, not an automatic change.
 - **Bounded tuning.** Changes use an allow-list, policy ceilings and available resource signals. CPU count is not a direct ceiling on worker recommendations.
-- **Respect manual intervention.** Conflicting operator changes to managed table options make the controller back off. It never edits table data.
+- **Table settings stay yours.** The controller never runs `ALTER TABLE`. Per-table trigger and cost changes are recommendations with ready-to-run SQL in `table_recommendations`, and a recommendation never loosens a trigger you set. It never edits table data.
 - **Separate emergency path.** An anti-wraparound vacuum making progress is not cancelled; human-started vacuums are never takeover targets.
-- **Reversible table tuning.** Original owned options are captured and restored after recovery. Global changes and their prior values are audited.
+- **Reversible.** Global changes and their prior values are audited; every table recommendation carries the SQL that reverts it.
 
 ## 🧭 Contents
 
@@ -93,17 +93,19 @@ One controller in the **control database** (`postgres` by default) discovers all
 | Decision | Evidence and limits |
 |---|---|
 | 🧹 Raise vacuum cost budget | Backlog trend, estimated drain time, host pressure and activity gained after earlier raises. |
-| 👷 Add workers | Saturation or an overdue queue, debt trend, memory, policy ceiling and PG18 worker slots. PostgreSQL 17 gets advice only. |
+| 👷 Add workers | A busy pool or an overdue queue longer than the pool, debt trend, memory and storage pressure (CPU load alone does not block: workers share one cost budget), policy ceiling and PG18 worker slots. PostgreSQL 17 gets advice only. |
+| ⏱️ Shorten the launcher interval | Core starts one worker per database per `autovacuum_naptime`, so a raised pool stays empty until the interval follows: halved per check while overdue relations wait and the pool is under-filled (floor 5 s), walked back up with the cost pair. |
 | 🧠 Adjust memory / buffer ring | Active maintenance, available memory, repeated index passes and bounded recommendations. |
-| 🎯 Tighten triggers | Widespread overdue tables justify cluster-wide changes; individual outliers get table-level tuning. |
+| 🎯 Tighten triggers | Widespread overdue tables justify cluster-wide changes and silence per-table advice; individual outliers get a table-level recommendation (threshold and scale factor together, never looser than today). |
 | 📊 Analyze missing statistics | Eligible live tables with no recorded `ANALYZE`, largest first, within a per-database scheduling budget. |
-| ♻️ Restore temporary tuning | Six healthy checks by default for owned table settings; ten backlog-free sweeps before decaying incident cost tuning. Worker counts are not lowered automatically. |
+| ♻️ Unwind incident tuning | Ten backlog-free sweeps before decaying cluster cost tuning; an applied table cost boost gets a revert recommendation after six healthy checks. Worker counts are not lowered automatically. |
+| 🔧 Repair `autovacuum = off` | Turned back on before anything else: at the start of every sweep and on every configuration reload. |
 
-Normal table tuning begins at **64 MiB**, requires repeated overdue observations and respects cooldowns and short lock timeouts. Optional table cost boosts share **one cluster-wide budget**, including boosts in other databases.
+Every table counts whatever its size (`min_table_bytes` defaults to 0; a small hot table hurts as much as a large one). A table recommendation needs two consecutive overdue checks, and at most two cost-boost recommendations stand at once cluster-wide (`max_boosted_relations`).
 
-A failed or timed-out database makes the sweep's global evidence incomplete: its recommendation is recorded, but not applied. Database workers collect evidence and carry out table-level actions; only the central controller changes cluster GUCs. `autovacuum_freeze_max_age` remains advice-only.
+A failed or timed-out database makes the sweep's global evidence incomplete: its recommendation is recorded, but not applied. Database workers collect evidence, run `ANALYZE` on never-analyzed tables and produce table recommendations; only the central controller changes cluster GUCs, and nothing changes table settings. `autovacuum_freeze_max_age` remains advice-only.
 
-**Cost-feedback detail:** the 3,200 MiB/s default theoretical cost ceiling is not a disk-bandwidth measurement. `vacuum_activity_rate`, derived from autovacuum-worker `pg_stat_io` activity and vacuum cost weights, is compared with the live cost budget. A raise must deliver the configured activity gain (10% by default) before the next raise.
+**Cost-feedback detail:** the 3,200 MiB/s default theoretical cost ceiling is not a disk-bandwidth measurement. `vacuum_activity_rate` (vacuum cost units per second, derived from autovacuum-worker `pg_stat_io` activity and the vacuum cost weights) is compared with `cost_budget_rate`, the units per second the live cost pair allows. A raise must deliver the configured activity gain (10% by default) before the next raise. `latest_global_recommendation` also shows the worker I/O as `vacuum_read_mbps` and `vacuum_write_mbps`.
 
 ## 📦 Installation
 
@@ -111,31 +113,31 @@ The [Quick install](#-quick-install) scripts are the simplest path. For manual o
 
 | Platform | Package |
 |---|---|
-| 🐧 Ubuntu 24.04 / 26.04 | DEB, amd64 / arm64; extension and shared setup helper |
-| 🐧 RHEL / Rocky / AlmaLinux 9 | RPM, x86_64 / aarch64; extension and shared setup helper |
+| 🐧 Ubuntu 24.04 / 26.04, Debian 12 / 13 | DEB per release, amd64 / arm64; extension and shared setup helper |
+| 🐧 RHEL / Rocky / AlmaLinux / Oracle Linux 9 and 10 | one `el9` / `el10` RPM serves every clone of that major, x86_64 / aarch64; extension and shared setup helper |
 | 🪟 Windows, EDB-style | PostgreSQL-major-specific x64 ZIP with setup helper |
 
 <details>
-<summary><strong>🐧 Ubuntu 24.04 amd64 · PostgreSQL 18 (DEB)</strong></summary>
+<summary><strong>🐧 Ubuntu 24.04 amd64 · PostgreSQL 18 (DEB; Debian 13: use the `_debian13_` file)</strong></summary>
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup_1.2.0-1_all.deb
-curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
-sudo apt-get install ./adaptive-autovacuum-setup_1.2.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.2.0-1_ubuntu24.04_amd64.deb
+curl -fsSLO $U/adaptive-autovacuum-setup_1.3.0-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb
+sudo apt-get install ./adaptive-autovacuum-setup_1.3.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb
 sudo adaptive-autovacuum-setup install
 ```
 
 </details>
 
 <details>
-<summary><strong>🐧 EL9 x86_64 · PostgreSQL 18 (RPM)</strong></summary>
+<summary><strong>🐧 EL9 x86_64 · PostgreSQL 18 (RPM; EL10: use the `.el10.` files)</strong></summary>
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm
-curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm
-sudo dnf install ./adaptive-autovacuum-setup-1.2.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.2.0-1.el9.x86_64.rpm
+curl -fsSLO $U/adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm
+sudo dnf install ./adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm
 sudo adaptive-autovacuum-setup install
 ```
 
@@ -146,7 +148,7 @@ sudo adaptive-autovacuum-setup install
 
 ```powershell
 $U = 'https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download'
-Invoke-WebRequest "$U/adaptive_autovacuum-1.2.0-pg18-windows-x64.zip" -OutFile aav.zip
+Invoke-WebRequest "$U/adaptive_autovacuum-1.3.0-pg18-windows-x64.zip" -OutFile aav.zip
 Expand-Archive aav.zip -DestinationPath aav
 .\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Credential (Get-Credential postgres)
 ```
@@ -171,7 +173,7 @@ windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 
 `packaging\windows\build-zip.ps1 -PgMajor 18` packages a Windows build. For manual activation, append the library to `shared_preload_libraries`, restart, then run `CREATE EXTENSION adaptive_autovacuum;` **once in the control database**. Set any explicit `off` settings to `on` if you want automation.
 
-The distributed `sql/adaptive_autovacuum--1.2.0.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
+The current `sql/adaptive_autovacuum--1.3.0.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
 
 </details>
 
@@ -186,14 +188,14 @@ SELECT * FROM adaptive_autovacuum.doctor();
 SELECT * FROM adaptive_autovacuum.status();
 ```
 
-`doctor()` runs 18 installation and runtime checks with `OK`, `WARN`, `FAIL` and `RESTART_REQUIRED` results. `status()` summarizes cluster-wide health, current sweep, database coverage, maintenance debt, active workers, cost settings and emergency state. Both are available to `pg_monitor`.
+`doctor()` runs 19 installation and runtime checks with `OK`, `WARN`, `FAIL` and `RESTART_REQUIRED` results. `status()` summarizes cluster-wide health, current sweep, database coverage, maintenance debt, active workers, cost settings and emergency state. Both are available to `pg_monitor`.
 
 | Need | SQL |
 |---|---|
 | 🗄️ Database health | `SELECT * FROM adaptive_autovacuum.database_status;` |
 | 🔍 Table health | `SELECT * FROM adaptive_autovacuum.table_status;` |
 | 🧾 Recent actions | `SELECT * FROM adaptive_autovacuum.actions LIMIT 50;` |
-| ♻️ Managed table options | `SELECT * FROM adaptive_autovacuum.changed_tables;` |
+| 💡 Table recommendations (SQL to run and to revert) | `SELECT * FROM adaptive_autovacuum.table_recommendations;` |
 | ⚙️ Global changes and original values | `SELECT * FROM adaptive_autovacuum.global_apply_queue ORDER BY id DESC;` |
 | 💡 Latest advice | `SELECT * FROM adaptive_autovacuum.latest_global_recommendation;` |
 | 📝 Decisions and errors | `SELECT * FROM adaptive_autovacuum.decisions ORDER BY id DESC LIMIT 50;` |
@@ -206,7 +208,13 @@ Shell diagnostics: `sudo adaptive-autovacuum-setup doctor` or, on Windows, `adap
 
 ## 🎛️ Operating the controller
 
-Fresh installations start with `enabled = true`, `dry_run = false`, `manage_global_settings = true` and emergency protection enabled. Optional per-table cost boosts are disabled by default. **No policy update is needed for normal operation.**
+Fresh installations start with `enabled = true`, `dry_run = false`, `manage_global_settings = true` and emergency protection enabled. Table settings are never written: `table_recommendations` lists the SQL to run in the table's database and the SQL to revert it. **No policy update is needed for normal operation.**
+
+```sql
+-- Table recommendations waiting for you, with the statement to run in that database
+SELECT database_name, relation_name, recommendation_status, apply_sql, revert_sql, reason
+FROM adaptive_autovacuum.table_recommendations;
+```
 
 ```sql
 -- Pause / resume cluster automation
@@ -245,8 +253,13 @@ Defaults are designed for unattended operation. Adjust only what your workload r
 | `policy.included_databases` | `NULL` | All connectable non-template databases, unless filtered. |
 | `policy.excluded_databases` | `{}` | LIKE patterns excluded from normal management. |
 | `policy.recommendation_workers_max` | `16` | Recommended autovacuum-worker ceiling. |
+| `policy.manage_naptime` | `true` | Ramp `autovacuum_naptime` down while the pool is under-filled, back up after recovery. |
+| `policy.naptime_min_seconds` | `5` | Floor of the managed `autovacuum_naptime`. |
 | `policy.manage_global_settings` | `true` | Apply global advice instead of only recording it. |
-| `policy.manage_table_costs` | `false` | Optional per-table cost boosts, under one cluster-wide budget. |
+| `policy.recommend_table_costs` | `true` | Include a tiered cost boost in table recommendations. |
+| `policy.max_boosted_relations` | `2` | Cost-boost recommendations standing at once, cluster-wide. |
+| `policy.min_table_bytes` | `0` | Size floor for table scoring; `0` scores every table. |
+| `policy.target_dead_tuple_min` | `1000` | Floor of the per-table dead-tuple target (1% of rows otherwise). |
 | `policy.cost_raise_min_activity_gain_percent` | `10` | Required activity gain before another cost raise. |
 | `policy.high_wal_mbps` | `0` | Optional WAL-rate pressure guardrail; `0` disables it. |
 
@@ -304,7 +317,7 @@ UPDATE adaptive_autovacuum.policy SET emergency_vacuum_enabled = false;
 |---|---|
 | PostgreSQL 17 / 18 | Both support cost tuning, triggers, missing-statistics repair and emergency protection. Binaries are major-specific. |
 | PostgreSQL 18 | Adds reloadable worker increases, maximum vacuum thresholds, delay timing and emergency eager-freeze tuning. PG17 worker increases are advice-only. |
-| Cluster scope | Install the extension in one control database. Global setting changes affect every database; exclusions prevent scanning and table-level actions. |
+| Cluster scope | Install the extension in one control database. Global setting changes affect every database; exclusions prevent scanning and table recommendations. |
 | Standbys | Automation waits for a writable primary. Keep binaries and settings consistent through HA tooling. |
 | Config managers | Coordinate with Patroni/operators; setup rejects detected managed environments. |
 | Privileges | Installation and workers require superuser privileges; selected health APIs permit `pg_monitor`. |
@@ -319,7 +332,9 @@ Upgrade the package/files for your PostgreSQL major, restart when replacing the 
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 ```
 
-**⚠️ Beta migration:** 1.1.0 → 1.2.0 has no in-place upgrade path because it moves from per-database copies to a single cluster control plane. The installer plans a confirmed drop/recreate in the control database. Review `changed_tables` and `global_apply_queue.old_value` first, and reapply your policy changes afterwards. Remove stale 1.1.0 copies from other databases separately; `doctor()` reports them.
+**1.2.0 → 1.3.0** upgrades in place. Table options that 1.2.0 set automatically stay as they are (they are tighter triggers); `actions` lists each as `legacy_table_settings` with the SQL that restores the previous values. From 1.3.0 the extension only recommends table settings.
+
+**⚠️ Beta migration:** 1.1.0 → 1.2.0 has no in-place upgrade path because it moves from per-database copies to a single cluster control plane. The installer plans a confirmed drop/recreate in the control database. Review 1.1.0's `changed_tables` and `global_apply_queue.old_value` first, and reapply your policy changes afterwards. Remove stale 1.1.0 copies from other databases separately; `doctor()` reports them.
 
 Before removal, restore any settings you do not want to keep, disable the controller and coordinate outstanding maintenance. On Linux:
 

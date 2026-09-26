@@ -1,77 +1,90 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
-/* Upgrade path 1.0.0 -> 1.1.0: operator values and history survive, the new API appears. */
-CREATE EXTENSION adaptive_autovacuum VERSION '1.0.0';
+/* Upgrade path 1.2.0 -> 1.3.0: operator values survive, table settings become recommendations, 1.2.0-set options are logged. */
+CREATE EXTENSION adaptive_autovacuum VERSION '1.2.0';
+WARNING:  adaptive_autovacuum is being installed in a database that is not the control database "postgres" (adaptive_autovacuum.control_database); the controller ignores the objects created here and already manages this database from the control database
+HINT:  Install the extension once, in the control database, or point adaptive_autovacuum.control_database at this database.
 SELECT extversion FROM pg_extension WHERE extname = 'adaptive_autovacuum';
-1.0.0
-UPDATE adaptive_autovacuum.policy
-SET dry_run = true,
-    min_table_bytes = 12345,
-    high_load_per_cpu = 0.85;
-INSERT INTO adaptive_autovacuum.global_apply_queue (guc_name, desired_value, old_value, status)
-VALUES ('autovacuum_vacuum_cost_limit', '400', '200', 'applied');
+1.2.0
+UPDATE adaptive_autovacuum.policy SET dry_run = true, min_table_bytes = 12345;
+-- A table 1.2.0 retuned itself: managed keys with their captured original values.
+CREATE TABLE aav_legacy(id integer) WITH (autovacuum_vacuum_threshold = 500, autovacuum_vacuum_scale_factor = 0.045);
+INSERT INTO adaptive_autovacuum.table_state
+    (database_oid, relation_oid, database_name, relation_name, original_reloptions, original_captured, managed_values, state)
+VALUES
+    ((SELECT oid FROM pg_database WHERE datname = current_database()), 'aav_legacy'::regclass, current_database(),
+     'public.aav_legacy', ARRAY['autovacuum_vacuum_threshold=1000'], true,
+     '{"autovacuum_vacuum_threshold":"500", "autovacuum_vacuum_scale_factor":"0.045"}'::jsonb, 'backlog_urgent');
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 SELECT extversion FROM pg_extension WHERE extname = 'adaptive_autovacuum';
-1.1.0
-SELECT dry_run AS dry_run_preserved,
-       min_table_bytes = 12345 AS min_table_bytes_preserved,
-       high_load_per_cpu = 0.85 AS load_gate_preserved,
-       enabled AS enabled_untouched
+1.3.0
+SELECT dry_run AS dry_run_preserved, min_table_bytes = 12345 AS min_table_bytes_preserved,
+       target_dead_tuple_min = 1000 AS dead_tuple_floor_moved_from_old_default,
+       recommend_table_costs AS cost_recommendations_on,
+       overdue_cycles_before_recommend = 2 AND healthy_cycles_before_revert = 6 AS hysteresis_columns_renamed,
+       repair_disabled_autovacuum_cycles = 1 AS repair_on_first_check
 FROM adaptive_autovacuum.policy;
-t|t|t|t
-SELECT count(*) = 1 AS history_preserved
-FROM adaptive_autovacuum.global_apply_queue
-WHERE status = 'applied' AND desired_value = '400';
+t|t|t|t|t|t
+SELECT count(*) = 4 AS io_counter_columns_added
+FROM information_schema.columns
+WHERE table_schema = 'adaptive_autovacuum' AND table_name = 'controller_state'
+  AND column_name IN ('last_io_hits', 'last_io_reads', 'last_io_writes', 'last_io_extends');
 t
-SELECT count(*) = 15 AS doctor_available,
+SELECT count(*) FILTER (WHERE column_name IN ('recommendation_status', 'recommended_reloptions', 'previous_reloptions',
+                                              'recommendation_reason', 'recommended_at', 'applied_at')) = 6
+       AND count(*) FILTER (WHERE column_name IN ('original_reloptions', 'original_captured', 'managed_values',
+                                                  'ownership_conflict', 'last_change_at', 'last_error')) = 0
+       AS table_state_recommendation_columns
+FROM information_schema.columns
+WHERE table_schema = 'adaptive_autovacuum' AND table_name = 'table_state';
+t
+SELECT count(*) FILTER (WHERE column_name IN ('change_cooldown_seconds', 'max_changes_per_cycle', 'boost_ramp_factor',
+                                              'boost_total_cost_limit_budget', 'manage_table_costs')) = 0
+       AS write_path_policy_columns_dropped
+FROM information_schema.columns
+WHERE table_schema = 'adaptive_autovacuum' AND table_name = 'policy';
+t
+SELECT count(*) = 2 AS naptime_policy_columns_added
+FROM information_schema.columns
+WHERE table_schema = 'adaptive_autovacuum' AND table_name = 'policy'
+  AND column_name IN ('manage_naptime', 'naptime_min_seconds');
+t
+SELECT count(*) = 1 AS naptime_recommendation_column_added
+FROM information_schema.columns
+WHERE table_schema = 'adaptive_autovacuum' AND table_name = 'global_recommendations'
+  AND column_name = 'recommended_autovacuum_naptime_seconds';
+t
+SELECT to_regclass('adaptive_autovacuum.changed_tables') IS NULL
+       AND to_regclass('adaptive_autovacuum.table_recommendations') IS NOT NULL
+       AND to_regprocedure('adaptive_autovacuum._reconcile_relation_options(text, text[], jsonb, jsonb, integer)') IS NULL
+       AND to_regprocedure('adaptive_autovacuum._repair_disabled_autovacuum()') IS NOT NULL
+       AS objects_replaced;
+t
+SELECT action = 'legacy_table_settings' AND applied
+       AND reason LIKE '%run in database %: ALTER TABLE public.aav_legacy SET (autovacuum_vacuum_threshold = 1000); ALTER TABLE public.aav_legacy RESET (autovacuum_vacuum_scale_factor);'
+       AND proposed_reloptions ->> 'autovacuum_vacuum_threshold' = '500'
+       AS legacy_table_settings_logged_with_restore_sql
+FROM adaptive_autovacuum.decisions
+WHERE relation_name = 'public.aav_legacy';
+t
+SELECT count(*) = 1 AS legacy_row_visible_in_actions
+FROM adaptive_autovacuum.actions
+WHERE action_scope = 'table' AND action_type = 'legacy_table_settings' AND relation_name = 'public.aav_legacy';
+t
+SELECT count(*) = 19 AS doctor_available,
        bool_and(status IN ('OK', 'WARN', 'FAIL', 'RESTART_REQUIRED')) AS doctor_statuses_valid
 FROM adaptive_autovacuum.doctor();
 t|t
-SELECT status = 'WARN' AS policy_check_warns_on_dry_run
-FROM adaptive_autovacuum.doctor()
-WHERE check_name = 'policy';
-t
 SELECT status = 'OK' AS version_check_current
 FROM adaptive_autovacuum.doctor()
 WHERE check_name = 'extension_version';
 t
-/* Installer activation: flips the three switches, reports old and new values. */
-SELECT setting, previous_value, new_value
-FROM adaptive_autovacuum.enable_default_policy()
-ORDER BY setting;
-dry_run|true|false
-enabled|true|true
-manage_global_settings|true|true
-SELECT enabled, dry_run, manage_global_settings
-FROM adaptive_autovacuum.policy;
-t|f|t
-/* Idempotent second call. */
-SELECT setting, previous_value, new_value
-FROM adaptive_autovacuum.enable_default_policy()
-ORDER BY setting;
-dry_run|false|false
-enabled|true|true
-manage_global_settings|true|true
-SELECT status = 'OK' AS policy_check_ok_after_enable
-FROM adaptive_autovacuum.doctor()
-WHERE check_name = 'policy';
+SELECT count(*) = 1 AS cycle_runs_after_upgrade
+FROM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
 t
-SELECT min_table_bytes = 12345 AS other_columns_untouched
-FROM adaptive_autovacuum.policy;
-t
-/* pg_monitor may read status() and doctor() but may not change the policy. */
-CREATE ROLE aav_upgrade_monitor;
-GRANT pg_monitor TO aav_upgrade_monitor;
-SET ROLE aav_upgrade_monitor;
-SELECT count(*) = 15 AS monitor_can_run_doctor
-FROM adaptive_autovacuum.doctor();
-t
-SELECT extension_version
+SELECT open_table_recommendations IS NOT NULL AS status_has_recommendation_count
 FROM adaptive_autovacuum.status();
-1.1.0
-SELECT has_function_privilege('adaptive_autovacuum.enable_default_policy()', 'EXECUTE') AS monitor_can_enable_policy;
-f
-RESET ROLE;
-DROP ROLE aav_upgrade_monitor;
+t
+DROP TABLE aav_legacy;
 DROP EXTENSION adaptive_autovacuum;

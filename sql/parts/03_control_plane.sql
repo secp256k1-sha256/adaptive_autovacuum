@@ -141,17 +141,16 @@ BEGIN
         'host', host_json,
         'cluster', jsonb_build_object(
             'xid_rate', cs.xid_rate,
+            /* Previous scan of this database: a widely overdue fleet means the baseline is wrong, not the tables. */
+            'prev_eligible', (SELECT ds.eligible_relations FROM adaptive_autovacuum.database_state ds WHERE ds.database_oid = dboid),
+            'prev_dead_overdue', (SELECT ds.dead_overdue FROM adaptive_autovacuum.database_state ds WHERE ds.database_oid = dboid),
+            'prev_insert_overdue', (SELECT ds.insert_overdue FROM adaptive_autovacuum.database_state ds WHERE ds.database_oid = dboid),
+            /* Cost-boost recommendations standing in the other databases share the slot limit. */
             'boosted_relations_elsewhere',
                 (SELECT count(*) FROM adaptive_autovacuum.table_state ts
                  WHERE ts.database_oid <> dboid
-                   AND ts.managed_values ? 'autovacuum_vacuum_cost_limit'
-                   AND NOT ts.ownership_conflict),
-            'boost_budget_used_elsewhere',
-                (SELECT COALESCE(sum((ts.managed_values ->> 'autovacuum_vacuum_cost_limit')::numeric), 0)::integer
-                 FROM adaptive_autovacuum.table_state ts
-                 WHERE ts.database_oid <> dboid
-                   AND ts.managed_values ? 'autovacuum_vacuum_cost_limit'
-                   AND NOT ts.ownership_conflict)),
+                   AND ts.recommendation_status IS NOT NULL
+                   AND ts.recommended_reloptions ? 'autovacuum_vacuum_cost_limit')),
         'table_policy',
             (SELECT COALESCE(jsonb_agg(to_jsonb(tp) - 'database_name' - 'note' - 'updated_at' - 'updated_by'), '[]'::jsonb)
              FROM adaptive_autovacuum.table_policy tp
@@ -243,40 +242,42 @@ BEGIN
 
     INSERT INTO adaptive_autovacuum.table_state AS target
         (database_oid, relation_oid, database_name, relation_name,
-         original_reloptions, original_captured, managed_values, ownership_conflict,
-         state, consecutive_overdue, consecutive_healthy, last_seen_at, last_change_at,
+         recommendation_status, recommended_reloptions, previous_reloptions, recommendation_reason,
+         recommended_at, applied_at,
+         state, consecutive_overdue, consecutive_healthy, last_seen_at,
          last_dead_tuples, last_live_tuples, last_trigger, last_backlog_ratio,
          last_inserts_since_vacuum, last_insert_backlog_ratio, last_xid_age, last_mxid_age,
-         last_vacuum_pid, last_vacuum_progress, vacuum_stalled_cycles, last_error, last_action)
+         last_vacuum_pid, last_vacuum_progress, vacuum_stalled_cycles, last_action)
     SELECT dboid, x.relation_oid, dbname, x.relation_name,
-           x.original_reloptions, COALESCE(x.original_captured, false),
-           COALESCE(x.managed_values, '{}'::jsonb), COALESCE(x.ownership_conflict, false),
+           x.recommendation_status, x.recommended_reloptions, x.previous_reloptions, x.recommendation_reason,
+           x.recommended_at, x.applied_at,
            COALESCE(x.state, 'normal'), COALESCE(x.consecutive_overdue, 0),
-           COALESCE(x.consecutive_healthy, 0), clock_timestamp(), x.last_change_at,
+           COALESCE(x.consecutive_healthy, 0), clock_timestamp(),
            x.last_dead_tuples, x.last_live_tuples, x.last_trigger, x.last_backlog_ratio,
            x.last_inserts_since_vacuum, x.last_insert_backlog_ratio, x.last_xid_age, x.last_mxid_age,
            x.last_vacuum_pid, x.last_vacuum_progress, COALESCE(x.vacuum_stalled_cycles, 0),
-           x.last_error, x.last_action
+           x.last_action
     FROM jsonb_to_recordset(COALESCE(doc -> 'table_state', '[]'::jsonb)) AS x(
-        relation_oid oid, relation_name text, original_reloptions text[], original_captured boolean,
-        managed_values jsonb, ownership_conflict boolean, state text, consecutive_overdue integer,
-        consecutive_healthy integer, last_change_at timestamptz, last_dead_tuples bigint,
+        relation_oid oid, relation_name text, recommendation_status text, recommended_reloptions jsonb,
+        previous_reloptions jsonb, recommendation_reason text, recommended_at timestamptz, applied_at timestamptz,
+        state text, consecutive_overdue integer, consecutive_healthy integer, last_dead_tuples bigint,
         last_live_tuples bigint, last_trigger double precision, last_backlog_ratio double precision,
         last_inserts_since_vacuum bigint, last_insert_backlog_ratio double precision,
         last_xid_age bigint, last_mxid_age bigint, last_vacuum_pid integer,
-        last_vacuum_progress text, vacuum_stalled_cycles integer, last_error text, last_action text)
+        last_vacuum_progress text, vacuum_stalled_cycles integer, last_action text)
     ON CONFLICT (database_oid, relation_oid) DO UPDATE
     SET database_name = EXCLUDED.database_name,
         relation_name = EXCLUDED.relation_name,
-        original_reloptions = EXCLUDED.original_reloptions,
-        original_captured = EXCLUDED.original_captured,
-        managed_values = EXCLUDED.managed_values,
-        ownership_conflict = EXCLUDED.ownership_conflict,
+        recommendation_status = EXCLUDED.recommendation_status,
+        recommended_reloptions = EXCLUDED.recommended_reloptions,
+        previous_reloptions = EXCLUDED.previous_reloptions,
+        recommendation_reason = EXCLUDED.recommendation_reason,
+        recommended_at = EXCLUDED.recommended_at,
+        applied_at = EXCLUDED.applied_at,
         state = EXCLUDED.state,
         consecutive_overdue = EXCLUDED.consecutive_overdue,
         consecutive_healthy = EXCLUDED.consecutive_healthy,
         last_seen_at = EXCLUDED.last_seen_at,
-        last_change_at = EXCLUDED.last_change_at,
         last_dead_tuples = EXCLUDED.last_dead_tuples,
         last_live_tuples = EXCLUDED.last_live_tuples,
         last_trigger = EXCLUDED.last_trigger,
@@ -288,7 +289,6 @@ BEGIN
         last_vacuum_pid = EXCLUDED.last_vacuum_pid,
         last_vacuum_progress = EXCLUDED.last_vacuum_progress,
         vacuum_stalled_cycles = EXCLUDED.vacuum_stalled_cycles,
-        last_error = EXCLUDED.last_error,
         last_action = EXCLUDED.last_action;
 
     INSERT INTO adaptive_autovacuum.decisions
@@ -339,7 +339,7 @@ BEGIN
          scan_seconds, status, last_error, extension_installed, table_count, eligible_relations,
          overdue_relations, dead_overdue, insert_overdue, emergency_relations, fleet_max_target,
          median_scale, median_thresh, median_ins_scale, median_ins_thresh, debt_tuples,
-         debt_velocity, max_xid_age, max_mxid_age, changes_applied, analyzed_relations)
+         debt_velocity, max_xid_age, max_mxid_age, recommended_relations, analyzed_relations)
     VALUES
         (dboid, dbname, clock_timestamp(), clock_timestamp(), generation,
          (s ->> 'scan_seconds')::double precision,
@@ -353,7 +353,7 @@ BEGIN
          (s ->> 'median_scale')::double precision, (s ->> 'median_thresh')::double precision,
          (s ->> 'median_ins_scale')::double precision, (s ->> 'median_ins_thresh')::double precision,
          debt, velocity, (s ->> 'max_xid_age')::bigint, (s ->> 'max_mxid_age')::bigint,
-         (s ->> 'changes_applied')::integer, (s ->> 'analyzed')::integer)
+         (s ->> 'recommended')::integer, (s ->> 'analyzed')::integer)
     ON CONFLICT ON CONSTRAINT database_state_pkey DO UPDATE
     SET database_name = EXCLUDED.database_name,
         last_seen_at = EXCLUDED.last_seen_at,
@@ -378,7 +378,7 @@ BEGIN
         debt_velocity = EXCLUDED.debt_velocity,
         max_xid_age = EXCLUDED.max_xid_age,
         max_mxid_age = EXCLUDED.max_mxid_age,
-        changes_applied = EXCLUDED.changes_applied,
+        recommended_relations = EXCLUDED.recommended_relations,
         analyzed_relations = EXCLUDED.analyzed_relations;
 
     RETURN QUERY
@@ -388,6 +388,50 @@ BEGIN
                    WHERE q.status = 'pending' AND q.next_retry_at <= clock_timestamp());
 END
 $$;
+
+/* autovacuum = off is queued for repair before anything else in the sweep; returns true when a row waits. */
+CREATE FUNCTION adaptive_autovacuum._repair_disabled_autovacuum()
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, adaptive_autovacuum
+AS $$
+DECLARE
+    p adaptive_autovacuum.policy%ROWTYPE;
+    cs adaptive_autovacuum.controller_state%ROWTYPE;
+BEGIN
+    IF current_setting('autovacuum')::boolean THEN
+        RETURN false;
+    END IF;
+    SELECT * INTO p FROM adaptive_autovacuum.policy WHERE singleton;
+    SELECT * INTO cs FROM adaptive_autovacuum.controller_state WHERE only_row;
+    IF p.singleton IS NULL OR NOT p.enabled OR NOT p.manage_global_settings OR p.dry_run
+       OR NOT p.repair_disabled_autovacuum THEN
+        RETURN false;
+    END IF;
+    /* The counter is advanced by the global step; the first check acts when the policy says 1. */
+    IF cs.autovacuum_off_cycles + 1 < p.repair_disabled_autovacuum_cycles THEN
+        RETURN false;
+    END IF;
+    /* A repair applied moments ago is still propagating through the postmaster's reload: not a second row. */
+    IF EXISTS (SELECT 1 FROM adaptive_autovacuum.global_apply_queue q
+               WHERE q.guc_name = 'autovacuum' AND q.status = 'applied'
+                 AND q.applied_at > clock_timestamp() - interval '30 seconds') THEN
+        RETURN false;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM adaptive_autovacuum.global_apply_queue q
+                   WHERE q.guc_name = 'autovacuum' AND q.status = 'pending') THEN
+        INSERT INTO adaptive_autovacuum.global_apply_queue (generation, guc_name, desired_value, reason)
+        VALUES (cs.cluster_generation, 'autovacuum', 'on',
+                'autovacuum is off: repaired before the sweep (policy.repair_disabled_autovacuum); the extension never turns it off.');
+    END IF;
+    RETURN true;
+END
+$$;
+
+COMMENT ON FUNCTION adaptive_autovacuum._repair_disabled_autovacuum() IS
+'Called by the controller at the start of every sweep and after every configuration reload: when autovacuum is off and the policy allows the repair, queues autovacuum = on so the controller applies it immediately, before any database is scanned.';
 
 /* Recover requests whose worker is gone (controller restart, crash); PID-reuse guarded. */
 CREATE FUNCTION adaptive_autovacuum._recover_stale_emergencies()
@@ -563,7 +607,13 @@ DECLARE
     last_applied_cost_delay text;
     workers_saturated boolean;
     worker_queue_pressure boolean;
+    worker_blocked_by_host boolean;
     worker_mem_cap integer;
+    current_naptime integer;
+    recommended_naptime integer;
+    baseline_naptime integer;
+    last_applied_naptime text;
+    naptime_lower boolean;
 
     cur_xid8 bigint;
     prev_xid8 bigint;
@@ -582,6 +632,10 @@ DECLARE
     io_extends double precision;
     cur_activity_units double precision;
     prev_activity_units double precision;
+    prev_io_hits double precision;
+    prev_io_reads double precision;
+    prev_io_writes double precision;
+    prev_io_extends double precision;
     cur_activity_rate double precision;
     activity_detail jsonb;
     raise_at timestamptz;
@@ -647,12 +701,14 @@ BEGIN
            cs.backlog_free_cycles, cs.autovacuum_off_cycles, cs.baseline_settings,
            cs.last_vacuum_activity_units, cs.last_cost_raise_at, cs.last_raise_cost_limit,
            cs.last_raise_cost_delay, cs.activity_before_raise,
-           cs.last_sweep_started_at, cs.observed_sweep_seconds
+           cs.last_sweep_started_at, cs.observed_sweep_seconds,
+           cs.last_io_hits, cs.last_io_reads, cs.last_io_writes, cs.last_io_extends
     INTO prev_xid8, prev_sample_at, prev_wal_bytes,
          free_cycles, av_off_cycles, baseline_json,
          prev_activity_units, raise_at, raise_limit,
          raise_delay, rate_before_raise,
-         sweep_started_at, prev_sweep_seconds
+         sweep_started_at, prev_sweep_seconds,
+         prev_io_hits, prev_io_reads, prev_io_writes, prev_io_extends
     FROM adaptive_autovacuum.controller_state cs;
 
     cur_xid_rate := NULL;
@@ -671,12 +727,13 @@ BEGIN
         END IF;
         IF prev_activity_units IS NOT NULL AND cur_activity_units >= prev_activity_units THEN
             cur_activity_rate := (cur_activity_units - prev_activity_units) / sample_interval;
+            /* Counter deltas over the interval; the first sweep after an upgrade has no previous counters and reports 0. */
             activity_detail := jsonb_build_object(
-                'hits_per_sec', io_hits / sample_interval,
-                'reads_per_sec', io_reads / sample_interval,
-                'writes_per_sec', io_writes / sample_interval,
-                'extends_per_sec', io_extends / sample_interval,
-                'unit', 'cumulative counters divided by the sample interval; see cost weights',
+                'hits_per_sec', (io_hits - COALESCE(prev_io_hits, io_hits)) / sample_interval,
+                'reads_per_sec', (io_reads - COALESCE(prev_io_reads, io_reads)) / sample_interval,
+                'writes_per_sec', (io_writes - COALESCE(prev_io_writes, io_writes)) / sample_interval,
+                'extends_per_sec', (io_extends - COALESCE(prev_io_extends, io_extends)) / sample_interval,
+                'unit', 'pg_stat_io counter deltas divided by the sample interval; see cost weights',
                 'weights', jsonb_build_object('hit', page_hit_cost, 'miss', page_miss_cost, 'dirty', page_dirty_cost));
         END IF;
     END IF;
@@ -724,6 +781,8 @@ BEGIN
     SELECT setting::double precision INTO current_global_cost_delay FROM pg_settings WHERE name = 'autovacuum_vacuum_cost_delay';
     SELECT setting::integer INTO current_autovacuum_work_mem_kb FROM pg_settings WHERE name = 'autovacuum_work_mem';
     SELECT GREATEST(setting::integer, 1) INTO current_autovacuum_workers FROM pg_settings WHERE name = 'autovacuum_max_workers';
+    SELECT setting::integer INTO current_naptime FROM pg_settings WHERE name = 'autovacuum_naptime';
+    recommended_naptime := current_naptime;
     SELECT setting::double precision INTO current_vacuum_threshold FROM pg_settings WHERE name = 'autovacuum_vacuum_threshold';
     SELECT setting::double precision INTO current_vacuum_scale_factor FROM pg_settings WHERE name = 'autovacuum_vacuum_scale_factor';
     SELECT setting::double precision INTO current_vacuum_max_threshold FROM pg_settings WHERE name = 'autovacuum_vacuum_max_threshold';
@@ -902,8 +961,18 @@ BEGIN
         baseline_json := baseline_json
                          || jsonb_build_object('autovacuum_vacuum_cost_delay', current_global_cost_delay);
     END IF;
+    SELECT q.desired_value INTO last_applied_naptime
+    FROM adaptive_autovacuum.global_apply_queue q
+    WHERE q.guc_name = 'autovacuum_naptime' AND q.status = 'applied'
+    ORDER BY q.applied_at DESC LIMIT 1;
+    IF last_applied_naptime IS NULL
+       OR last_applied_naptime::numeric IS DISTINCT FROM current_naptime::numeric
+       OR NOT baseline_json ? 'autovacuum_naptime' THEN
+        baseline_json := baseline_json || jsonb_build_object('autovacuum_naptime', current_naptime);
+    END IF;
     baseline_cost_limit := (baseline_json ->> 'autovacuum_vacuum_cost_limit')::integer;
     baseline_cost_delay := (baseline_json ->> 'autovacuum_vacuum_cost_delay')::double precision;
+    baseline_naptime := (baseline_json ->> 'autovacuum_naptime')::integer;
 
     /* Closed loop: growing/flat/unknown raises, shrinking holds, no backlog decays to baseline. */
     free_cycles := CASE WHEN cl_overdue = 0
@@ -941,7 +1010,8 @@ BEGIN
           AND free_cycles >= p.recovery_cycles_before_decay
           AND recommendation_reason = 'No cluster-level cost change is currently justified.'
           AND (current_global_cost_limit <> baseline_cost_limit
-               OR current_global_cost_delay <> baseline_cost_delay) THEN
+               OR current_global_cost_delay <> baseline_cost_delay
+               OR current_naptime <> baseline_naptime) THEN
         IF current_global_cost_limit > baseline_cost_limit THEN
             recommended_cost_limit := GREATEST(baseline_cost_limit, current_global_cost_limit / 2);
         ELSIF current_global_cost_limit < baseline_cost_limit THEN
@@ -953,12 +1023,16 @@ BEGIN
         ELSIF current_global_cost_delay > baseline_cost_delay THEN
             recommended_cost_delay := GREATEST(baseline_cost_delay, current_global_cost_delay / 2);
         END IF;
+        /* The launcher interval walks back up the same way it came down. */
+        IF p.manage_naptime AND current_naptime < baseline_naptime THEN
+            recommended_naptime := LEAST(baseline_naptime, current_naptime * 2);
+        END IF;
         free_cycles := 0;
         recommendation_reason := format(
             'No overdue relations for %s consecutive checks: stepping the cost settings back'
-            || ' toward the pre-incident baseline (cost_limit %s, cost_delay %s ms).',
+            || ' toward the pre-incident baseline (cost_limit %s, cost_delay %s ms, autovacuum_naptime %s s).',
             p.recovery_cycles_before_decay, baseline_cost_limit,
-            trim(trailing '.' from to_char(baseline_cost_delay, 'FM999990.99')));
+            trim(trailing '.' from to_char(baseline_cost_delay, 'FM999990.99')), baseline_naptime);
     END IF;
 
     /* A raise must first prove itself: the previous applied raise has to show more activity. */
@@ -1032,16 +1106,18 @@ BEGIN
             END);
     END IF;
 
-    /* Workers: busy pool or a queue far longer than the pool, with non-shrinking debt. */
+    /* Workers: busy pool or an overdue queue longer than the pool, with non-shrinking debt. */
     workers_saturated := av_workers_running >= current_autovacuum_workers;
-    /* One pg_stat_activity sample misses saturation; a long overdue queue is the same evidence. */
-    worker_queue_pressure := cl_overdue >= GREATEST(current_autovacuum_workers * 2,
-                                                    current_autovacuum_workers + 2);
+    /* One pg_stat_activity sample misses saturation; an overdue queue beyond the pool is the same evidence. */
+    worker_queue_pressure := cl_overdue >= current_autovacuum_workers + 2;
+    /* Workers share one cost budget, so CPU load alone does not block them; memory and storage pressure do. */
+    worker_blocked_by_host := (host_memory_percent < p.low_memory_percent OR cur_storage_pressure)
+                              AND NOT critical_seen;
     IF NOT autovacuum_enabled_global
        OR cl_overdue = 0
        OR (NOT workers_saturated AND NOT worker_queue_pressure)
        OR backlog_under_control
-       OR (cur_host_pressure AND NOT critical_seen) THEN
+       OR worker_blocked_by_host THEN
         recommended_workers := current_autovacuum_workers;
     ELSE
         /* Bounded doubling per step, toward the overdue count; independent of the cost budget. */
@@ -1085,6 +1161,24 @@ BEGIN
                     recommended_workers);
             END IF;
         END IF;
+    END IF;
+
+    /* Launcher cadence: core starts one worker per database per autovacuum_naptime, so a raised pool stays
+       empty until the interval follows; halve it while overdue relations wait and the pool is under-filled. */
+    naptime_lower := p.manage_naptime
+                     AND autovacuum_enabled_global
+                     AND cl_overdue > 0
+                     AND NOT backlog_under_control
+                     AND NOT worker_blocked_by_host
+                     AND av_workers_running < current_autovacuum_workers
+                     AND current_naptime > p.naptime_min_seconds;
+    IF naptime_lower THEN
+        recommended_naptime := GREATEST(p.naptime_min_seconds, current_naptime / 2);
+        recommendation_reason := recommendation_reason || format(
+            ' %s of %s autovacuum workers are running while %s relations are overdue: the launcher starts'
+            || ' one worker per database per autovacuum_naptime, so it goes %s -> %s s (floor %s s) to fill the pool.',
+            av_workers_running, current_autovacuum_workers, cl_overdue,
+            current_naptime, recommended_naptime, p.naptime_min_seconds);
     END IF;
 
     /* Mistuned baseline: many overdue relations = wrong global triggers; recommend the median. */
@@ -1223,7 +1317,7 @@ BEGIN
          delay_bound_long_vacuums, repeated_index_vacuum_cycles,
          recommended_cost_limit, recommended_cost_delay_ms,
          recommended_autovacuum_work_mem_kb, recommended_buffer_usage_limit_kb,
-         recommended_autovacuum_workers,
+         recommended_autovacuum_workers, recommended_autovacuum_naptime_seconds,
          recommended_vacuum_scale_factor, recommended_vacuum_threshold,
          recommended_vacuum_max_threshold,
          recommended_insert_scale_factor, recommended_insert_threshold,
@@ -1236,7 +1330,7 @@ BEGIN
          delay_bound_count, repeated_index_cycle_count,
          recommended_cost_limit, recommended_cost_delay,
          recommended_work_mem_kb, recommended_buffer_usage_limit_kb,
-         recommended_workers,
+         recommended_workers, recommended_naptime,
          recommended_scale, recommended_thresh,
          recommended_max_thresh,
          recommended_ins_scale, recommended_ins_thresh,
@@ -1249,6 +1343,7 @@ BEGIN
          recommendation_reason);
 
     /* autovacuum=off repair: the one non-numeric change; queued separately, only ever 'on'. */
+    /* Normally already done before the sweep (_repair_disabled_autovacuum); a repair applied moments ago is still propagating. */
     IF p.manage_global_settings AND NOT p.dry_run
        AND NOT autovacuum_enabled_global
        AND p.repair_disabled_autovacuum
@@ -1256,7 +1351,9 @@ BEGIN
        AND NOT EXISTS (SELECT 1
                        FROM adaptive_autovacuum.global_apply_queue q
                        WHERE q.guc_name = 'autovacuum'
-                         AND q.status = 'pending') THEN
+                         AND (q.status = 'pending'
+                              OR (q.status = 'applied'
+                                  AND q.applied_at > clock_timestamp() - interval '30 seconds'))) THEN
         INSERT INTO adaptive_autovacuum.global_apply_queue(generation, guc_name, desired_value, reason)
         VALUES (generation, 'autovacuum', 'on', recommendation_reason);
     END IF;
@@ -1280,6 +1377,9 @@ BEGIN
                        AND recommended_workers > current_autovacuum_workers
                   THEN recommended_workers::text END,
              current_autovacuum_workers::text),
+            ('autovacuum_naptime',
+             CASE WHEN p.manage_naptime THEN recommended_naptime::text END,
+             current_naptime::text),
             ('autovacuum_work_mem',
              recommended_work_mem_kb::text,
              current_autovacuum_work_mem_kb::text),
@@ -1371,6 +1471,10 @@ BEGIN
         baseline_settings = baseline_json,
         last_vacuum_activity_units = cur_activity_units,
         vacuum_activity_rate = cur_activity_rate,
+        last_io_hits = io_hits,
+        last_io_reads = io_reads,
+        last_io_writes = io_writes,
+        last_io_extends = io_extends,
         last_cost_raise_at = raise_at,
         last_raise_cost_limit = raise_limit,
         last_raise_cost_delay = raise_delay,
@@ -1410,7 +1514,7 @@ END
 $$;
 
 COMMENT ON FUNCTION adaptive_autovacuum._global_controller(double precision, integer, bigint, bigint, bigint, boolean, bigint, jsonb) IS
-'The single cluster-level decision step, run by the controller process once per completed sweep: aggregates database_state for the generation, samples cluster counters (next XID read without assigning one, WAL, cost-weighted autovacuum activity), records one recommendation and queues the allow-listed ALTER SYSTEM changes. extra_summary is a diagnostic hook that folds a pre-aggregated summary in as additional databases.';
+'The single cluster-level decision step, run by the controller process once per completed sweep: aggregates database_state for the generation, samples cluster counters (next XID read without assigning one, WAL, cost-weighted autovacuum activity), records one recommendation and queues the allow-listed ALTER SYSTEM changes (cost pair, workers, autovacuum_naptime, memory, triggers). extra_summary is a diagnostic hook that folds a pre-aggregated summary in as additional databases.';
 
 /* Run the database program in the current database the way a worker would, and absorb the result. */
 CREATE FUNCTION adaptive_autovacuum._scan_this_database(

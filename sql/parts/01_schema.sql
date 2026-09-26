@@ -58,11 +58,12 @@ CREATE TABLE adaptive_autovacuum.policy
     included_databases              text[],
     excluded_databases              text[] NOT NULL DEFAULT ARRAY[]::text[],
 
-    min_table_bytes                 bigint NOT NULL DEFAULT 67108864 CHECK (min_table_bytes >= 0),
+    /* Size floor for the performance scan; 0 = every table counts (small hot tables matter too). */
+    min_table_bytes                 bigint NOT NULL DEFAULT 0 CHECK (min_table_bytes >= 0),
     excluded_schemas                text[] NOT NULL DEFAULT ARRAY['pg_catalog', 'information_schema', 'pg_toast', 'adaptive_autovacuum'],
 
     target_dead_tuple_ratio         double precision NOT NULL DEFAULT 0.01 CHECK (target_dead_tuple_ratio > 0 AND target_dead_tuple_ratio <= 1),
-    target_dead_tuple_min           bigint NOT NULL DEFAULT 5000 CHECK (target_dead_tuple_min >= 0),
+    target_dead_tuple_min           bigint NOT NULL DEFAULT 1000 CHECK (target_dead_tuple_min >= 0),
     target_dead_tuple_max           bigint NOT NULL DEFAULT 1000000 CHECK (target_dead_tuple_max >= target_dead_tuple_min AND target_dead_tuple_max <= 2147483647),
     target_insert_ratio             double precision NOT NULL DEFAULT 0.10 CHECK (target_insert_ratio > 0 AND target_insert_ratio <= 1),
     target_insert_min               bigint NOT NULL DEFAULT 10000 CHECK (target_insert_min >= 0),
@@ -74,11 +75,12 @@ CREATE TABLE adaptive_autovacuum.policy
     backlog_elevated_ratio          double precision NOT NULL DEFAULT 1.50 CHECK (backlog_elevated_ratio >= 1),
     backlog_urgent_ratio            double precision NOT NULL DEFAULT 3.00 CHECK (backlog_urgent_ratio >= backlog_elevated_ratio),
     backlog_critical_ratio          double precision NOT NULL DEFAULT 6.00 CHECK (backlog_critical_ratio >= backlog_urgent_ratio),
-    overdue_cycles_before_change    integer NOT NULL DEFAULT 2 CHECK (overdue_cycles_before_change >= 1),
-    healthy_cycles_before_restore   integer NOT NULL DEFAULT 6 CHECK (healthy_cycles_before_restore >= 1),
-    change_cooldown_seconds         integer NOT NULL DEFAULT 1800 CHECK (change_cooldown_seconds >= 0),
+    /* Consecutive non-normal checks before a table recommendation is issued. */
+    overdue_cycles_before_recommend integer NOT NULL DEFAULT 2 CHECK (overdue_cycles_before_recommend >= 1),
+    /* Consecutive normal checks before an applied cost boost gets a revert recommendation. */
+    healthy_cycles_before_revert    integer NOT NULL DEFAULT 6 CHECK (healthy_cycles_before_revert >= 1),
+    /* Lock timeout of the in-cycle ANALYZE (the program never runs ALTER TABLE). */
     lock_timeout_ms                 integer NOT NULL DEFAULT 250 CHECK (lock_timeout_ms >= 1),
-    max_changes_per_cycle           integer NOT NULL DEFAULT 5 CHECK (max_changes_per_cycle >= 0),
 
     /* Never-analyzed tables leave the planner guessing; analyze the largest within a budget. */
     analyze_missing_stats           boolean NOT NULL DEFAULT true,
@@ -86,7 +88,7 @@ CREATE TABLE adaptive_autovacuum.policy
 
     /* autovacuum=off is repaired after this many consecutive checks; it is never turned off. */
     repair_disabled_autovacuum      boolean NOT NULL DEFAULT true,
-    repair_disabled_autovacuum_cycles integer NOT NULL DEFAULT 10 CHECK (repair_disabled_autovacuum_cycles >= 1),
+    repair_disabled_autovacuum_cycles integer NOT NULL DEFAULT 1 CHECK (repair_disabled_autovacuum_cycles >= 1),
 
     /* Debt trend deadband: growth per check above it = growing, below its negative = shrinking. */
     backlog_trend_deadband          double precision NOT NULL DEFAULT 0.05 CHECK (backlog_trend_deadband > 0 AND backlog_trend_deadband < 1),
@@ -95,7 +97,8 @@ CREATE TABLE adaptive_autovacuum.policy
     /* A shrinking backlog only holds the raises if it is projected to clear within this time. */
     max_backlog_drain_seconds       integer NOT NULL DEFAULT 180 CHECK (max_backlog_drain_seconds >= 1),
 
-    manage_table_costs              boolean NOT NULL DEFAULT false,
+    /* Table-level cost boosts are recommendations (table_recommendations), tiered by severity. */
+    recommend_table_costs           boolean NOT NULL DEFAULT true,
     max_boosted_relations           integer NOT NULL DEFAULT 2 CHECK (max_boosted_relations >= 0),
     /* Caps = documented maxima of (auto)vacuum_cost_limit / _cost_delay. */
     elevated_cost_limit             integer NOT NULL DEFAULT 1000 CHECK (elevated_cost_limit >= 200 AND elevated_cost_limit <= 10000),
@@ -104,8 +107,6 @@ CREATE TABLE adaptive_autovacuum.policy
     elevated_cost_delay_ms          double precision NOT NULL DEFAULT 2.0 CHECK (elevated_cost_delay_ms >= 0 AND elevated_cost_delay_ms <= 100),
     urgent_cost_delay_ms            double precision NOT NULL DEFAULT 1.0 CHECK (urgent_cost_delay_ms >= 0 AND urgent_cost_delay_ms <= elevated_cost_delay_ms),
     critical_cost_delay_ms          double precision NOT NULL DEFAULT 0.0 CHECK (critical_cost_delay_ms >= 0 AND critical_cost_delay_ms <= urgent_cost_delay_ms),
-    boost_ramp_factor               double precision NOT NULL DEFAULT 2.0 CHECK (boost_ramp_factor >= 1.1 AND boost_ramp_factor <= 10),
-    boost_total_cost_limit_budget   integer NOT NULL DEFAULT 10000 CHECK (boost_total_cost_limit_budget >= 1000),
 
     xid_warning_ratio               double precision NOT NULL DEFAULT 0.70 CHECK (xid_warning_ratio > 0 AND xid_warning_ratio < 1),
     mxid_warning_ratio              double precision NOT NULL DEFAULT 0.70 CHECK (mxid_warning_ratio > 0 AND mxid_warning_ratio < 1),
@@ -140,6 +141,9 @@ CREATE TABLE adaptive_autovacuum.policy
     recommendation_buffer_usage_limit_max_mb integer NOT NULL DEFAULT 256 CHECK (recommendation_buffer_usage_limit_max_mb >= 2 AND recommendation_buffer_usage_limit_max_mb <= 16384),
     work_mem_available_fraction     double precision NOT NULL DEFAULT 0.10 CHECK (work_mem_available_fraction > 0 AND work_mem_available_fraction <= 0.50),
     recommendation_workers_max      integer NOT NULL DEFAULT 16 CHECK (recommendation_workers_max BETWEEN 1 AND 64),
+    /* autovacuum_naptime is halved per check while overdue relations wait and the pool is under-filled; decays with the cost pair. */
+    manage_naptime                  boolean NOT NULL DEFAULT true,
+    naptime_min_seconds             integer NOT NULL DEFAULT 5 CHECK (naptime_min_seconds >= 1),
 
     emergency_vacuum_enabled        boolean NOT NULL DEFAULT true,
     emergency_work_mem_min_mb       integer NOT NULL DEFAULT 128 CHECK (emergency_work_mem_min_mb >= 64),
@@ -183,24 +187,27 @@ CREATE TABLE adaptive_autovacuum.table_policy
 COMMENT ON TABLE adaptive_autovacuum.table_policy IS
 'Per-relation operator overrides for any managed database, keyed by database, schema and relation name. A row whose relation no longer exists is kept (it may return after a restore); the database worker simply finds nothing to apply it to.';
 
-/* Rows only for relations with control state; rewritten on change or hourly, never per cycle. */
+/* Rows only for relations with control state (non-normal, recommendation, vacuum fingerprint); rewritten on change or hourly. */
 CREATE TABLE adaptive_autovacuum.table_state
 (
     database_oid          oid NOT NULL,
     relation_oid          oid NOT NULL,
     database_name         name NOT NULL,
     relation_name         text NOT NULL,
-    original_reloptions   text[],
-    original_captured     boolean NOT NULL DEFAULT false,
-    managed_values        jsonb NOT NULL DEFAULT '{}'::jsonb,
-    ownership_conflict    boolean NOT NULL DEFAULT false,
+    /* open = SQL waits for the operator; applied = the reloptions match it; revert = the cost boost is no longer needed. */
+    recommendation_status text CHECK (recommendation_status IN ('open', 'applied', 'revert')),
+    recommended_reloptions jsonb,
+    /* Values of the recommended keys before the operator applied them; a null value = the key was not set. */
+    previous_reloptions   jsonb,
+    recommendation_reason text,
+    recommended_at        timestamptz,
+    applied_at            timestamptz,
     state                 text NOT NULL DEFAULT 'normal',
     /* Saturate at their policy thresholds so a steady state produces no write. */
     consecutive_overdue   integer NOT NULL DEFAULT 0,
     consecutive_healthy   integer NOT NULL DEFAULT 0,
     /* Time of the last row write, not of the last scan. */
     last_seen_at          timestamptz NOT NULL DEFAULT clock_timestamp(),
-    last_change_at        timestamptz,
     last_dead_tuples      bigint,
     last_live_tuples      bigint,
     last_trigger          double precision,
@@ -213,7 +220,6 @@ CREATE TABLE adaptive_autovacuum.table_state
     last_vacuum_pid       integer,
     last_vacuum_progress  text,
     vacuum_stalled_cycles integer NOT NULL DEFAULT 0,
-    last_error            text,
     /* Previous cycle's action; decisions log (state, action) transitions only. */
     last_action           text,
     PRIMARY KEY (database_oid, relation_oid)
@@ -250,7 +256,8 @@ CREATE TABLE adaptive_autovacuum.database_state
     debt_velocity         double precision,
     max_xid_age           bigint,
     max_mxid_age          bigint,
-    changes_applied       integer,
+    /* Relations with an open table recommendation after the last scan. */
+    recommended_relations integer,
     analyzed_relations    integer
 );
 
@@ -297,6 +304,7 @@ CREATE UNLOGGED TABLE adaptive_autovacuum.global_recommendations
     recommended_autovacuum_work_mem_kb integer NOT NULL,
     recommended_buffer_usage_limit_kb integer NOT NULL,
     recommended_autovacuum_workers  integer NOT NULL,
+    recommended_autovacuum_naptime_seconds integer,
     recommended_vacuum_scale_factor double precision,
     recommended_vacuum_threshold    integer,
     recommended_vacuum_max_threshold integer,
@@ -439,6 +447,11 @@ CREATE TABLE adaptive_autovacuum.controller_state
     /* Cost-weighted autovacuum-worker activity (pg_stat_io, cumulative units) and units/s over the last interval. */
     last_vacuum_activity_units double precision,
     vacuum_activity_rate double precision,
+    /* Autovacuum-worker pg_stat_io counters at the previous sweep; the activity detail differences them. */
+    last_io_hits double precision,
+    last_io_reads double precision,
+    last_io_writes double precision,
+    last_io_extends double precision,
     /* The last applied cost raise and the activity before it; the next raise must beat it. */
     last_cost_raise_at timestamptz,
     last_raise_cost_limit integer,
@@ -475,110 +488,33 @@ AS $$
     END
 $$;
 
-CREATE FUNCTION adaptive_autovacuum._managed_values_match(
-    options text[], managed_values jsonb)
-RETURNS boolean
+/* Operator-runnable ALTER TABLE text for a set of reloptions; a null value means RESET that key. */
+CREATE FUNCTION adaptive_autovacuum._reloptions_sql(relation_name text, options jsonb)
+RETURNS text
 LANGUAGE sql
 IMMUTABLE
 PARALLEL SAFE
 AS $$
-    SELECT NOT EXISTS
-    (
-        SELECT 1
-        FROM jsonb_each_text(COALESCE(managed_values, '{}'::jsonb)) AS managed(option_name, option_value)
-        WHERE CASE
-            WHEN managed.option_name IN (
-                'autovacuum_vacuum_threshold',
-                'autovacuum_vacuum_scale_factor',
-                'autovacuum_vacuum_max_threshold',
-                'autovacuum_vacuum_insert_threshold',
-                'autovacuum_vacuum_insert_scale_factor',
-                'autovacuum_vacuum_cost_limit',
-                'autovacuum_vacuum_cost_delay'
-            )
-            THEN adaptive_autovacuum._option_value(options, managed.option_name)::numeric
-                 IS DISTINCT FROM managed.option_value::numeric
-            ELSE adaptive_autovacuum._option_value(options, managed.option_name)
-                 IS DISTINCT FROM managed.option_value
-        END
+    WITH opt AS (
+        SELECT o.key, o.value
+        FROM jsonb_each_text(COALESCE(options, '{}'::jsonb)) AS o(key, value)
+        WHERE o.key IN ('autovacuum_vacuum_threshold', 'autovacuum_vacuum_scale_factor',
+                        'autovacuum_vacuum_max_threshold', 'autovacuum_vacuum_insert_threshold',
+                        'autovacuum_vacuum_insert_scale_factor', 'autovacuum_vacuum_cost_limit',
+                        'autovacuum_vacuum_cost_delay')
+          AND (o.value IS NULL OR o.value ~ '^-?[0-9]+([.][0-9]+)?$')
     )
+    SELECT NULLIF(concat_ws(' ',
+        (SELECT format('ALTER TABLE %s SET (%s);', relation_name,
+                       string_agg(format('%I = %s', key, value), ', ' ORDER BY key))
+         FROM opt WHERE value IS NOT NULL HAVING count(*) > 0),
+        (SELECT format('ALTER TABLE %s RESET (%s);', relation_name,
+                       string_agg(format('%I', key), ', ' ORDER BY key))
+         FROM opt WHERE value IS NULL HAVING count(*) > 0)), '')
 $$;
 
-/* Operator tool for the control database; the database program carries the same logic inline. */
-CREATE FUNCTION adaptive_autovacuum._reconcile_relation_options(
-    relation_name text,
-    original_options text[],
-    previous_managed jsonb,
-    desired_managed jsonb,
-    lock_timeout_ms integer)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, adaptive_autovacuum
-AS $$
-DECLARE
-    option_name text;
-    option_value text;
-    original_value text;
-    reset_names text[] := ARRAY[]::text[];
-    set_parts text[] := ARRAY[]::text[];
-BEGIN
-    previous_managed := COALESCE(previous_managed, '{}'::jsonb);
-    desired_managed := COALESCE(desired_managed, '{}'::jsonb);
-
-    PERFORM set_config('lock_timeout', lock_timeout_ms::text || 'ms', true);
-
-    FOR option_name IN
-        SELECT key
-        FROM (
-            SELECT jsonb_object_keys(previous_managed) AS key
-            UNION
-            SELECT jsonb_object_keys(desired_managed) AS key
-        ) keys
-        ORDER BY key
-    LOOP
-        IF option_name NOT IN (
-            'autovacuum_vacuum_threshold',
-            'autovacuum_vacuum_scale_factor',
-            'autovacuum_vacuum_max_threshold',
-            'autovacuum_vacuum_insert_threshold',
-            'autovacuum_vacuum_insert_scale_factor',
-            'autovacuum_vacuum_cost_limit',
-            'autovacuum_vacuum_cost_delay'
-        ) THEN
-            RAISE EXCEPTION 'unsupported managed reloption: %', option_name;
-        END IF;
-
-        IF desired_managed ? option_name THEN
-            option_value := desired_managed ->> option_name;
-            IF option_value !~ '^-?[0-9]+([.][0-9]+)?$' THEN
-                RAISE EXCEPTION 'invalid numeric reloption value for %: %', option_name, option_value;
-            END IF;
-            set_parts := array_append(set_parts, format('%I = %s', option_name, option_value));
-        ELSE
-            original_value := adaptive_autovacuum._option_value(original_options, option_name);
-            IF original_value IS NULL THEN
-                reset_names := array_append(reset_names, option_name);
-            ELSE
-                set_parts := array_append(set_parts, format('%I = %s', option_name, original_value));
-            END IF;
-        END IF;
-    END LOOP;
-
-    IF cardinality(reset_names) > 0 THEN
-        EXECUTE format('ALTER TABLE %s RESET (%s)',
-                       relation_name,
-                       (SELECT string_agg(format('%I', value), ', ')
-                        FROM unnest(reset_names) AS value));
-    END IF;
-
-    IF cardinality(set_parts) > 0 THEN
-        EXECUTE format('ALTER TABLE %s SET (%s)',
-                       relation_name,
-                       array_to_string(set_parts, ', '));
-    END IF;
-END
-$$;
+COMMENT ON FUNCTION adaptive_autovacuum._reloptions_sql(text, jsonb) IS
+'Builds the ALTER TABLE ... SET (...) / RESET (...) statements for a jsonb of reloptions (null value = RESET). Used by table_recommendations; run the text in the database that owns the table.';
 
 /* Oldest snapshot / prepared xact / slot holding the cleanup horizon (XID only, not MXID). */
 CREATE FUNCTION adaptive_autovacuum.horizon_blocker()

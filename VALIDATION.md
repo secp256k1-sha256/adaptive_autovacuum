@@ -1151,3 +1151,231 @@ duplicate detection verified with a temporary `aav_win_dup`; idempotent rerun vi
 ZIP in `dist\` was picked up; removed). The workstation was left with the controller disabled again.
 
 Not run here: DEB build (no dpkg on the test hosts; CI covers it), the GitHub `release.yml` publication itself.
+
+## Validation performed 2026-09-25 (1.3.0: Debian 12/13 and EL10 packages)
+
+Packaging release plus one SQL fix (addendum 2026-09-26 below). `package-deb.yml` matrix gained `debian12` (bookworm) and `debian13` (trixie); `package-rpm.yml`
+gained a `dist` dimension (`el9` on `almalinux:9`, `el10` on `almalinux:10`, PGDG `EL-<n>` repositories, artifact names
+`rpm-<dist>-<arch>-pg<major>`). Version 1.3.0 everywhere (control file, spec and its changelog, Debian changelog,
+META.json, helper, install.sh, Windows module and install.ps1, bats and regression asserts, docs). The SQL objects are
+unchanged: `sql/adaptive_autovacuum--1.2.0.sql` stays frozen, `assemble.sh` now writes `--1.3.0.sql`, and a comment-only
+`--1.2.0--1.3.0.sql` upgrade script ships so the installers take the `ALTER EXTENSION UPDATE` path; the stale 1.0.0 to
+1.1.0 upgrade test was rewritten for 1.2.0 to 1.3.0 and added back to `REGRESS`. The spec sets `__brp_check_rpaths`
+to nothing: EL10's rpmbuild rejected the PGXS rpath to `/usr/pgsql-18/lib` (`ERROR 0002 ... invalid runpath`), which
+PGDG's own extension packages also carry. `release.yml` notes list the platforms and the in-place upgrade from 1.2.0.
+`make-release-manifest.sh` already accepted `debian13` and `el10` names; `install.sh` already mapped Debian and every
+EL clone (`rhel|rocky|almalinux|centos|ol` to `el<major>`), only its unsupported-distribution message changed.
+
+Regression (WSL AlmaLinux 9, PGDG PG 18.6 and 17.11, two passes each: on demand and preloaded with the controller off):
+`adaptive_autovacuum` and the new `upgrade` test pass on both majors; the upgrade output (1.2.0 created, policy edit,
+`ALTER EXTENSION UPDATE` to 1.3.0, values preserved, 18 doctor checks, `_run_cycle` runs) is identical across 17/18 and
+both passes and was adopted as `test/expected/upgrade.out`.
+
+EL9 upgrade path (same box, 1.2.0 RPMs reinstalled first so the files matched the release): RPMs built for 18 and 17,
+`dnf install` moved all three packages to 1.3.0 in one transaction, `rpm -V` clean, the package ships `--1.2.0.sql`,
+`--1.3.0.sql` and `--1.2.0--1.3.0.sql`; `install.sh --dry-run` planned `ALTER EXTENSION adaptive_autovacuum UPDATE
+(1.2.0 -> 1.3.0)` and `--yes` ran it: extension 1.3.0, `global_apply_queue` still 19 rows, the `min_table_bytes` marker
+set before the upgrade survived; doctor all OK, controller running (generation 49 to 50); live bats 7/7. The PG 17
+cluster held a forgotten 1.1.0 copy; the helper re-created it as 1.3.0 (`DROP EXTENSION + CREATE EXTENSION`, controller
+running afterwards). A `systemctl restart` of both clusters at once failed PG 17 with `lock file "postmaster.pid"
+already exists` (WSL restart race, unrelated to the packages); a plain start recovered it.
+
+Debian 13 (fresh WSL `Debian` distribution, trixie amd64, PGDG PG 18.6, same steps as the CI job): `generate.sh 18`,
+changelog `1.3.0-1` matches the control file, `dpkg-buildpackage -us -uc -b` built
+`postgresql-18-adaptive-autovacuum_1.3.0-1_debian13_amd64.deb` (55 KB `.so`, three SQL scripts, control file) and
+`adaptive-autovacuum-setup_1.3.0-1_all.deb`; `pg_ctlcluster 18 main` cluster (port 5434); `install.sh --check` and `--yes
+--control-database postgres` offline against a local manifest: preload set, restart through `postgresql@18-main`,
+extension 1.3.0 created, doctor 17 OK + `last_sweep WARN` (first minute), no FAIL; live bats 7/7; `apt-get remove`
+deleted the `.so` and kept the database objects; reinstalled afterwards.
+
+EL10 (fresh WSL `AlmaLinux-10` distribution, 10.2 x86_64, PGDG EL-10 PG 18.6, `epel-release` + `crb`, `bats` 1.11.1 from
+EPEL 10; `dnf module disable postgresql` has nothing to disable and is now `|| true` in the workflow): first rpmbuild
+failed in `check-rpaths` (fixed as above), second built `postgresql18-adaptive-autovacuum-1.3.0-1.el10.x86_64.rpm` and
+`adaptive-autovacuum-setup-1.3.0-1.el10.noarch.rpm` (rpmlint reports the rpath and a long description line, non-fatal
+as in CI); cluster via `initdb` + `pg_ctl` as in the CI container; `install.sh --check`/`--yes --control-database
+postgres` offline: preload, restart with `pg_ctl` (no systemd unit), extension 1.3.0, doctor no FAIL, `rpm -V` clean;
+live bats 7/7; `dnf remove` kept the database objects; reinstalled afterwards.
+
+Windows: version bump only; the module and `install.ps1` parse, Pester discovery 16/16. Not run here: arm64/aarch64
+builds, Debian 12 and Ubuntu (CI covers them), the GitHub `release.yml` publication.
+
+### Addendum 2026-09-26: `vacuum_activity_detail` per-second keys were cumulative
+
+`_global_controller()` built `hits_per_sec`, `reads_per_sec`, `writes_per_sec` and `extends_per_sec` from the cumulative
+`pg_stat_io` autovacuum-worker counters divided by the sample interval, so the detail grew with uptime while
+`vacuum_activity_rate` (delta-based) was correct. Fixed in 1.3.0 (not yet released): `controller_state` gained
+`last_io_hits`, `last_io_reads`, `last_io_writes`, `last_io_extends`, written every sweep and differenced on the next;
+the first sweep after an upgrade has no previous counters and reports 0. The 1.2.0 -> 1.3.0 upgrade script now adds the
+four columns; `test/sql/upgrade.sql` asserts them and the main suite seeds a 100000-hit gap over 100000 s and reads back
+1 hit/s. Regression: WSL AlmaLinux-9 PG 18.6 and PG 17.11, two passes each (both tests), Windows PG 18.4 two passes,
+all green. Found while building a pgbench watch script that wanted MB/s from the detail keys.
+
+## Validation performed 2026-09-26 (1.3.0: table settings recommended, autovacuum repaired first)
+
+Follow-up to the 2026-09-25 pgbench drill on an AWS t4g.small (user-run, `Downloads\pgbenchdrill_1.sql`: 100 tables x
+100K rows with `autovacuum_vacuum_threshold = 1000, autovacuum_vacuum_scale_factor = 0`, pgbench with autovacuum and the
+controller off, then the controller switched on). That drill found the controller LOOSENING operator-set triggers: with
+the 5,000 `target_dead_tuple_min` floor it rewrote the tables to threshold 500 / scale factor 0.045 / max threshold
+5,000, the tables sat at about 2,450 dead tuples, core autovacuum never fired, and the controller read them as healthy
+while the cost pair decayed. It also showed the `autovacuum = off` repair arriving minutes after the switch (10 checks,
+then only at the end of a sweep) and the `vacuum_activity_detail` per-second keys being cumulative (fixed the same day).
+
+Design decisions taken (user): per-table automatic management is gone. The database program computes table settings and
+RECORDS them; it never runs `ALTER TABLE`. Trigger settings are always recommended as a threshold + scale factor pair
+(plus `autovacuum_vacuum_max_threshold` on PostgreSQL 18), cost boosts are recommendations too, and the operator runs
+the SQL text in the table's own database (`table_recommendations.apply_sql`, `revert_sql`); no cross-database apply
+function. `min_table_bytes` defaults to 0 (a small hot table matters as much as a large one), `target_dead_tuple_min`
+to 1,000. `autovacuum = off` is repaired before anything else.
+
+What changed (SQL 1.3.0, `sql/parts/*`, upgrade script assembled from `90_upgrade_1.2.0_head.sql` + parts 02-04 with
+`CREATE OR REPLACE`):
+
+- `table_state` carries the recommendation (`recommendation_status` open / applied / revert, `recommended_reloptions`,
+  `previous_reloptions`, `recommendation_reason`, `recommended_at`, `applied_at`) instead of ownership state
+  (`original_reloptions`, `original_captured`, `managed_values`, `ownership_conflict`, `last_change_at`, `last_error`
+  dropped). View `table_recommendations` builds the SQL with `_reloptions_sql()` (allow-listed keys, numeric values,
+  null = RESET); `changed_tables`, `_reconcile_relation_options()` and `_managed_values_match()` are gone.
+- Lifecycle: `open` after `overdue_cycles_before_recommend` (2) non-normal checks; `applied` when every recommended key
+  matches the reloptions numerically, and then FROZEN (never re-tuned while in place, even when the table reads more
+  severe against its tighter trigger); `revert` (cost keys only) after `healthy_cycles_before_revert` (6) normal
+  checks; the row is dropped when nothing of ours is left in place, and when the table is dropped (state rows of
+  relations that no longer exist are pruned at the next scan).
+- Never-loosen guard: a dead- or insert-side trigger is recommended only when it fires earlier than the current one; a
+  cost pair only when stronger than the pair the table vacuums under (its own cost reloptions, else the cluster pair).
+  Widespread-overdue suppression: when the previous scan found at least 3 relations and a quarter of the eligible fleet
+  overdue on a side, no trigger recommendation is issued on that side (the cluster baseline is corrected instead, the
+  same rule as the section-7 detector; found in the drill where all 100 tables opened an insert-side recommendation for
+  one sweep before the cluster insert scale factor changed).
+- Policy: `manage_table_costs` -> `recommend_table_costs` (default true), `overdue_cycles_before_change` ->
+  `overdue_cycles_before_recommend`, `healthy_cycles_before_restore` -> `healthy_cycles_before_revert`;
+  `change_cooldown_seconds`, `max_changes_per_cycle`, `boost_ramp_factor`, `boost_total_cost_limit_budget` dropped;
+  `max_boosted_relations` (2) now bounds standing cost-boost recommendations cluster-wide.
+- `database_state.changes_applied` -> `recommended_relations`; `database_status` shows it; `status()` adds
+  `open_table_recommendations`; `doctor()` adds check 14 `table_recommendations` (19 checks).
+- `latest_global_recommendation` adds `vacuum_read_mbps` / `vacuum_write_mbps` (pg_stat_io page deltas x block size);
+  `vacuum_activity_rate` and `cost_budget_rate` stay in cost units per second.
+- `autovacuum = off` first: new `_repair_disabled_autovacuum()`; the C controller calls it (and applies the queued row,
+  SIGHUP to the postmaster) at the very start of `aav_run_sweep()` before any database worker, and right after every
+  configuration reload it processes in its wait loop, so `ALTER SYSTEM SET autovacuum = off; SELECT pg_reload_conf()`
+  is undone within the same second. A repair applied in the last 30 s is not queued again (the controller's own copy of
+  the GUC still reads off until the postmaster's reload reaches it; first drill runs produced a duplicate row from both
+  the sweep start and the global step). The control-plane readiness probe requires the new function, so a 1.3.0 library
+  over 1.2.0 SQL waits with the usual "missing or outdated" warning until `ALTER EXTENSION UPDATE`.
+- Upgrade 1.2.0 -> 1.3.0 keeps table options the old controller wrote (they are tighter triggers) and logs one
+  `legacy_table_settings` row per relation in `decisions` (visible in `actions`) with the SQL that restores the captured
+  original values.
+
+Regression (`test/sql/adaptive_autovacuum.sql`, `upgrade.sql`): the suite asserts the program text contains no
+`ALTER TABLE`, exercises `_reloptions_sql()`, and runs the full lifecycle on two tables while holding them in
+`SHARE UPDATE EXCLUSIVE` inside a transaction (core autovacuum skips locked relations, so the checks are deterministic):
+open with the exact `apply_sql` (trigger pair + max threshold on 18 + urgent boost), never-loosen on a table tuned to
+threshold 100, operator applies via `EXECUTE apply_sql`, `applied` detected and frozen while the table reads critical,
+`revert` with the exact `RESET` text after one healthy check, closed after the revert, the operator's trigger kept;
+widespread suppression (nine overdue of thirteen eligible: cost advice only, reason names the cluster baseline); dropped
+tables pruned; 19 doctor checks; `status()`/`doctor()` agree on open recommendations. The upgrade test seeds a 1.2.0
+managed row and asserts the legacy decision text, renamed and dropped columns, the moved defaults and the replaced
+objects. Expected output adopted from WSL PG 18.6 (93 true, 0 false, two passes identical); PG 17.11 two passes and
+Windows PG 18.4 two passes pass against it unchanged. C: rebuilt on WSL (gcc, PGDG 18.6 / 17.11) and Windows (MSVC 19.44).
+
+Two-phase pgbench drills (scripts `C:\cld\aav_wsl_pgbench_drill.sh`, `aav_win_pgbench_drill.ps1`; charts
+`C:\cld\aav_results\aav_121_*.png` from `aav_plot_recs.py`): start with `autovacuum = off`, `autovacuum_max_workers 1`,
+cost 10 / 100 ms, naptime 10 s, `adaptive_autovacuum.enabled = off`; 100 worker tables x 100K rows (threshold 1000),
+5 hot tables x 20K rows (default trigger) and 2 loose tables x 10K rows (scale factor 0.5, own max threshold off), all
+with an indexed `counter` so updates are not HOT (page pruning otherwise removes the dead tuples of small hot tables
+before autovacuum ever sees them); pgbench 16 clients for 120 s; then only the controller is switched on; the "operator"
+runs every `apply_sql` open for 30 s and every `revert_sql`, one naptime apart; a 60 s hot + loose burst at +150 s.
+
+- WSL AlmaLinux 9, PG 18.6, 24 CPUs (three runs, 2,400 to 2,750 TPS during the build, 160K to 206K dead tuples on the
+  worker tables): `autovacuum = on` applied 0.1 to 0.2 s after the reload every time (queue row requested 50 ms after
+  the reload; one row after the guard, two before it); first sweep 10 s later raised the pair 10 / 100 ms -> 200 / 50 ms
+  (built-in floor), workers 1 -> 2 -> 4 -> 8 -> 16 over four sweeps, cost pair doubled per sweep to 1600 / 6.25 ms,
+  `autovacuum_work_mem` and the cluster triggers (scale factor 0.2 -> 0.009, threshold 50 -> 100, max threshold ->
+  1,000, insert scale 0.2 -> 0.09, analyze scale 0.1 -> 0.005) set from the fleet evidence; the whole debt (10.3M
+  dead + inserted-since-vacuum tuples) drained in about 2.5 minutes at up to 60 MiB/s written / 17 MiB/s read by
+  autovacuum workers; two cost-boost recommendations (critical tier 6000 / 0 ms) opened after two checks, were applied
+  by the operator, detected `applied` on the next sweep, turned to `revert` after six healthy checks and closed after the
+  RESET; the burst opened boosts for the hot tables again; after ten backlog-free checks the pair decayed 1600 / 6.25 ->
+  800 / 12.5 -> 400 / 25 ms toward the baseline. Zero server-log errors. Trigger recommendations did not fire for the
+  hot tables because the cluster max threshold of 1,000 already made their trigger (280) tighter than the 1,000 target,
+  which is exactly the never-loosen rule; the loose tables needed their own `autovacuum_vacuum_max_threshold = -1` to
+  escape that cap (run 4 below).
+- Windows 11, PG 18.4 (EDB), 24 CPUs (three runs, 7,700 to 10,300 TPS, 386K to 420K dead tuples): repair applied 0.5 to
+  1.2 s after the reload (the wait-loop path fired at +0.7 s; before the guard the first sweep queued a duplicate row,
+  the final run on the current SQL shows exactly one), same ladder to 1600 or 2560 / 6.25 ms and 16 workers, decay to
+  800 or 1280 / 12.5 ms, boosts applied and reverted, zero log errors. Core's launcher started only one worker per
+  `autovacuum_naptime` / databases in the first two minutes after the repair, so activity lagged the raised budget;
+  the controller does not manage `autovacuum_naptime` (candidate for later).
+- WSL run 4 (loose tables with their own `autovacuum_vacuum_max_threshold = -1`): the trigger recommendation for the two
+  loose tables opened only after the fleet had drained (86 of 107 tables were still overdue during the burst, so the
+  widespread rule held it back, reason recorded), with the expected text ("Dead tuples 71555 ... current trigger of
+  6000 (threshold 1000 + scale factor 0.5 x 10000 rows); firing at 1000 dead tuples ...") but after the drill's
+  operator window. The run also exposed ratios of 10x and more printing as `#.##` (`to_char(..., 'FM0.00')`, one
+  integer digit) in the state and recommendation reasons; widened to `FM9990.00` (`FM990.000` for the XID ratios) and
+  the suite re-run on all three builds (WSL 18.6 x2 adopted, 17.11 x2, Windows 18.4 x2, all green).
+- WSL run 5 (format fix, burst at +240 s): repair 0.1 s, one queue row; the loose tables' trigger recommendation opened
+  during the burst with correct text ("Dead tuples 55812 are 9.30x the current trigger of 6000 ... firing at 1000 dead
+  tuples") and was withdrawn one sweep later because autovacuum, by then with 16 workers and a raised budget, vacuumed
+  them at once (55K dead against a 6,000 trigger); the operator's 30 s window never came, which is the intended
+  outcome for a table autovacuum does reach. Four cost boosts (two waves) were applied and reverted. The activity
+  feedback held the pair at 400 / 25 ms for most of the drain (observed activity matched the budget), it reached
+  800 / 12.5 ms only during the burst and decayed to 200 / 50 ms afterwards; the drain took about 5.5 minutes
+  against 2.5 in the runs where the pair climbed to 1600 / 6.25 ms. Zero log errors.
+
+Not done: the Debian/EL10 package builds and installers were not re-run after the SQL change (the packaging is
+unchanged; the SQL files ship inside the same packages), and the architecture DOCX was not regenerated.
+
+## Validation performed 2026-09-26 (1.3.0: autovacuum_naptime managed, worker raises easier)
+
+The drills above (all on the 1.2.x controller logic) showed `autovacuum_max_workers` going 1 -> 16 within 40 s while one
+to three workers actually ran: core's launcher visits each database once per `autovacuum_naptime` (60 s) and starts one
+worker for it, so a raised pool stays empty. The user asked for workers that grow more easily and a naptime that ramps
+down; with nothing committed yet the working tree became 1.3.0 (`sql/adaptive_autovacuum--1.3.0.sql`,
+`--1.2.0--1.3.0.sql`, version strings in the control file, Makefile, META.json, packaging, installers, docs, tests).
+
+Changes:
+
+- `autovacuum_naptime` is managed (allow-listed in SQL and C, reloadable): halved per check down to
+  `policy.naptime_min_seconds` (default 5) while relations are overdue, the debt is not under control, memory and
+  storage are not under pressure and fewer workers run than the pool allows; doubled back toward the operator baseline
+  in the same decay step as the cost pair (baseline tracked in `controller_state.baseline_settings` like the cost
+  pair). `policy.manage_naptime` (default true) switches it off. `global_recommendations` gained
+  `recommended_autovacuum_naptime_seconds`, `status()` `autovacuum_naptime_seconds`.
+- Worker raise: the queue test is now "overdue relations >= workers + 2" (was also ">= 2 x workers"), and CPU load
+  alone no longer blocks a raise (memory and storage pressure still do, critical wraparound overrides): the workers
+  share one cost budget, so the pool adds concurrency rather than I/O, and the small loaded host is exactly the one
+  that shows load while hundreds of tables are overdue. The cost pair still holds under any host pressure.
+
+Regression: new asserts for the defaults, the naptime halving with an under-filled pool, CPU load not blocking the
+worker raise while memory pressure does (also holds naptime), naptime held with the workers when the debt is under
+control, and naptime walking back up in the decay step; the upgrade test asserts the new columns. Green on WSL PG 18.6
+(two passes, expected adopted, 0 false) and PG 17.11 (two passes), Windows PG 18.4 (two passes, MSVC DLL rebuilt for
+the allow-list). All later WSL runs use the Debian 13 distribution (PGDG 18.6 and 17.11) at the user's request.
+
+Two-phase drill, Windows 11 / PG 18.4, 7,400 TPS build, 382K dead tuples on the worker tables, controller switched on
+at +126 s with autovacuum off: repair applied 0.4 s after the reload (one row); then per 10 s sweep
+
+| after switch-on | max_workers | workers running | autovacuum_naptime | cost pair | overdue |
+|---|---|---|---|---|---|
+| 5 s | 1 | 0 | 60 s | 10 / 100 ms | 107 |
+| 16 s | 2 | 0 | 60 s | 200 / 50 ms | 107 |
+| 27 s | 4 | 0 | 30 s | 400 / 25 ms | 107 |
+| 38 s | 8 | 0 | 15 s | 800 / 12.5 ms | 107 |
+| 62 s | 16 | 4 | 5 s | 2560 / 6.25 ms | 98 |
+| 84 s | 16 | 8 | 5 s | 2560 / 6.25 ms | 72 |
+| 117 s | 16 | 14 | 5 s | 2560 / 6.25 ms | 29 |
+| 138 s | 16 | 0 | 5 s | 2560 / 6.25 ms | 0 |
+
+so the whole backlog drained about one minute after the pool filled, against 2.5 to 5.5 minutes in the 1.2.x runs where
+at most three workers ran. Cost-boost recommendations opened, were applied and reverted; the hot + loose burst at
++240 s opened trigger recommendations for the two loose tables (`SET (autovacuum_vacuum_max_threshold = 1000,
+autovacuum_vacuum_scale_factor = 0.09, autovacuum_vacuum_threshold = 100)`) which the operator applied live, plus two
+boosts, all reverted or closed afterwards; after ten backlog-free checks the decay stepped `autovacuum_naptime` 5 -> 10 s
+and the pair 2560 / 6.25 -> 1280 / 12.5 -> 640 / 25 ms, the reason naming the three baselines (10 / 100 ms / 60 s).
+Zero log errors. Chart: `C:\cld\aav_results\aav_121_win_pg18.png`.
+
+Same drill on WSL Debian 13 / PG 18.6 (82,800 TPS build, 657K dead tuples on the worker tables, 3.0M on the hot and
+loose tables): repair applied 28 ms after the reload (one row); naptime 60 -> 30 -> 15 -> 7 -> 5 s and workers 1 -> 2
+-> 4 -> 8 -> 16 over four sweeps, 12 workers running at the peak, 107 overdue relations cleared about 100 s after the
+switch-on (pair 200 / 50 -> 400 / 25 -> 1600 / 6.25 ms); the burst opened trigger recommendations for both loose
+tables (one combined with a cost boost in a single ALTER TABLE) which the operator applied live; decay to 640 / 25 ms
+and naptime 20 s by the end of the run; zero log errors. Chart: `C:\cld\aav_results\aav_121_wsl_pg18.png`.

@@ -1,8 +1,8 @@
 EXTENSION = adaptive_autovacuum
 MODULE_big = adaptive_autovacuum
 OBJS = src/adaptive_autovacuum.o
-DATA = sql/adaptive_autovacuum--1.2.0.sql
-REGRESS = adaptive_autovacuum
+DATA = sql/adaptive_autovacuum--1.2.0.sql sql/adaptive_autovacuum--1.3.0.sql sql/adaptive_autovacuum--1.2.0--1.3.0.sql
+REGRESS = adaptive_autovacuum upgrade
 REGRESS_OPTS = --inputdir=test
 PGFILEDESC = "adaptive_autovacuum - adaptive autovacuum controller"
 

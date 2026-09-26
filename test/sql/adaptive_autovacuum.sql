@@ -6,14 +6,20 @@ CREATE EXTENSION adaptive_autovacuum;
 
 SELECT enabled = true AS active_by_default,
        dry_run = false AS applies_by_default,
-       manage_table_costs = false AS cost_changes_opt_in,
+       recommend_table_costs = true AS cost_recommendations_on_by_default,
+       min_table_bytes = 0 AS every_table_eligible_by_default,
+       target_dead_tuple_min = 1000 AS dead_tuple_floor_default,
+       overdue_cycles_before_recommend = 2 AS recommend_after_two_checks,
+       healthy_cycles_before_revert = 6 AS revert_after_six_healthy_checks,
        emergency_vacuum_enabled = true AS emergency_on_by_default,
        manage_global_settings = true AS globals_managed_by_default,
        analyze_missing_stats = true AS analyze_missing_stats_by_default,
        analyze_missing_stats_budget_ms = 10000 AS analyze_budget_default,
        repair_disabled_autovacuum = true AS autovacuum_repair_on_by_default,
-       repair_disabled_autovacuum_cycles = 10 AS autovacuum_repair_after_ten_checks,
+       repair_disabled_autovacuum_cycles = 1 AS autovacuum_repair_on_first_check,
        recommendation_workers_max = 16 AS workers_max_default,
+       manage_naptime = true AS naptime_managed_by_default,
+       naptime_min_seconds = 5 AS naptime_floor_default,
        recovery_cycles_before_decay = 10 AS decay_after_ten_clean_checks
 FROM adaptive_autovacuum.policy;
 
@@ -50,82 +56,26 @@ SELECT adaptive_autovacuum.host_metrics() ?&
 CREATE TABLE aav_test(id integer)
 WITH (autovacuum_vacuum_threshold = 123);
 
-SELECT adaptive_autovacuum._managed_values_match(
-           ARRAY['autovacuum_vacuum_threshold=123'],
-           '{"autovacuum_vacuum_threshold":"123.0"}'::jsonb)
-       AS numeric_reloptions_compare;
+-- SQL text for the operator: SET for values, RESET for null values, allow-listed keys only, sorted.
+SELECT adaptive_autovacuum._reloptions_sql('public.aav_test',
+           '{"autovacuum_vacuum_threshold":"50", "autovacuum_vacuum_scale_factor":"0.01"}'::jsonb)
+       = 'ALTER TABLE public.aav_test SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 50);'
+       AS reloptions_sql_set;
 
-DO $$
-BEGIN
-    PERFORM adaptive_autovacuum._reconcile_relation_options(
-        'public.aav_test',
-        ARRAY['autovacuum_vacuum_threshold=123'],
-        '{}'::jsonb,
-        '{"autovacuum_vacuum_threshold":"50", "autovacuum_vacuum_scale_factor":"0.01"}'::jsonb,
-        1000
-    );
-END
-$$;
+SELECT adaptive_autovacuum._reloptions_sql('public.aav_test',
+           '{"autovacuum_vacuum_threshold":"123", "autovacuum_vacuum_scale_factor":null}'::jsonb)
+       = 'ALTER TABLE public.aav_test SET (autovacuum_vacuum_threshold = 123); ALTER TABLE public.aav_test RESET (autovacuum_vacuum_scale_factor);'
+       AS reloptions_sql_set_and_reset;
 
-SELECT adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_threshold')::integer = 50
-       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_scale_factor')::numeric = 0.01
-       AS reloptions_applied
-FROM pg_class WHERE oid = 'aav_test'::regclass;
+SELECT adaptive_autovacuum._reloptions_sql('public.aav_test',
+           '{"fillfactor":"50", "autovacuum_vacuum_threshold":"1; DROP TABLE x"}'::jsonb) IS NULL
+       AS reloptions_sql_rejects_unknown_keys_and_values;
 
-DO $$
-BEGIN
-    PERFORM adaptive_autovacuum._reconcile_relation_options(
-        'public.aav_test',
-        ARRAY['autovacuum_vacuum_threshold=123'],
-        '{"autovacuum_vacuum_threshold":"50", "autovacuum_vacuum_scale_factor":"0.01"}'::jsonb,
-        '{}'::jsonb,
-        1000
-    );
-END
-$$;
+-- The database program never writes table settings; ANALYZE is its only DDL.
+SELECT position('ALTER TABLE' IN adaptive_autovacuum._database_program()) = 0 AS program_never_alters_tables;
 
-SELECT adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_threshold')::integer = 123
-       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_scale_factor') IS NULL
-       AS reloptions_restored
-FROM pg_class WHERE oid = 'aav_test'::regclass;
-
-DO $$
-BEGIN
-    PERFORM adaptive_autovacuum._reconcile_relation_options(
-        'public.aav_test',
-        ARRAY['autovacuum_vacuum_threshold=123'],
-        '{}'::jsonb,
-        '{"autovacuum_vacuum_insert_threshold":"1000", "autovacuum_vacuum_insert_scale_factor":"0.05"}'::jsonb,
-        1000
-    );
-END
-$$;
-
-SELECT adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_insert_threshold')::integer = 1000
-       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_insert_scale_factor')::numeric = 0.05
-       AS insert_reloptions_applied
-FROM pg_class WHERE oid = 'aav_test'::regclass;
-
-DO $$
-BEGIN
-    PERFORM adaptive_autovacuum._reconcile_relation_options(
-        'public.aav_test',
-        ARRAY['autovacuum_vacuum_threshold=123'],
-        '{"autovacuum_vacuum_insert_threshold":"1000", "autovacuum_vacuum_insert_scale_factor":"0.05"}'::jsonb,
-        '{}'::jsonb,
-        1000
-    );
-END
-$$;
-
-SELECT adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_insert_threshold') IS NULL
-       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_insert_scale_factor') IS NULL
-       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_threshold')::integer = 123
-       AS insert_reloptions_restored
-FROM pg_class WHERE oid = 'aav_test'::regclass;
-
-SELECT count(*) = 0 AS changed_tables_view_empty
-FROM adaptive_autovacuum.changed_tables;
+SELECT count(*) = 0 AS table_recommendations_view_empty
+FROM adaptive_autovacuum.table_recommendations;
 
 SELECT count(*) = 0 AS global_apply_queue_empty
 FROM adaptive_autovacuum.global_apply_queue;
@@ -424,6 +374,177 @@ SELECT n_tup_ins = 1 AND n_tup_upd = 1 AND n_tup_del = 1
 FROM pg_stat_all_tables
 WHERE relid = 'adaptive_autovacuum.table_state'::regclass;
 
+-- Table settings are recommended, never written: open -> applied -> revert, with ready-to-run SQL.
+CREATE TABLE aav_rec(id integer, payload text);
+INSERT INTO aav_rec SELECT g, g::text FROM generate_series(1, 10000) g;
+CREATE TABLE aav_tight(id integer, payload text)
+WITH (autovacuum_vacuum_threshold = 100, autovacuum_vacuum_scale_factor = 0);
+INSERT INTO aav_tight SELECT g, g::text FROM generate_series(1, 10000) g;
+SELECT pg_stat_force_next_flush();
+VACUUM ANALYZE aav_rec;
+VACUUM ANALYZE aav_tight;
+DELETE FROM aav_rec WHERE id > 1000;
+DELETE FROM aav_tight WHERE id > 9100;
+SELECT pg_stat_force_next_flush();
+
+-- The lock keeps core autovacuum off these tables (it skips locked relations) while the checks run.
+BEGIN;
+LOCK TABLE aav_rec, aav_tight IN SHARE UPDATE EXCLUSIVE MODE;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 0 AS no_recommendation_before_hysteresis
+FROM adaptive_autovacuum.table_recommendations;
+
+SELECT state = 'backlog_urgent' AND last_action = 'observe' AS first_check_observes
+FROM adaptive_autovacuum.table_state
+WHERE relation_oid = 'aav_rec'::regclass;
+
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommendation_status = 'open'
+       AND apply_sql = format('ALTER TABLE public.aav_rec SET (autovacuum_vacuum_cost_delay = 1, autovacuum_vacuum_cost_limit = 3000, %sautovacuum_vacuum_scale_factor = 0.09, autovacuum_vacuum_threshold = 100);',
+                              CASE WHEN current_setting('server_version_num')::integer >= 180000
+                                   THEN 'autovacuum_vacuum_max_threshold = 1000, ' ELSE '' END)
+       AND revert_sql IS NULL
+       AND applied_at IS NULL
+       AND reason LIKE 'Dead tuples 9000 are 4.39x the current trigger of 2050 (threshold 50 + scale factor 0.2 x 10000 rows%firing at 1000 dead tuples (1% of the table) needs threshold 100 and scale factor 0.09%Urgent tier: a table-level cost limit 3000 / delay 1 ms%(boost slot 2 of 2)%'
+       AS trigger_and_cost_recommended_together
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_rec';
+
+-- Never loosen: a trigger already tighter than the policy target is left alone; the boost still comes.
+SELECT recommendation_status = 'open'
+       AND apply_sql = 'ALTER TABLE public.aav_tight SET (autovacuum_vacuum_cost_delay = 0, autovacuum_vacuum_cost_limit = 6000);'
+       AND NOT (recommended_reloptions ? 'autovacuum_vacuum_threshold')
+       AND reason LIKE 'The current trigger (100 dead tuples) is already at or below the policy target (1000)%Critical tier: a table-level cost limit 6000 / delay 0 ms%(boost slot 1 of 2)%'
+       AS tight_trigger_never_loosened
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_tight';
+
+SELECT count(*) = 1 AS recommendation_transition_logged_once
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_rec'::regclass AND action = 'recommend_reloptions' AND NOT applied;
+
+SELECT recommended_relations = 2 AS database_status_counts_open_recommendations
+FROM adaptive_autovacuum.database_status
+WHERE database_name = current_database();
+
+-- The operator runs the SQL in the table's database; the next check sees it applied.
+DO $$
+BEGIN
+    EXECUTE (SELECT apply_sql FROM adaptive_autovacuum.table_recommendations WHERE relation_name = 'public.aav_rec');
+END
+$$;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommendation_status = 'applied'
+       AND applied_at IS NOT NULL
+       AND apply_sql IS NULL
+       AND revert_sql = format('ALTER TABLE public.aav_rec RESET (autovacuum_vacuum_cost_delay, autovacuum_vacuum_cost_limit, %sautovacuum_vacuum_scale_factor, autovacuum_vacuum_threshold);',
+                               CASE WHEN current_setting('server_version_num')::integer >= 180000
+                                    THEN 'autovacuum_vacuum_max_threshold, ' ELSE '' END)
+       AS recommendation_detected_as_applied
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_rec';
+
+-- Against its new trigger the table reads critical, but an applied recommendation is never re-tuned.
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT state = 'backlog_critical'
+       AND recommendation_status = 'applied'
+       AND recommended_reloptions ->> 'autovacuum_vacuum_cost_limit' = '3000'
+       AS applied_recommendation_frozen
+FROM adaptive_autovacuum.table_state
+WHERE relation_oid = 'aav_rec'::regclass;
+
+SELECT count(*) = 1 AS applied_transition_logged_once
+FROM adaptive_autovacuum.decisions
+WHERE relid = 'aav_rec'::regclass AND action = 'recommendation_applied';
+COMMIT;
+
+-- Healthy again: the trigger settings stay with the operator, the cost boost gets a revert.
+VACUUM aav_rec;
+VACUUM aav_tight;
+SELECT pg_stat_force_next_flush();
+UPDATE adaptive_autovacuum.policy SET healthy_cycles_before_revert = 1;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT recommendation_status = 'revert'
+       AND revert_sql = 'ALTER TABLE public.aav_rec RESET (autovacuum_vacuum_cost_delay, autovacuum_vacuum_cost_limit);'
+       AND apply_sql IS NULL
+       AND reason LIKE 'The relation has been normal for 1 check(s); the table-level cost boost (3000 / 1 ms)%'
+       AS cost_boost_revert_recommended
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_rec';
+
+-- The unapplied recommendation of the now-healthy table is withdrawn.
+SELECT count(*) = 0 AS open_recommendation_withdrawn_when_healthy
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_tight';
+
+DO $$
+BEGIN
+    EXECUTE (SELECT revert_sql FROM adaptive_autovacuum.table_recommendations WHERE relation_name = 'public.aav_rec');
+END
+$$;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT count(*) = 0 AS reverted_recommendation_closed
+FROM adaptive_autovacuum.table_recommendations;
+
+SELECT adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_threshold')::integer = 100
+       AND adaptive_autovacuum._option_value(reloptions, 'autovacuum_vacuum_cost_limit') IS NULL
+       AS operator_keeps_trigger_boost_removed
+FROM pg_class WHERE oid = 'aav_rec'::regclass;
+UPDATE adaptive_autovacuum.policy SET healthy_cycles_before_revert = 6;
+
+-- A dropped table takes its state row with it at the next check.
+CREATE TABLE aav_gone(id integer) WITH (autovacuum_enabled = false);
+INSERT INTO aav_gone SELECT g FROM generate_series(1, 10000) g;
+SELECT pg_stat_force_next_flush();
+VACUUM ANALYZE aav_gone;
+DELETE FROM aav_gone WHERE id > 1000;
+SELECT pg_stat_force_next_flush();
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT count(*) = 1 AS overdue_table_has_state_row
+FROM adaptive_autovacuum.table_state WHERE relation_name = 'public.aav_gone';
+DROP TABLE aav_gone;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT count(*) = 0 AS dropped_table_state_row_pruned
+FROM adaptive_autovacuum.table_state WHERE relation_name = 'public.aav_gone';
+
 -- Debt trend: a synthetic previous sample makes the same backlog read as growing, then shrinking.
 DELETE FROM aav_overdue WHERE id > 100;
 SELECT pg_stat_force_next_flush();
@@ -610,6 +731,25 @@ SELECT recommended_cost_limit = 2 * :aav_limit
        AS observed_activity_gain_allows_raise
 FROM adaptive_autovacuum.latest_global_recommendation;
 
+-- Detail keys are counter deltas per second: a seed 100000 hits behind over 100000 s reads back as 1 hit/s.
+UPDATE adaptive_autovacuum.controller_state
+SET last_sample_at = clock_timestamp() - interval '100000 seconds',
+    last_io_hits = last_io_hits - 100000,
+    last_vacuum_activity_units = -1000000;
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+
+SELECT round((vacuum_activity_detail ->> 'hits_per_sec')::numeric, 1) = 1.0
+       AND (vacuum_activity_detail ->> 'reads_per_sec')::numeric < 1
+       AS activity_detail_uses_counter_deltas
+FROM adaptive_autovacuum.latest_global_recommendation;
+
 -- A record that no longer matches the live settings (operator change, failed apply) is ignored.
 UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
 UPDATE adaptive_autovacuum.database_state
@@ -635,7 +775,8 @@ SELECT pg_stat_force_next_flush();
 INSERT INTO adaptive_autovacuum.global_apply_queue (guc_name, desired_value, status, applied_at)
 SELECT s.name, s.setting, 'applied', clock_timestamp()
 FROM pg_settings s
-WHERE s.name IN ('autovacuum_vacuum_cost_limit', 'autovacuum_vacuum_cost_delay');
+WHERE s.name IN ('autovacuum_vacuum_cost_limit', 'autovacuum_vacuum_cost_delay', 'autovacuum_naptime');
+SELECT setting::integer AS aav_naptime FROM pg_settings WHERE name = 'autovacuum_naptime' \gset
 UPDATE adaptive_autovacuum.global_apply_queue
 SET desired_value = current_setting('vacuum_cost_limit')
 WHERE guc_name = 'autovacuum_vacuum_cost_limit' AND desired_value = '-1';
@@ -643,7 +784,8 @@ UPDATE adaptive_autovacuum.controller_state
 SET backlog_free_cycles = 9,
     baseline_settings = jsonb_build_object(
         'autovacuum_vacuum_cost_limit', current_setting('vacuum_cost_limit')::integer / 4,
-        'autovacuum_vacuum_cost_delay', 20);
+        'autovacuum_vacuum_cost_delay', 20,
+        'autovacuum_naptime', 4 * :aav_naptime);
 DO $$
 BEGIN
     PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
@@ -653,6 +795,7 @@ $$;
 SELECT r.overdue_relations = 0
        AND r.recommended_cost_limit = current_setting('vacuum_cost_limit')::integer / 2
        AND r.recommended_cost_delay_ms = LEAST(20, GREATEST(0.5, 2 * s.setting::double precision))
+       AND r.recommended_autovacuum_naptime_seconds = 2 * :aav_naptime
        AND r.reason LIKE 'No overdue relations for 10 consecutive checks%'
        AS clean_checks_decay_toward_baseline
 FROM adaptive_autovacuum.latest_global_recommendation r,
@@ -710,7 +853,14 @@ SELECT overdue_relations >= 8
        AS queue_pressure_raises_workers_past_cpu_count
 FROM adaptive_autovacuum.latest_global_recommendation;
 
--- Host pressure (load 10 on 1 CPU) still blocks the raise.
+-- The launcher starts one worker per database per naptime: an under-filled pool halves autovacuum_naptime.
+SELECT setting::integer AS aav_naptime FROM pg_settings WHERE name = 'autovacuum_naptime' \gset
+SELECT recommended_autovacuum_naptime_seconds = GREATEST(5, :aav_naptime / 2)
+       AND reason LIKE format('%%so it goes %s -> %s s (floor 5 s) to fill the pool%%', :aav_naptime, GREATEST(5, :aav_naptime / 2))
+       AS underfilled_pool_halves_naptime
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- CPU load alone (load 10 on 1 CPU) no longer blocks the raise: workers share one cost budget.
 UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
 UPDATE adaptive_autovacuum.database_state
 SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
@@ -722,8 +872,27 @@ END
 $$;
 
 SELECT overdue_relations >= 8
+       AND recommended_autovacuum_workers = 2 * :aav_workers
+       AND recommended_autovacuum_naptime_seconds = GREATEST(5, :aav_naptime / 2)
+       AND recommended_cost_limit = current_setting('vacuum_cost_limit')::integer
+       AS cpu_load_alone_does_not_block_worker_raise
+FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- Memory pressure (1% free) still blocks the raise and the naptime step.
+UPDATE adaptive_autovacuum.controller_state SET last_sample_at = clock_timestamp() - interval '60 seconds';
+UPDATE adaptive_autovacuum.database_state
+SET last_scan_completed_at = clock_timestamp() - interval '60 seconds', debt_tuples = 0, debt_velocity = NULL
+WHERE database_name = current_database();
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 1000000, 100000000);
+END
+$$;
+
+SELECT overdue_relations >= 8
        AND recommended_autovacuum_workers = :aav_workers
-       AS host_pressure_blocks_worker_raise
+       AND recommended_autovacuum_naptime_seconds = :aav_naptime
+       AS memory_pressure_blocks_worker_raise
 FROM adaptive_autovacuum.latest_global_recommendation;
 
 -- Free memory caps the raise: 3 x autovacuum_work_mem free allows exactly one extra worker.
@@ -772,8 +941,46 @@ $$;
 
 SELECT backlog_trend = 'shrinking'
        AND recommended_autovacuum_workers = :aav_workers
-       AS shrinking_debt_holds_workers
+       AND recommended_autovacuum_naptime_seconds = :aav_naptime
+       AS shrinking_debt_holds_workers_and_naptime
 FROM adaptive_autovacuum.latest_global_recommendation;
+
+-- A widely overdue fleet (the eight worker-pool tables) means the baseline is wrong: no per-table trigger advice.
+CREATE TABLE aav_wide(id integer, payload text);
+INSERT INTO aav_wide SELECT g, g::text FROM generate_series(1, 10000) g;
+SELECT pg_stat_force_next_flush();
+VACUUM ANALYZE aav_wide;
+DELETE FROM aav_wide WHERE id > 1000;
+SELECT pg_stat_force_next_flush();
+BEGIN;
+LOCK TABLE aav_wide IN SHARE UPDATE EXCLUSIVE MODE;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT recommendation_status = 'open'
+       AND NOT (recommended_reloptions ? 'autovacuum_vacuum_threshold')
+       AND recommended_reloptions ? 'autovacuum_vacuum_cost_limit'
+       AND reason LIKE '9 of % eligible tables were overdue on the dead-tuple side in the last scan: the cluster baseline is being corrected%'
+       AS widespread_overdue_suppresses_trigger_advice
+FROM adaptive_autovacuum.table_recommendations
+WHERE relation_name = 'public.aav_wide';
+COMMIT;
+DROP TABLE aav_wide;
+-- The dropped table's recommendation goes with it at the next check.
+DO $$
+BEGIN
+    PERFORM adaptive_autovacuum._run_cycle(0, 1, 0, 0);
+END
+$$;
+SELECT count(*) = 0 AS dropped_table_recommendation_pruned
+FROM adaptive_autovacuum.table_recommendations;
 
 SELECT bool_and(relpersistence = 'u') AS audit_tables_unlogged
 FROM pg_class
@@ -791,17 +998,20 @@ WHERE oid IN ('adaptive_autovacuum.policy'::regclass,
               'adaptive_autovacuum.controller_state'::regclass);
 
 /* Operator API: fixed check set, valid vocabulary, preload check agrees with shared memory. */
-SELECT count(*) = 18 AS doctor_check_count,
+SELECT count(*) = 19 AS doctor_check_count,
        bool_and(status IN ('OK', 'WARN', 'FAIL', 'RESTART_REQUIRED')) AS doctor_statuses_valid,
        bool_and(detail IS NOT NULL) AS doctor_details_present
 FROM adaptive_autovacuum.doctor();
+
+SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'table_recommendations') = 'OK'
+       AS doctor_no_open_recommendations;
 
 SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'library_preloaded')
        = CASE WHEN (SELECT available FROM adaptive_autovacuum.controller_status())
               THEN 'OK' ELSE 'FAIL' END AS preload_check_matches_shared_memory;
 
-SELECT extension_version = '1.2.0' AS status_version,
-       available_version = '1.2.0' AS status_available_version,
+SELECT extension_version = '1.3.0' AS status_version,
+       available_version = '1.3.0' AS status_available_version,
        library_preloaded = (SELECT available FROM adaptive_autovacuum.controller_status()) AS status_preload_matches,
        launcher_running IS NOT NULL AS status_launcher_known,
        controller_running IS NOT NULL AS status_controller_known,
@@ -809,6 +1019,7 @@ SELECT extension_version = '1.2.0' AS status_version,
        NOT is_control_database AS regression_database_is_not_the_control_database,
        cluster_generation > 0 AS status_generation_counts,
        managed_databases >= 1 AS status_sees_managed_databases,
+       open_table_recommendations = 0 AS status_no_open_recommendations,
        wraparound_status IN ('ok', 'watch', 'alarm') AS status_wraparound_known
 FROM adaptive_autovacuum.status();
 
@@ -837,6 +1048,9 @@ SELECT adaptive_autovacuum._version_key('1.0.0') < adaptive_autovacuum._version_
 
 DROP TABLE aav_healthy;
 DROP TABLE aav_overdue;
+DROP TABLE aav_rec;
+DROP TABLE aav_tight;
+DROP TABLE aav_wq_1, aav_wq_2, aav_wq_3, aav_wq_4, aav_wq_5, aav_wq_6, aav_wq_7, aav_wq_8;
 DROP TABLE aav_no_stats;
 DROP TABLE aav_test;
 DROP EXTENSION adaptive_autovacuum;
