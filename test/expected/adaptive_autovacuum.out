@@ -993,8 +993,8 @@ SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'libr
        = CASE WHEN (SELECT available FROM adaptive_autovacuum.controller_status())
               THEN 'OK' ELSE 'FAIL' END AS preload_check_matches_shared_memory;
 t
-SELECT extension_version = '1.3.0' AS status_version,
-       available_version = '1.3.0' AS status_available_version,
+SELECT extension_version = '1.3.1' AS status_version,
+       available_version = '1.3.1' AS status_available_version,
        library_preloaded = (SELECT available FROM adaptive_autovacuum.controller_status()) AS status_preload_matches,
        launcher_running IS NOT NULL AS status_launcher_known,
        controller_running IS NOT NULL AS status_controller_known,

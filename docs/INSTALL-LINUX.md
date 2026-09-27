@@ -53,10 +53,10 @@ Detected PostgreSQL:
   Preload now:      ''
 
 Plan:
-  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.3.0)
+  Extension files:  /usr/pgsql-18/lib/adaptive_autovacuum.so, /usr/pgsql-18/share/extension (1.3.1)
   Preload change:   '' -> 'adaptive_autovacuum'
   Restart:          yes (postgresql-18.service)
-  Control database: postgres: CREATE EXTENSION adaptive_autovacuum (version 1.3.0)
+  Control database: postgres: CREATE EXTENSION adaptive_autovacuum (version 1.3.1)
   Enable controller: yes (adaptive_autovacuum.enabled = on, track_cost_delay_timing = on)
 
 Continue? [Y/n]
@@ -126,8 +126,8 @@ Log: `/var/log/adaptive-autovacuum/setup.log`.
 ## Package manager only
 
 ```bash
-sudo dnf install ./adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm   # .el10. on EL10; postgresql17-... for PostgreSQL 17
-sudo apt-get install ./adaptive-autovacuum-setup_1.3.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb   # _debian13_ on Debian 13
+sudo dnf install ./adaptive-autovacuum-setup-1.3.1-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.1-1.el9.x86_64.rpm   # .el10. on EL10; postgresql17-... for PostgreSQL 17
+sudo apt-get install ./adaptive-autovacuum-setup_1.3.1-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.1-1_ubuntu24.04_amd64.deb   # _debian13_ on Debian 13
 sudo adaptive-autovacuum-setup install
 ```
 

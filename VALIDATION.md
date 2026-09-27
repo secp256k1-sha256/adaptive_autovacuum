@@ -1379,3 +1379,94 @@ loose tables): repair applied 28 ms after the reload (one row); naptime 60 -> 30
 switch-on (pair 200 / 50 -> 400 / 25 -> 1600 / 6.25 ms); the burst opened trigger recommendations for both loose
 tables (one combined with a cost boost in a single ALTER TABLE) which the operator applied live; decay to 640 / 25 ms
 and naptime 20 s by the end of the run; zero log errors. Chart: `C:\cld\aav_results\aav_121_wsl_pg18.png`.
+
+### Release v1.3.0 (2026-09-26)
+
+Commit `d181b1c`, tag `v1.3.0`. `test.yml` green on main and on the tag; `release.yml` green in 12 minutes: 55 jobs
+(version check, PG 17 and 18 extension tests, installer script tests, Windows module tests, 16 DEB builds for Ubuntu
+24.04 / 26.04 and Debian 12 / 13 on amd64 and arm64, 8 RPM builds for EL9 / EL10 on x86_64 and aarch64, their install
+jobs, two Windows zips) and 34 published assets with `release-manifest.json` and `SHA256SUMS`. Quick-install check on WSL
+Debian 13 / PG 18.6: the cluster was set back to the released 1.2.0 objects with a policy marker, then the published
+`install.sh --pg-major 18 --control-database postgres --yes` moved the packages 1.2.1-1 -> 1.3.0-1 and took the in-place
+`ALTER EXTENSION UPDATE` path: extension 1.3.0, marker kept, `table_recommendations` and
+`_repair_disabled_autovacuum()` present, `manage_naptime` true, 19 doctor checks with only `last_sweep` WARN in the
+first minute, controller running; the shipped scripts are `--1.2.0.sql`, `--1.3.0.sql`, `--1.2.0--1.3.0.sql`.
+
+### 1.3.1 (2026-09-26): Windows installer prompt
+
+The published 1.3.0 `install.ps1` failed at the interactive confirmation on a Windows 11 host
+(`ERROR: The variable '$major?' cannot be retrieved because it has not been set.`): inside the double-quoted prompt
+PowerShell reads `$major?` as a variable named `major?`, which `Set-StrictMode -Version Latest` rejects; `-Yes` and
+`-Check` never reach that line, which is why the Pester and live installer tests passed. Fixed as `${major}?`; a Pester
+test now scans the PowerShell sources for `$name?` interpolations. 1.3.1 ships the 1.3.0 SQL unchanged (`--1.3.0.sql`
+and `--1.2.0--1.3.0.sql` frozen, `--1.3.1.sql` and `--1.2.0--1.3.1.sql` assembled, comment-only `--1.3.0--1.3.1.sql`);
+the upgrade test covers 1.2.0 -> 1.3.1 directly and 1.3.0 -> 1.3.1.
+
+## Validation performed 2026-09-26/27 (1.3.1: full platform matrix)
+
+Package builds from the working tree and live installs with `install.sh` / `install.ps1` against a local manifest, then
+`doctor` and the live installer suites, on WSL Debian 13 (DEB, upgrade 1.3.0 -> 1.3.1 in place), Ubuntu 24.04 (fresh WSL
+distribution, PGDG added by the test, DEB), AlmaLinux 9 (EL9 RPMs for PG 18 and 17; the PG 18 cluster was set back to the
+released 1.2.0 objects first and `install.sh` planned and ran `ALTER EXTENSION UPDATE (1.2.0 -> 1.3.1)` with the policy
+marker kept; PG 17 via the helper), AlmaLinux 10 (EL10 RPM, DROP + CREATE from the never-released 1.2.1 objects) and
+Windows 11 (zip + `install.ps1` into `postgres` on the local PG 18 service, controller running, duplicate detection,
+idempotent rerun, Pester live suite). Linux live bats 7/7 on every flavor (EL9 rerun cleanly after the shared-network
+port clash below), removal keeps the database objects, PG 17 DEBs built on Debian and Ubuntu.
+
+Regression suite (`adaptive_autovacuum` + `upgrade`, two passes, on demand and preloaded) green on PG 18.6 and 17.11 on
+Debian 13, Ubuntu 24.04, AlmaLinux 9, AlmaLinux 10, Rocky Linux 9.8 and Rocky Linux 10.2 (Rocky imported from the
+official WSL images), and on Windows PG 18.4. A Windows PG 17.6 scratch cluster with its own MSVC DLL came up only at
+the end of the run (a first attempt had silently reused the PG 18 paths and DLL); see the Windows addendum for what ran on it.
+
+The user's two-phase pgbench drill (`Downloads\pgbenchdrill_1.sql` method: 100 x 100K-row tables with threshold 1000,
+5 hot and 2 loose tables, autovacuum and controller off during a 120 s pgbench build, then only the controller switched
+on; operator applies recommendations open for 30 s; hot + loose burst at +240 s) on every flavor for PG 18 and PG 17,
+several drills sharing the 24 CPUs at a time (hence the spread in TPS and backlog size):
+
+| drill | build TPS | dead peak | repair | naptime | max_workers / running peak | pair peak | pair end | overdue cleared after | recs open / applied |
+|---|---|---|---|---|---|---|---|---|---|
+| debian13_pg18 | 92,117 | 3.99M | 0.0 s | 60 -> 5 | 16 / 12 | 2560/6.25 | 640/25 | 109 s | 4 / 4 |
+| debian13_pg17 | 94,995 | 4.10M | 0.0 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 155 s | 4 / 2 |
+| ubuntu24_pg18 | 408 | 0.05M | 0.2 s | 60 -> 5 | 16 / 16 | 1600/6.25 | 400/25 | 137 s | 2 / 2 |
+| ubuntu24_pg17 | 1,317 | 0.15M | 0.1 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 131 s | 7 / 7 |
+| almalinux9_pg18 | 698 | 0.08M | 0.8 s | 60 -> 5 | 16 / 16 | 1600/6.25 | 200/50 | 138 s | 2 / 2 |
+| almalinux9_pg17 | 1,346 | 0.16M | 0.1 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 163 s | 7 / 7 |
+| almalinux10_pg18 | 421 | 0.05M | 0.2 s | 60 -> 5 | 16 / 16 | 1600/6.25 | 400/25 | 136 s | 2 / 2 |
+| almalinux10_pg17 | 804 | 0.10M | 0.2 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 172 s | 2 / 2 |
+| rocky9_pg18 | 687 | 0.08M | 0.4 s | 60 -> 5 | 16 / 16 | 1600/6.25 | 200/50 | 138 s | 2 / 2 |
+| rocky9_pg17 | 1,362 | 0.16M | 0.1 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 166 s | 7 / 6 |
+| rocky10_pg18 | 951 | 0.11M | 0.3 s | 60 -> 5 | 16 / 13 | 1600/6.25 | 200/50 | 115 s | 7 / 2 |
+| rocky10_pg17 | 3,382 | 0.36M | 0.1 s | 60 -> 7 | 1 / 1 | 2560/6.25 | 640/25 | 124 s | 2 / 2 |
+
+Reading: `autovacuum = off` is repaired within a second of the reload on every platform; the launcher interval ramps
+60 -> 30 -> 15 -> 7 -> 5 s (integer halving, floor 5); on PG 18 the pool grows to 16 and 12 to 16 workers actually run,
+on PG 17 `autovacuum_max_workers` is restart-only so one worker carries the backlog and the naptime ramp plus the cost
+pair (2560 / 6.25 ms) still clear it in two to three minutes; on PG 17 the hot tables also receive trigger
+recommendations (no cluster `autovacuum_vacuum_max_threshold` exists there), so 7 recommendations open and are applied
+live; the pair and naptime decay toward the baseline once the backlog is gone. Server logs: no errors beyond the expected
+shutdown messages and single "canceling autovacuum task" lines when the operator's `ALTER TABLE` met a running vacuum.
+Charts: `C:\cldav_resultsav_121_<flavor>_pg<major>.png`, summary via `C:\cldav_matrix_summary.py`.
+
+Test-harness findings (not extension defects): all WSL2 distributions share one network namespace, so clusters in
+different distributions collide on ports (AlmaLinux 10's package-test cluster on 5432 blocked AlmaLinux 9's service;
+Ubuntu's new cluster landed on 5435); the regress/drill scripts take a per-distribution `PORTBASE`. Debian and Ubuntu
+mount `/tmp` as tmpfs, so a scratch instance is gone after the distribution idles. PG 17 has no
+`autovacuum_vacuum_max_threshold` reloption, so the drill sets it on PG 18 only. Scripts under execution must not be
+edited in place.
+
+### Windows addendum (2026-09-27)
+
+The user's drill as written (a 5-minute pgbench build, then the controller switched on for 5 minutes, no burst) on two
+scratch clusters of the local PG 18.4 and PG 17.6 installations (port 55433 and 54321; PG 17 needed its own MSVC DLL and
+the extension files in the real share directory, since PG 17 has no `extension_control_path`). Three earlier Windows
+attempts were harness failures, not controller ones: a hand-edited script header mangled by escaping, a PG 17 port that
+collided with a dead socket left by the first hung run, and a "PG 17" DLL that was the PG 18 build.
+
+| drill | build TPS | dead tuples at switch-on | repair | naptime | workers running peak | pair peak | overdue cleared |
+|---|---|---|---|---|---|---|---|
+| win_pg18 | 10,461 | 1.39M | 0.3 s | 60 -> 30 -> 7 -> 5 s | 16 of 16 | 2560 / 6.25 ms | 189 s; decay to 1280 / 12.5 ms and naptime 10 s began inside the window |
+| win_pg17 | 9,319 | 1.29M | 2.7 s | 60 -> 30 -> 7 s | 1 (restart-only GUC) | 2560 / 6.25 ms | still draining at ~1,500 tuples/s when the 5-minute window closed (112K left of 450K on the worker tables) |
+
+Two cost-boost recommendations opened, were applied and (PG 18) reverted after the recovery on both; zero server-log
+errors. The Windows PG 17 regression suite did not get a valid run in this round (the scratch cluster was only correct
+at the end and the user closed the round); PG 17 is covered by the six Linux flavors.

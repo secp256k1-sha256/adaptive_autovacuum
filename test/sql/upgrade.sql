@@ -2,7 +2,7 @@
 \pset tuples_only on
 SET client_min_messages = warning;
 
-/* Upgrade path 1.2.0 -> 1.3.0: operator values survive, table settings become recommendations, 1.2.0-set options are logged. */
+/* Upgrade path 1.2.0 -> 1.3.1 (direct script): operator values survive, table settings become recommendations, 1.2.0-set options are logged. */
 CREATE EXTENSION adaptive_autovacuum VERSION '1.2.0';
 
 SELECT extversion FROM pg_extension WHERE extname = 'adaptive_autovacuum';
@@ -90,4 +90,11 @@ SELECT open_table_recommendations IS NOT NULL AS status_has_recommendation_count
 FROM adaptive_autovacuum.status();
 
 DROP TABLE aav_legacy;
+DROP EXTENSION adaptive_autovacuum;
+
+/* 1.3.0 -> 1.3.1 is a comment-only step (installer fix); the objects are already current. */
+CREATE EXTENSION adaptive_autovacuum VERSION '1.3.0';
+ALTER EXTENSION adaptive_autovacuum UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'adaptive_autovacuum';
+SELECT count(*) = 19 AS doctor_after_point_upgrade FROM adaptive_autovacuum.doctor();
 DROP EXTENSION adaptive_autovacuum;

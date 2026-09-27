@@ -1,3 +1,10 @@
+postgresql-@PGMAJOR@-adaptive-autovacuum (1.3.1-1) unstable; urgency=medium
+
+  * Windows install.ps1: the interactive confirmation prompt failed under strict mode
+    ("$major?" parsed as a variable); no extension changes, upgrade script 1.3.0 -> 1.3.1.
+
+ -- adaptive_autovacuum maintainers <noreply@github.com>  Sat, 26 Sep 2026 16:00:00 +0000
+
 postgresql-@PGMAJOR@-adaptive-autovacuum (1.3.0-1) unstable; urgency=medium
 
   * Packages for Debian 12/13 and EL10 (RHEL/Rocky/AlmaLinux 10); upgrade script 1.2.0 -> 1.3.0.

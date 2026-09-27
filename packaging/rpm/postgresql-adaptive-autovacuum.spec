@@ -8,7 +8,7 @@
 %global __brp_check_rpaths %{nil}
 
 Name:           postgresql%{pgmajor}-adaptive-autovacuum
-Version:        1.3.0
+Version:        1.3.1
 Release:        1%{?dist}
 Summary:        Adaptive autovacuum controller extension for PostgreSQL %{pgmajor}
 License:        PostgreSQL
@@ -86,6 +86,9 @@ if [ "$1" -eq 0 ]; then
 fi
 
 %changelog
+* Sat Sep 26 2026 adaptive_autovacuum maintainers - 1.3.1-1
+- Windows install.ps1: interactive confirmation prompt failed under strict mode; no extension changes.
+
 * Sat Sep 26 2026 adaptive_autovacuum maintainers - 1.3.0-1
 - Table settings recommended, never written; autovacuum = off repaired before the sweep; autovacuum_naptime managed;
   worker raises easier; packages for Debian 12/13 and EL10; upgrade script 1.2.0 -> 1.3.0

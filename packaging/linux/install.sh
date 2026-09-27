@@ -10,7 +10,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.3.0"
+readonly INSTALLER_VERSION="1.3.1"
 readonly REPO="${AAV_REPO:-secp256k1-sha256/adaptive_autovacuum}"
 readonly RELEASE_BASE="https://github.com/$REPO/releases"
 # Hosts a GitHub release download may legitimately redirect to.

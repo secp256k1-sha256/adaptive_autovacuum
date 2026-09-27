@@ -122,9 +122,9 @@ The [Quick install](#-quick-install) scripts are the simplest path. For manual o
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup_1.3.0-1_all.deb
-curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb
-sudo apt-get install ./adaptive-autovacuum-setup_1.3.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.0-1_ubuntu24.04_amd64.deb
+curl -fsSLO $U/adaptive-autovacuum-setup_1.3.1-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.3.1-1_ubuntu24.04_amd64.deb
+sudo apt-get install ./adaptive-autovacuum-setup_1.3.1-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.1-1_ubuntu24.04_amd64.deb
 sudo adaptive-autovacuum-setup install
 ```
 
@@ -135,9 +135,9 @@ sudo adaptive-autovacuum-setup install
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm
-curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm
-sudo dnf install ./adaptive-autovacuum-setup-1.3.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.0-1.el9.x86_64.rpm
+curl -fsSLO $U/adaptive-autovacuum-setup-1.3.1-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.3.1-1.el9.x86_64.rpm
+sudo dnf install ./adaptive-autovacuum-setup-1.3.1-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.1-1.el9.x86_64.rpm
 sudo adaptive-autovacuum-setup install
 ```
 
@@ -148,7 +148,7 @@ sudo adaptive-autovacuum-setup install
 
 ```powershell
 $U = 'https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download'
-Invoke-WebRequest "$U/adaptive_autovacuum-1.3.0-pg18-windows-x64.zip" -OutFile aav.zip
+Invoke-WebRequest "$U/adaptive_autovacuum-1.3.1-pg18-windows-x64.zip" -OutFile aav.zip
 Expand-Archive aav.zip -DestinationPath aav
 .\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Credential (Get-Credential postgres)
 ```
@@ -173,7 +173,7 @@ windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 
 `packaging\windows\build-zip.ps1 -PgMajor 18` packages a Windows build. For manual activation, append the library to `shared_preload_libraries`, restart, then run `CREATE EXTENSION adaptive_autovacuum;` **once in the control database**. Set any explicit `off` settings to `on` if you want automation.
 
-The current `sql/adaptive_autovacuum--1.3.0.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
+The current `sql/adaptive_autovacuum--1.3.1.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
 
 </details>
 
@@ -332,7 +332,7 @@ Upgrade the package/files for your PostgreSQL major, restart when replacing the 
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 ```
 
-**1.2.0 → 1.3.0** upgrades in place. Table options that 1.2.0 set automatically stay as they are (they are tighter triggers); `actions` lists each as `legacy_table_settings` with the SQL that restores the previous values. From 1.3.0 the extension only recommends table settings.
+**1.2.0 → 1.3.1** and **1.3.0 → 1.3.1** upgrade in place (1.3.1 changes the Windows installer only). Table options that 1.2.0 set automatically stay as they are (they are tighter triggers); `actions` lists each as `legacy_table_settings` with the SQL that restores the previous values. From 1.3.0 the extension only recommends table settings.
 
 **⚠️ Beta migration:** 1.1.0 → 1.2.0 has no in-place upgrade path because it moves from per-database copies to a single cluster control plane. The installer plans a confirmed drop/recreate in the control database. Review 1.1.0's `changed_tables` and `global_apply_queue.old_value` first, and reapply your policy changes afterwards. Remove stale 1.1.0 copies from other databases separately; `doctor()` reports them.
 

@@ -1,6 +1,6 @@
-\echo Use "ALTER EXTENSION adaptive_autovacuum UPDATE TO '1.3.0'" to load this file. \quit
+\echo Use "ALTER EXTENSION adaptive_autovacuum UPDATE TO '1.3.1'" to load this file. \quit
 
-/* 1.2.0 -> 1.3.0: Debian 12/13 and EL10 packages; vacuum_activity_detail per-second keys become true deltas;
+/* 1.2.0 -> 1.3.1 (same SQL as 1.3.0): Debian 12/13 and EL10 packages; vacuum_activity_detail per-second keys become true deltas;
    autovacuum = off is repaired before the sweep; table settings are recommended (table_recommendations), never written;
    autovacuum_naptime is managed and worker raises need only an overdue queue longer than the pool.
    assemble.sh appends parts 02-04 with CREATE OR REPLACE, so every function and view below is rebuilt. */

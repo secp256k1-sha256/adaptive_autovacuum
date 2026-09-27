@@ -93,6 +93,7 @@ jobs:
             1.3.0: table settings are recommended, never written (`table_recommendations` with ready-to-run SQL);
             `autovacuum = off` is repaired before the sweep; every table is scored (`min_table_bytes` 0);
             `autovacuum_naptime` is ramped down while the worker pool is under-filled and worker raises are easier.
+            1.3.1: Windows `install.ps1` interactive confirmation fixed (use `-Yes` on 1.3.0); no extension changes.
             No upgrade path from 1.1.0: the installer re-creates the extension (policy and history of the old copy are deleted).
 
             Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.

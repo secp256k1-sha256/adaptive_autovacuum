@@ -16,3 +16,5 @@ log/
 tmp_check/
 dist/
 test/results_*/
+windows_pg17/
+windows_pg18/

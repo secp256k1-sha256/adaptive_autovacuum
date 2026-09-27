@@ -106,3 +106,21 @@ Describe 'Get-AavCandidates (host integration, read-only)' {
         @($c | Where-Object { $_.data_directory }) | Group-Object { $_.data_directory.ToLowerInvariant() } | Where-Object Count -gt 1 | Should -BeNullOrEmpty
     }
 }
+
+Describe 'PowerShell source hygiene' {
+    It 'never interpolates $name? or $name: inside double-quoted strings (strict mode reads them as variable names)' {
+        $root = Join-Path $PSScriptRoot '..\..\packaging\windows'
+        $hits = foreach ($f in Get-ChildItem $root -Include *.ps1, *.psm1 -Recurse) {
+            $n = 0
+            foreach ($line in Get-Content $f.FullName) {
+                $n++
+                # $env:, $script:, $global:, $using: and ${...} are legitimate; anything else followed by ? or : is a bug.
+                if ($line -match '\$(?!env:|script:|global:|using:|local:|private:|\{)[A-Za-z_][A-Za-z0-9_]*[?]' -or
+                    $line -match '"[^"]*\$(?!env:|script:|global:|using:|local:|private:|\{)[A-Za-z_][A-Za-z0-9_]*:[^\/"][^"]*"') {
+                    "$($f.Name):${n}: $($line.Trim())"
+                }
+            }
+        }
+        $hits | Should -BeNullOrEmpty
+    }
+}

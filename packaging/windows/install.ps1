@@ -53,7 +53,7 @@ $ErrorActionPreference = 'Stop'
 # Any unexpected error is an installation failure with a defined exit code, never a silent exit 0.
 trap { Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 8 }
 
-$InstallerVersion = '1.3.0'
+$InstallerVersion = '1.3.1'
 $Repo = if ($env:AAV_REPO) { $env:AAV_REPO } else { 'secp256k1-sha256/adaptive_autovacuum' }
 $ReleaseBase = "https://github.com/$Repo/releases"
 $AllowedHosts = @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
@@ -160,7 +160,7 @@ try {
     if ($Check) { & $setup check @fwd; exit $LASTEXITCODE }
     if (-not $Yes -and -not $DryRun) {
         if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
-            $a = Read-Host "Install the package and configure PostgreSQL $major? [Y/n]"
+            $a = Read-Host "Install the package and configure PostgreSQL ${major}? [Y/n]"
             if (-not ([string]::IsNullOrWhiteSpace($a) -or $a -match '^[Yy]')) { Fail $Ex.Args 'cancelled' }
         } else { Fail $Ex.Args 'non-interactive session: pass -Yes to install' }
     }
