@@ -88,7 +88,7 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 
 ## ⚙️ How it decides
 
-One controller in the **control database** (`postgres` by default) discovers all eligible databases and scans them in sweep generations. Up to two database workers run concurrently by default. The controller collects central state, makes one global decision and applies all queued settings in one `ALTER SYSTEM` step per complete sweep. It sleeps for 60 seconds after a sweep; the revisit interval also includes scan time.
+One controller in the **control database** (`postgres` by default) discovers all eligible databases and scans them in sweep generations. Up to two database workers run concurrently by default. The controller collects central state, makes one global decision and applies all queued settings in one `ALTER SYSTEM` step per complete sweep. It sleeps for 60 seconds after a sweep.
 
 | Decision | Evidence and limits |
 |---|---|
@@ -332,23 +332,6 @@ Upgrade the package/files for your PostgreSQL major, restart when replacing the 
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 ```
 
-**1.2.0 → 1.3.1** and **1.3.0 → 1.3.1** upgrade in place (1.3.1 changes the Windows installer only). Table options that 1.2.0 set automatically stay as they are (they are tighter triggers); `actions` lists each as `legacy_table_settings` with the SQL that restores the previous values. From 1.3.0 the extension only recommends table settings.
-
-**⚠️ Beta migration:** 1.1.0 → 1.2.0 has no in-place upgrade path because it moves from per-database copies to a single cluster control plane. The installer plans a confirmed drop/recreate in the control database. Review 1.1.0's `changed_tables` and `global_apply_queue.old_value` first, and reapply your policy changes afterwards. Remove stale 1.1.0 copies from other databases separately; `doctor()` reports them.
-
-Before removal, restore any settings you do not want to keep, disable the controller and coordinate outstanding maintenance. On Linux:
-
-```bash
-sudo adaptive-autovacuum-setup remove-preload
-```
-
-Restart before removing packages. To remove SQL objects in the control database:
-
-```sql
-DROP EXTENSION adaptive_autovacuum;
-```
-
-**Dropping the extension does not reverse existing global or table changes** and discards its record of owned table options. Restore them first. See platform setup guides for complete removal.
 
 ## 🧪 Testing and documentation
 
