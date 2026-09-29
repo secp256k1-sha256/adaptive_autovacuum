@@ -9,8 +9,7 @@
 [![Status](https://img.shields.io/badge/Status-Beta-orange)](VALIDATION.md)
 [![Language](https://img.shields.io/badge/C%20%2B%20PL%2FpgSQL-555555)](src/)
 
-> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and ~20,000 TPS pgbench workloads. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
-
+> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and pgbench workloads. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
 
 
 ## ⚡ Quick install
