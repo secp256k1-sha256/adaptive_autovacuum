@@ -50,7 +50,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-/* PG17 floor (dead_tuple_bytes columns); PG18-only surface degrades gracefully. */
+/* PG17 floor (dead_tuple_bytes columns); PG18/19-only surface degrades gracefully. */
 #if PG_VERSION_NUM < 170000
 #error "adaptive_autovacuum requires PostgreSQL 17 or later"
 #endif
@@ -1385,6 +1385,10 @@ aav_start_database_worker(Oid dboid, const char *dbname,
              "adaptive autovacuum database worker");
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
                        BGWORKER_BACKEND_DATABASE_CONNECTION;
+#ifdef BGWORKER_INTERRUPTIBLE
+    /* PG19+: let DROP/ALTER DATABASE end the worker instead of waiting on it. */
+    worker.bgw_flags |= BGWORKER_INTERRUPTIBLE;
+#endif
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = BGW_NEVER_RESTART;
     snprintf(worker.bgw_library_name, MAXPGPATH, "adaptive_autovacuum");
@@ -2214,6 +2218,10 @@ aav_start_emergency_worker(const AAVEmergencyRequest *request, const char *dbnam
              "adaptive autovacuum emergency worker");
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
                        BGWORKER_BACKEND_DATABASE_CONNECTION;
+#ifdef BGWORKER_INTERRUPTIBLE
+    /* PG19+: a dropped database must not wait for the emergency vacuum. */
+    worker.bgw_flags |= BGWORKER_INTERRUPTIBLE;
+#endif
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = BGW_NEVER_RESTART;
     snprintf(worker.bgw_library_name, MAXPGPATH, "adaptive_autovacuum");
@@ -2492,14 +2500,21 @@ aav_run_emergency_vacuum(const AAVEmergencyRequest *request)
     params.multixact_freeze_min_age = 0;
     params.multixact_freeze_table_age = 0;
     params.is_wraparound = request->is_wraparound;
+#if PG_VERSION_NUM >= 190000
+    /* PG19 split the logging threshold per command. */
+    params.log_vacuum_min_duration = 0;
+    params.log_analyze_min_duration = 0;
+#else
     params.log_min_duration = 0;
+#endif
     params.index_cleanup = VACOPTVALUE_DISABLED;
     params.truncate = VACOPTVALUE_DISABLED;
     params.toast_parent = InvalidOid;
 #if PG_VERSION_NUM >= 180000
     params.max_eager_freeze_failure_rate = vacuum_max_eager_freeze_failure_rate;
 #endif
-    params.nworkers = 0;
+    /* No parallel vacuum: index cleanup is off, so there is nothing to parallelize. */
+    params.nworkers = -1;
 
     vac_context = AllocSetContextCreate(TopMemoryContext,
                                         "adaptive autovacuum emergency vacuum",

@@ -336,9 +336,13 @@ BEGIN
                 pv.dead_tuple_bytes,
                 /* PG18+ column; NULL on PG17 via the jsonb detour. */
                 ((to_jsonb(pv) ->> 'delay_time'))::double precision AS delay_time,
+                /* PG19+ columns (mode, started_by); NULL before, so the activity heuristics stay the fallback. */
+                (to_jsonb(pv) ->> 'mode') AS vacuum_mode,
                 clock_timestamp() - a.query_start AS vacuum_elapsed,
-                a.query LIKE '%(to prevent wraparound)' AS antiwraparound,
-                a.backend_type = 'autovacuum worker' AS is_autovacuum
+                COALESCE((to_jsonb(pv) ->> 'started_by') = 'autovacuum_wraparound',
+                         a.query LIKE '%(to prevent wraparound)') AS antiwraparound,
+                COALESCE((to_jsonb(pv) ->> 'started_by') <> 'manual',
+                         a.backend_type = 'autovacuum worker') AS is_autovacuum
             FROM pg_stat_progress_vacuum pv
             JOIN pg_stat_activity a ON a.pid = pv.pid
             WHERE pv.datid = (SELECT d.oid
@@ -406,6 +410,7 @@ BEGIN
             av.max_dead_tuple_bytes,
             av.dead_tuple_bytes,
             av.delay_time,
+            av.vacuum_mode,
             av.vacuum_elapsed,
             av.antiwraparound,
             av.is_autovacuum,
@@ -569,16 +574,17 @@ BEGIN
         pv_vacuum_stalled_cycles := COALESCE(r.prev_vacuum_stalled_cycles, 0);
         pv_last_action := r.prev_last_action;
 
-        /* Progress fingerprint; unchanged across samples of the same backend = stuck. */
+        /* Progress fingerprint; unchanged across samples of the same backend = stuck. A mode switch (PG19) is progress. */
         IF r.vacuum_pid IS NOT NULL THEN
-            cur_vacuum_progress := format('%s|%s|%s|%s|%s|%s|%s',
+            cur_vacuum_progress := format('%s|%s|%s|%s|%s|%s|%s|%s',
                                           COALESCE(r.phase, '?'),
                                           COALESCE(r.heap_blks_total, -1),
                                           COALESCE(r.heap_blks_scanned, -1),
                                           COALESCE(r.heap_blks_vacuumed, -1),
                                           COALESCE(r.indexes_processed, -1),
                                           COALESCE(r.index_vacuum_count, -1),
-                                          COALESCE(r.dead_tuple_bytes, -1));
+                                          COALESCE(r.dead_tuple_bytes, -1),
+                                          COALESCE(r.vacuum_mode, '-'));
             IF pv_last_vacuum_pid IS NOT DISTINCT FROM r.vacuum_pid
                AND pv_last_vacuum_progress IS NOT DISTINCT FROM cur_vacuum_progress THEN
                 vacuum_stalled_cycles := pv_vacuum_stalled_cycles + 1;
@@ -595,7 +601,9 @@ BEGIN
                                AND horizon_age >= stall_xid_age;
 
         /* Takeover needs stall-line age + minimum runtime + N frozen samples; age alone never cancels. */
+        /* A failsafe-mode vacuum (reported by PG19) already runs the profile we would use; never replace it. */
         emergency_takeover := av_wraparound_running
+            AND COALESCE(r.vacuum_mode, '') <> 'failsafe'
             AND av_elapsed_seconds >= p.emergency_takeover_min_runtime_seconds
             AND vacuum_stalled_cycles >= p.emergency_takeover_stall_samples
             AND (r.mxid_age >= stall_mxid_age
@@ -864,6 +872,7 @@ BEGIN
                 'max_dead_tuple_bytes', r.max_dead_tuple_bytes,
                 'dead_tuple_bytes', r.dead_tuple_bytes,
                 'delay_time_ms', r.delay_time,
+                'vacuum_mode', r.vacuum_mode,
                 'antiwraparound', r.antiwraparound,
                 'vacuum_stalled_cycles', vacuum_stalled_cycles
             );

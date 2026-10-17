@@ -2,14 +2,14 @@
 
 ### PostgreSQL autovacuum that tunes itself.
 
-**For PostgreSQL 17 & 18 · Full feature set on PostgreSQL 18**
+**For PostgreSQL 17 & 18 · Full feature set on PostgreSQL 18 · PostgreSQL 19 compatible (tested on 19 RC1; packages follow the 19 GA release)**
 
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018%20%7C%2019-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/License-PostgreSQL-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Beta-orange)](VALIDATION.md)
 [![Language](https://img.shields.io/badge/C%20%2B%20PL%2FpgSQL-555555)](src/)
 
-> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and pgbench workloads. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
+> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and pgbench workloads. The source builds and passes the regression suite on PostgreSQL 19 RC1 (Linux); 19 packages are published once PostgreSQL 19 is released. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
 
 
 ## ⚡ Quick install
@@ -316,6 +316,7 @@ UPDATE adaptive_autovacuum.policy SET emergency_vacuum_enabled = false;
 |---|---|
 | PostgreSQL 17 / 18 | Both support cost tuning, triggers, missing-statistics repair and emergency protection. Binaries are major-specific. |
 | PostgreSQL 18 | Adds reloadable worker increases, maximum vacuum thresholds, delay timing and emergency eager-freeze tuning. PG17 worker increases are advice-only. |
+| PostgreSQL 19 | Source-compatible (built and regression-tested on 19 RC1; packages at GA). Uses the new vacuum initiator and mode from `pg_stat_progress_vacuum`: user-started vacuums are recognised directly and a failsafe-mode vacuum is never taken over. Database and emergency workers end immediately when their database is dropped. The native autovacuum score weights and `autovacuum_max_parallel_workers` are left to the operator; with parallel autovacuum enabled, index I/O done by parallel workers is not counted in `vacuum_read_mbps`/`vacuum_write_mbps`. |
 | Cluster scope | Install the extension in one control database. Global setting changes affect every database; exclusions prevent scanning and table recommendations. |
 | Standbys | Automation waits for a writable primary. Keep binaries and settings consistent through HA tooling. |
 | Config managers | Coordinate with Patroni/operators; setup rejects detected managed environments. |

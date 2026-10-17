@@ -2,8 +2,8 @@
 
 ## Completed in this package
 
-- Source is guarded for PostgreSQL 17 and later with `PG_VERSION_NUM` (full feature set on 18).
-- The C API use was checked against PostgreSQL 17 and 18 declarations for background workers, shared-memory hooks, `VacuumParams`, `makeVacuumRelation()`, and `vacuum()`.
+- Source is guarded for PostgreSQL 17 and later with `PG_VERSION_NUM` (full feature set on 18; builds and passes on 19 RC1).
+- The C API use was checked against PostgreSQL 17, 18 and 19 declarations for background workers, shared-memory hooks, `VacuumParams`, `makeVacuumRelation()`, and `vacuum()`.
 - SQL policy and C orchestration were reviewed for transaction boundaries, reversible reloption ownership, admission limits, stale request recovery, and emergency-worker cleanup.
 - The architecture DOCX was rendered to 14 page images and every page was visually inspected for clipping, overlap, table breakage, and missing text.
 - GitHub Actions runs a `postgres:[17, 18]` container matrix: compile, install, initdb, and `make installcheck` twice per major (once loaded on demand, once preloaded).
@@ -1470,3 +1470,46 @@ collided with a dead socket left by the first hung run, and a "PG 17" DLL that w
 Two cost-boost recommendations opened, were applied and (PG 18) reverted after the recovery on both; zero server-log
 errors. The Windows PG 17 regression suite did not get a valid run in this round (the scratch cluster was only correct
 at the end and the user closed the round); PG 17 is covered by the six Linux flavors.
+
+## Validation performed 2026-10-17 (1.3.2: PostgreSQL 19 compatibility, tested on 19 RC1)
+
+Scope: source compatibility only. Packages stay 17/18 until PostgreSQL 19 is released; the 19 packages, installer
+major lists and CI matrices follow at that point.
+
+What PostgreSQL 19 changed for this extension, checked against the `REL_19_STABLE` headers and the RC1 build:
+
+- `VacuumParams.log_min_duration` became `log_vacuum_min_duration` plus `log_analyze_min_duration`: the only compile
+  break (emergency vacuum). `vacuum()` still takes `const VacuumParams *`; `PG_STAT_TMP_DIR` is unchanged. The emergency
+  vacuum now sets `nworkers = -1` explicitly (index cleanup is off, nothing to parallelize).
+- Parallel autovacuum (`autovacuum_max_parallel_workers`, default 0) runs its index workers as ordinary `parallel
+  worker` backends and reports one `pg_stat_progress_vacuum` row per leader, so the worker counts
+  (`backend_type = 'autovacuum worker'`) and the takeover cancel (`pg_stat_progress_vacuum.pid`) were already correct.
+  Residual: parallel index I/O is attributed to `parallel worker` in `pg_stat_io`, so `vacuum_read_mbps` /
+  `vacuum_write_mbps` undercount when it is enabled. Documented, not compensated.
+- `pg_stat_progress_vacuum.started_by` (`manual`, `autovacuum`, `autovacuum_wraparound`) and `mode` (`normal`,
+  `aggressive`, `failsafe`) feed `antiwraparound` and `is_autovacuum` through the same `to_jsonb()` detour as
+  `delay_time` (NULL on 17/18, where the activity-string and backend-type heuristics remain). `mode` joins the stall
+  fingerprint (a mode switch counts as progress) and a `failsafe` vacuum is never taken over. `active_vacuums` gains
+  `started_by` and `mode` (appended last, so the 1.3.1 -> 1.3.2 upgrade rebuilds the view in place).
+- `BGWORKER_INTERRUPTIBLE` (new flag, `#ifdef`) on the database and emergency workers: a `DROP DATABASE` ends the
+  worker instead of waiting for it. The launcher and controller keep their flags.
+- Deliberately not done: the autovacuum score-weight settings and `autovacuum_max_parallel_workers` are not in the
+  managed-setting allow-list; no `pg_stat_autovacuum_scores` surface yet; `ShmemInitStruct()` kept (still supported).
+
+Environment: WSL AlmaLinux 9 (recreated), PGDG `postgresql17 17.11`, `postgresql18 18.6`, `postgresql19 19rc1`
+(`pgdg19-updates-testing`), gcc 11.5.
+
+| check | 17.11 | 18.6 | 19rc1 |
+|---|---|---|---|
+| build (`-Wall -Wextra`) | clean (3 pre-existing `-Wclobbered` notes) | same | same |
+| `adaptive_autovacuum` regression, pass 1 (on-demand load) / pass 2 (preloaded) | ok / ok | ok / ok | ok / ok |
+| `upgrade` regression (1.2.0 -> 1.3.1 -> 1.3.2 and 1.3.0 -> 1.3.1 -> 1.3.2, view columns present) | ok / ok | ok / ok | ok / ok |
+| false answers / unexpected errors in the result files | 0 / 0 | 0 / 0 | 0 / 0 |
+
+PG 19 live drill (preloaded, controller sweeping every 5 s, 1.5M-row table with two indexes): a throttled manual
+`VACUUM` shows `client backend | started_by=manual | mode=normal | antiwraparound=f | is_autovacuum=f`; a throttled
+autovacuum shows `autovacuum worker | autovacuum | normal | f | t`; the controller recorded the vacuum PID and the
+8-field fingerprint (`scanning heap|31042|30|0|0|0|0|normal`) with `vacuum_stalled_cycles = 0`; `doctor()` OK apart
+from the expected dry-run warnings; no server-log errors. Not exercised on 19: a failsafe-mode or wraparound-started
+vacuum (needs a near-wraparound cluster), a `DROP DATABASE` racing a database worker, and Windows (no EDB 19 RC
+installer exists).

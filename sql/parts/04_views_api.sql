@@ -165,8 +165,14 @@ SELECT
     progress.dead_tuple_bytes,
     /* PG18+ column, NULL on PG17 via the jsonb detour. */
     ((to_jsonb(progress) ->> 'delay_time'))::double precision AS delay_time,
-    activity.query LIKE '%(to prevent wraparound)' AS antiwraparound,
-    activity.backend_type = 'autovacuum worker' AS is_autovacuum
+    /* PG19 reports the initiator; the activity heuristics remain the fallback on 17/18. */
+    COALESCE((to_jsonb(progress) ->> 'started_by') = 'autovacuum_wraparound',
+             activity.query LIKE '%(to prevent wraparound)') AS antiwraparound,
+    COALESCE((to_jsonb(progress) ->> 'started_by') <> 'manual',
+             activity.backend_type = 'autovacuum worker') AS is_autovacuum,
+    /* PG19+ columns, NULL on PG17/18. */
+    (to_jsonb(progress) ->> 'started_by') AS started_by,
+    (to_jsonb(progress) ->> 'mode') AS mode
 FROM pg_stat_progress_vacuum progress
 JOIN pg_stat_activity activity ON activity.pid = progress.pid;
 
