@@ -12,6 +12,40 @@
 > **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and pgbench workloads. The source builds and passes the regression suite on PostgreSQL 19 RC1 (Linux); 19 packages are published once PostgreSQL 19 is released. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
 
 
+## 🎬 See it in action
+
+<p align="center">
+  <a href="aav_demo/AAV_DEMO_20261017.mp4" title="Open the full-quality MP4 (5 min)">
+    <img src="aav_demo/AAV_DEMO_20261017.gif" alt="The complete five-minute demo: PostgreSQL autovacuum tuning itself under a pgbench update storm, watched live from psql" width="900">
+  </a>
+</p>
+
+<p align="center">
+  <sub>The complete recording, start to finish, one frame per second. Click it for the full-quality MP4.</sub><br>
+  <strong><a href="aav_demo/AAV_DEMO_20261017.mp4">▶️ Full-quality MP4</a></strong> · <a href="aav_demo/README.md">run it yourself</a> · <a href="aav_demo/">browse the demo kit</a>
+</p>
+
+One Windows host, 100 update-heavy tables and an 8-client pgbench storm. One window loops the psql dashboard from the demo kit; the other switches the controller on and starts the load. The cluster starts deliberately hobbled: autovacuum off, a cost budget of `10 / 100ms` and a one-hour launcher interval.
+
+| | What happens | What to look at |
+|:--:|---|---|
+| 🧯 | **Repair first.** The controller turns `autovacuum` back on before it tunes anything. | `autovacuum` flips from `off` to `on` in the top table. |
+| 👷 | **Capacity next.** With 100 tables overdue and the pool saturated, the worker ceiling climbs 1 → 2 → 4 → 8 → 16 and the launcher interval drops from one hour to 5 s. | `workers` and `naptime` columns, and `av_running` filling up. |
+| 💰 | **Then the cost budget, one step at a time.** `10 / 100` → `200 / 50` → `400 / 25` → `800 / 12.5` → `1600 / 6.25` → `2560 / 6.25`; each raise must deliver more vacuum activity before the next is allowed. | `cost_pair` rows marked `held` are checks where nothing changed. |
+| 📉 | **The backlog turns.** Dead tuples peak near 470,000 with all 100 tables overdue, then `trend` moves from `growing` through `flat` to `shrinking`. | `dead_tuples`, `overdue`, `trend`, `read_mbps`, `write_mbps`. |
+
+| | Step | In the kit |
+|:--:|---|---|
+| 📦 | **Install** | `install.ps1`: the one-line Windows installer, verified download, restart and health check. |
+| 🌱 | **Seed** | `seed.sql`: 100 tables × 100,000 rows, with early-firing autovacuum thresholds so the demo fits in minutes. |
+| 🔥 | **Load** | `worker_load.sql` under `pgbench -c 8 -j 8 -T 180`: random single-row updates across all 100 tables. |
+| 👀 | **Watch** | `aav_watch.sql`: live autovacuum settings, running workers and the controller's last ten decisions, refreshed every five seconds. |
+| ♻️ | **Replay** | `reset_history.sql`: wipe the learned state and run it again from a clean slate. |
+
+<!-- GitHub cannot play a repository MP4 inline, so the GIF above is the whole recording at 1 fps. For a native player: open this README in GitHub's web editor, drag AAV_DEMO_20261017.mp4 into it, and replace the <p> block above with the generated github.com/user-attachments/assets/... URL on a line of its own. -->
+
+---
+
 ## ⚡ Quick install
 
 No compiler or manual file copying. Review the installer, then run it.
@@ -37,7 +71,7 @@ The installer selects the PostgreSQL cluster, verifies downloads, installs the e
 
 **🩺 Check health anytime:** `SELECT * FROM adaptive_autovacuum.doctor();` or `sudo adaptive-autovacuum-setup doctor` (Windows: `adaptive-autovacuum-setup.ps1 doctor`).
 
-[Packages & manual installation](#-installation) · [Monitoring](#-monitoring) · [Configuration](#-configuration)
+[Demo](#-see-it-in-action) · [Packages & manual installation](#-installation) · [Monitoring](#-monitoring) · [Configuration](#-configuration)
 
 ---
 
@@ -74,6 +108,7 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 
 ## 🧭 Contents
 
+- [🎬 See it in action](#-see-it-in-action)
 - [⚙️ How it decides](#️-how-it-decides)
 - [📦 Installation](#-installation)
 - [📈 Monitoring](#-monitoring)
@@ -351,6 +386,7 @@ make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 | [Installer security](docs/INSTALLER-SECURITY.md) | Verification, privileges and recovery. |
 | [Architecture](docs/ARCHITECTURE.md) | Controller, workers, SQL program and central state. |
 | [Validation](VALIDATION.md) | Test coverage and observed workload behavior. |
+| [Demo kit](aav_demo/README.md) | The five-minute recording (MP4 and GIF), seed and load scripts and the live psql dashboard used in it. |
 
 ## 📄 License
 
