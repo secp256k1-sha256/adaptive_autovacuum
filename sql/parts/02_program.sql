@@ -143,6 +143,7 @@ DECLARE
     applied boolean;
     action_name text;
     action_error text;
+    takeover_error text;
     state_needed boolean;
     emergency_work_mem_mb integer;
 
@@ -1022,9 +1023,27 @@ BEGIN
                 ELSE p.emergency_work_mem_min_mb
             END;
 
-            /* Takeover: cancel the stuck autovacuum (never a manual vacuum). */
+            /* Takeover: terminate the stuck autovacuum worker (never a manual vacuum) so it exits instead of only
+               abandoning this table. No timeout argument = no wait for the exit: the emergency request is queued
+               right away and competes for the relation lock as early as possible. SIGTERM is asynchronous, so the
+               replacement is not guaranteed to win the lock. A refused or failed signal is logged and recorded on
+               the decision; the request is still queued (its lock_timeout and retry gates bound the attempt). */
+            takeover_error := NULL;
             IF emergency_takeover THEN
-                PERFORM pg_catalog.pg_cancel_backend(r.vacuum_pid);
+                BEGIN
+                    IF NOT pg_catalog.pg_terminate_backend(r.vacuum_pid) THEN
+                        takeover_error := format('pg_terminate_backend(%s) returned false (the worker already exited or is not a PostgreSQL backend)',
+                                                 r.vacuum_pid);
+                    END IF;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        GET STACKED DIAGNOSTICS takeover_error = MESSAGE_TEXT;
+                        takeover_error := format('pg_terminate_backend(%s) failed: %s', r.vacuum_pid, takeover_error);
+                END;
+                IF takeover_error IS NOT NULL THEN
+                    RAISE WARNING 'adaptive autovacuum: emergency takeover of %: %; the emergency VACUUM is queued anyway',
+                                  r.fqname, takeover_error;
+                END IF;
             END IF;
 
             out_emergency := out_emergency || jsonb_build_object(
@@ -1046,7 +1065,7 @@ BEGIN
                 'action', CASE WHEN emergency_takeover THEN 'queue_emergency_takeover'
                                ELSE 'queue_emergency_vacuum' END,
                 'reason', reason, 'host_metrics', host_json, 'relation_metrics', relation_json,
-                'proposed_reloptions', NULL, 'applied', true, 'error', NULL);
+                'proposed_reloptions', NULL, 'applied', true, 'error', takeover_error);
         END IF;
 
         /* Persist only what a later cycle needs; rewrite on state change or hourly heartbeat. */

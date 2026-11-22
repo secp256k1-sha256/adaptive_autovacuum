@@ -1,6 +1,6 @@
 name: package-windows
 
-# Windows x64 ZIPs for PostgreSQL 17 and 18, built with MSVC against an EDB installation and exercised
+# Windows x64 ZIPs for PostgreSQL 17, 18 and 19, built with MSVC against an EDB installation and exercised
 # with install.ps1 (offline manifest) on the same runner.
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgmajor: [17, 18]
+        pgmajor: [17, 18, 19]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

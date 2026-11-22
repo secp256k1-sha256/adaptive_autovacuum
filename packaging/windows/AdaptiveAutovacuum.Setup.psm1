@@ -5,9 +5,9 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:SetupVersion = '1.3.1'
+$script:SetupVersion = '1.4.0'
 $script:ExtName = 'adaptive_autovacuum'
-$script:SupportedMajors = @(17, 18)
+$script:SupportedMajors = @(17, 18, 19)
 if ($env:AAV_SUPPORTED_MAJORS) { $script:SupportedMajors = @($env:AAV_SUPPORTED_MAJORS -split '[ ,]+' | ForEach-Object { [int]$_ }) }
 $script:StateDir = if ($env:AAV_STATE_DIR) { $env:AAV_STATE_DIR } else { Join-Path $env:ProgramData 'adaptive_autovacuum' }
 $script:StateFile = Join-Path $script:StateDir 'installer-state.json'

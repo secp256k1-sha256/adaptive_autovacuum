@@ -1,6 +1,6 @@
 # Installing on Windows
 
-Supported by the packaged installer: PostgreSQL 17 and 18 x64 installed the EDB way (a Windows service, the
+Supported by the packaged installer: PostgreSQL 17, 18 and 19 x64 installed the EDB way (a Windows service, the
 `HKLM\SOFTWARE\PostgreSQL` registry keys, `C:\Program Files\PostgreSQL\<major>`). Windows PowerShell 5.1 and
 PowerShell 7 both work; run from an **elevated** prompt.
 
@@ -14,7 +14,7 @@ Get-Content .\install.ps1
 
 The extension is created once per cluster, in the control database (`postgres` by default; `-ControlDatabase NAME`
 chooses another one and sets `adaptive_autovacuum.control_database`). Every database of the cluster is managed from
-there. `install.ps1` downloads `release-manifest.json`, validates it, picks the Windows x64 ZIP for the PostgreSQL major found on the host (the running one when both 17 and 18 are installed; `-PgMajor N` when both run),
+there. `install.ps1` downloads `release-manifest.json`, validates it, picks the Windows x64 ZIP for the PostgreSQL major found on the host (the running one when several supported majors are installed; `-PgMajor N` when more than one runs),
 verifies its SHA-256, expands it into a unique temporary directory, checks every file against the
 `artifact-manifest.json` inside the ZIP, and then runs `adaptive-autovacuum-setup.ps1 install` from the
 package. Add `-Yes` for unattended runs, `-Check` for discovery only, `-DryRun` for the plan.

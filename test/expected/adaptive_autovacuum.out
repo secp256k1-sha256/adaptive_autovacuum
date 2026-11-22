@@ -81,6 +81,26 @@ t
 -- The database program never writes table settings; ANALYZE is its only DDL.
 SELECT position('ALTER TABLE' IN adaptive_autovacuum._database_program()) = 0 AS program_never_alters_tables;
 t
+/* 1.4.0: emergency takeover terminates the stalled worker (no wait argument) and no longer only cancels it. */
+SELECT position('pg_catalog.pg_terminate_backend(r.vacuum_pid)' IN adaptive_autovacuum._database_program()) > 0
+       AND position('pg_cancel_backend' IN adaptive_autovacuum._database_program()) = 0
+       AS takeover_terminates_not_cancels;
+t
+/* 1.4.0: stale-request recovery spares a request whose worker may still be starting (claimed < 1 min ago)
+   and fails one older than that with no emergency worker started after its claim. */
+INSERT INTO adaptive_autovacuum.emergency_queue
+    (database_oid, database_name, relid, relation_name, reason, status, started_at,
+     work_mem_mb, cost_limit, cost_delay_ms, lock_timeout_ms)
+VALUES (1, 'aav_none', 1, 'public.aav_fresh', 'aav_stale_test', 'running', clock_timestamp(), 128, 200, 0, 5000),
+       (1, 'aav_none', 2, 'public.aav_stale', 'aav_stale_test', 'running', clock_timestamp() - interval '2 minutes', 128, 200, 0, 5000);
+SELECT adaptive_autovacuum._recover_stale_emergencies() >= 1 AS stale_recovery_ran;
+t
+SELECT count(*) FILTER (WHERE relation_name = 'public.aav_fresh' AND status = 'running') = 1
+       AND count(*) FILTER (WHERE relation_name = 'public.aav_stale' AND status = 'failed') = 1
+       AS stale_recovery_spares_starting_worker
+FROM adaptive_autovacuum.emergency_queue WHERE reason = 'aav_stale_test';
+t
+DELETE FROM adaptive_autovacuum.emergency_queue WHERE reason = 'aav_stale_test';
 SELECT count(*) = 0 AS table_recommendations_view_empty
 FROM adaptive_autovacuum.table_recommendations;
 t
@@ -993,8 +1013,8 @@ SELECT (SELECT status FROM adaptive_autovacuum.doctor() WHERE check_name = 'libr
        = CASE WHEN (SELECT available FROM adaptive_autovacuum.controller_status())
               THEN 'OK' ELSE 'FAIL' END AS preload_check_matches_shared_memory;
 t
-SELECT extension_version = '1.3.2' AS status_version,
-       available_version = '1.3.2' AS status_available_version,
+SELECT extension_version = '1.4.0' AS status_version,
+       available_version = '1.4.0' AS status_available_version,
        library_preloaded = (SELECT available FROM adaptive_autovacuum.controller_status()) AS status_preload_matches,
        launcher_running IS NOT NULL AS status_launcher_known,
        controller_running IS NOT NULL AS status_controller_known,

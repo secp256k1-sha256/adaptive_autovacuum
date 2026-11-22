@@ -1,3 +1,17 @@
+postgresql-@PGMAJOR@-adaptive-autovacuum (1.4.0-1) unstable; urgency=medium
+
+  * PostgreSQL 19 support (1.3.2 SQL): PG19 vacuum initiator and mode feed the wraparound flags,
+    the stall fingerprint and the takeover guard; interruptible database and emergency workers.
+  * Emergency takeover terminates the stalled anti-wraparound autovacuum worker instead of
+    cancelling its current operation; a refused signal is logged and recorded on the decision.
+    Upgrade scripts 1.3.1 -> 1.3.2 -> 1.4.0; policy values and state are preserved.
+  * Background workers stay idle in binary-upgrade mode, so pg_upgrade with the library preloaded
+    no longer fails at schema restore; emergency maintenance_work_mem is clamped to the server ceiling.
+  * Stale emergency-request recovery no longer marks a still-running emergency VACUUM as failed.
+  * Packages for PostgreSQL 19.
+
+ -- adaptive_autovacuum maintainers <noreply@github.com>  Sun, 22 Nov 2026 12:00:00 +0000
+
 postgresql-@PGMAJOR@-adaptive-autovacuum (1.3.1-1) unstable; urgency=medium
 
   * Windows install.ps1: the interactive confirmation prompt failed under strict mode

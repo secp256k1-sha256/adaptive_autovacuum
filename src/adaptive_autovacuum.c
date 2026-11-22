@@ -325,6 +325,11 @@ _PG_init(void)
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook = aav_shmem_startup;
 
+    /* pg_upgrade starts both clusters in binary-upgrade mode (postmaster -b, parsed before preload): stay idle there,
+       like core autovacuum. A controller connected to the control database made pg_restore's DROP DATABASE fail. */
+    if (IsBinaryUpgrade)
+        return;
+
     MemSet(&worker, 0, sizeof(worker));
     snprintf(worker.bgw_name, BGW_MAXLEN, "adaptive autovacuum launcher");
     snprintf(worker.bgw_type, BGW_MAXLEN, "adaptive autovacuum launcher");
@@ -2480,7 +2485,9 @@ aav_run_emergency_vacuum(const AAVEmergencyRequest *request)
     if (!OidIsValid(request->relid))
         elog(ERROR, "adaptive autovacuum emergency request has invalid relation OID");
 
-    work_mem = psprintf("%dMB", request->work_mem_mb);
+    /* Clamp to the server's own maintenance_work_mem ceiling: on Windows PostgreSQL 17 (32-bit long) it is
+       2097151 kB, one kB below the 2048 MB policy default, and an out-of-range value failed every request. */
+    work_mem = psprintf("%dMB", Min(request->work_mem_mb, MAX_KILOBYTES / 1024));
     cost_limit = psprintf("%d", request->cost_limit);
     cost_delay = psprintf("%dms", request->cost_delay_ms);
     lock_timeout = psprintf("%dms", request->lock_timeout_ms);

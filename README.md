@@ -2,14 +2,13 @@
 
 ### PostgreSQL autovacuum that tunes itself.
 
-**For PostgreSQL 17 & 18 · Full feature set on PostgreSQL 18 · PostgreSQL 19 compatible (tested on 19 RC1; packages follow the 19 GA release)**
+**For PostgreSQL 17, 18 & 19 · Full feature set on PostgreSQL 18 and 19**
 
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018%20%7C%2019-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/License-PostgreSQL-blue)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Beta-orange)](VALIDATION.md)
 [![Language](https://img.shields.io/badge/C%20%2B%20PL%2FpgSQL-555555)](src/)
 
-> **⚠️ Beta: testing in progress.** Functionally tested on Linux and Windows (PostgreSQL 17.6, 17.11, 18.4 and 18.6), including regression tests, standby and emergency-vacuum drills, and pgbench workloads. The source builds and passes the regression suite on PostgreSQL 19 RC1 (Linux); 19 packages are published once PostgreSQL 19 is released. Sustained production-scale validation is still pending. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
+> **Production release (1.4.0).** Validated on Linux and Windows across PostgreSQL 17, 18 and 19 (17.6, 17.11, 18.4, 18.6, 18.7, 19.0; Windows, Ubuntu 26.04 and Rocky Linux 10): regression suites in on-demand and preloaded mode, package installers, standby, emergency-vacuum and emergency-takeover drills, pgbench workloads, and a PostgreSQL 18 -> 19 `pg_upgrade`. See [VALIDATION.md](VALIDATION.md) for what was run and observed; results on your workload may differ. Include `SELECT * FROM adaptive_autovacuum.doctor();` when reporting an issue.
 
 
 ## 🎬 See it in action
@@ -58,7 +57,7 @@ less install.sh
 sudo bash install.sh
 ```
 
-**🪟 Windows** · EDB PostgreSQL 17 or 18 x64, elevated PowerShell
+**🪟 Windows** · EDB PostgreSQL 17, 18 or 19 x64, elevated PowerShell
 
 ```powershell
 Invoke-WebRequest https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download/install.ps1 -OutFile install.ps1
@@ -103,7 +102,7 @@ But many databases have **no dedicated DBA**: startups, small teams, solo develo
 - **Evidence before action.** Global changes require a complete, successful cluster sweep; incomplete evidence produces advice, not an automatic change.
 - **Bounded tuning.** Changes use an allow-list, policy ceilings and available resource signals. CPU count is not a direct ceiling on worker recommendations.
 - **Table settings stay yours.** The controller never runs `ALTER TABLE`. Per-table trigger and cost changes are recommendations with ready-to-run SQL in `table_recommendations`, and a recommendation never loosens a trigger you set. It never edits table data.
-- **Separate emergency path.** An anti-wraparound vacuum making progress is not cancelled; human-started vacuums are never takeover targets.
+- **Separate emergency path.** An anti-wraparound vacuum making progress is never interrupted; a provably stalled one is terminated and replaced by the emergency profile (1.4.0); human-started vacuums are never takeover targets.
 - **Reversible.** Global changes and their prior values are audited; every table recommendation carries the SQL that reverts it.
 
 ## 🧭 Contents
@@ -156,9 +155,9 @@ The [Quick install](#-quick-install) scripts are the simplest path. For manual o
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup_1.3.1-1_all.deb
-curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.3.1-1_ubuntu24.04_amd64.deb
-sudo apt-get install ./adaptive-autovacuum-setup_1.3.1-1_all.deb ./postgresql-18-adaptive-autovacuum_1.3.1-1_ubuntu24.04_amd64.deb
+curl -fsSLO $U/adaptive-autovacuum-setup_1.4.0-1_all.deb
+curl -fsSLO $U/postgresql-18-adaptive-autovacuum_1.4.0-1_ubuntu24.04_amd64.deb
+sudo apt-get install ./adaptive-autovacuum-setup_1.4.0-1_all.deb ./postgresql-18-adaptive-autovacuum_1.4.0-1_ubuntu24.04_amd64.deb
 sudo adaptive-autovacuum-setup install
 ```
 
@@ -169,9 +168,9 @@ sudo adaptive-autovacuum-setup install
 
 ```bash
 U=https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download
-curl -fsSLO $U/adaptive-autovacuum-setup-1.3.1-1.el9.noarch.rpm
-curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.3.1-1.el9.x86_64.rpm
-sudo dnf install ./adaptive-autovacuum-setup-1.3.1-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.3.1-1.el9.x86_64.rpm
+curl -fsSLO $U/adaptive-autovacuum-setup-1.4.0-1.el9.noarch.rpm
+curl -fsSLO $U/postgresql18-adaptive-autovacuum-1.4.0-1.el9.x86_64.rpm
+sudo dnf install ./adaptive-autovacuum-setup-1.4.0-1.el9.noarch.rpm ./postgresql18-adaptive-autovacuum-1.4.0-1.el9.x86_64.rpm
 sudo adaptive-autovacuum-setup install
 ```
 
@@ -182,7 +181,7 @@ sudo adaptive-autovacuum-setup install
 
 ```powershell
 $U = 'https://github.com/secp256k1-sha256/adaptive_autovacuum/releases/latest/download'
-Invoke-WebRequest "$U/adaptive_autovacuum-1.3.1-pg18-windows-x64.zip" -OutFile aav.zip
+Invoke-WebRequest "$U/adaptive_autovacuum-1.4.0-pg18-windows-x64.zip" -OutFile aav.zip
 Expand-Archive aav.zip -DestinationPath aav
 .\aav\adaptive-autovacuum-setup.ps1 install -SourceDir (Resolve-Path .\aav).Path -Credential (Get-Credential postgres)
 ```
@@ -207,7 +206,7 @@ windows\build_windows.bat "C:\Program Files\PostgreSQL\18"
 
 `packaging\windows\build-zip.ps1 -PgMajor 18` packages a Windows build. For manual activation, append the library to `shared_preload_libraries`, restart, then run `CREATE EXTENSION adaptive_autovacuum;` **once in the control database**. Set any explicit `off` settings to `on` if you want automation.
 
-The current `sql/adaptive_autovacuum--1.3.1.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
+The current `sql/adaptive_autovacuum--1.4.0.sql` is assembled from `sql/parts/01_schema.sql`, `02_program.sql`, `03_control_plane.sql` and `04_views_api.sql` using `bash sql/assemble.sh`; contributors should edit the parts and commit both.
 
 </details>
 
@@ -351,7 +350,7 @@ UPDATE adaptive_autovacuum.policy SET emergency_vacuum_enabled = false;
 |---|---|
 | PostgreSQL 17 / 18 | Both support cost tuning, triggers, missing-statistics repair and emergency protection. Binaries are major-specific. |
 | PostgreSQL 18 | Adds reloadable worker increases, maximum vacuum thresholds, delay timing and emergency eager-freeze tuning. PG17 worker increases are advice-only. |
-| PostgreSQL 19 | Source-compatible (built and regression-tested on 19 RC1; packages at GA). Uses the new vacuum initiator and mode from `pg_stat_progress_vacuum`: user-started vacuums are recognised directly and a failsafe-mode vacuum is never taken over. Database and emergency workers end immediately when their database is dropped. The native autovacuum score weights and `autovacuum_max_parallel_workers` are left to the operator; with parallel autovacuum enabled, index I/O done by parallel workers is not counted in `vacuum_read_mbps`/`vacuum_write_mbps`. |
+| PostgreSQL 19 | Supported with packages from 1.4.0 (validated on 19.0). Uses the new vacuum initiator and mode from `pg_stat_progress_vacuum`: user-started vacuums are recognised directly and a failsafe-mode vacuum is never taken over. Database and emergency workers end immediately when their database is dropped. The native autovacuum score weights and `autovacuum_max_parallel_workers` are left to the operator; with parallel autovacuum enabled, index I/O done by parallel workers is not counted in `vacuum_read_mbps`/`vacuum_write_mbps`. |
 | Cluster scope | Install the extension in one control database. Global setting changes affect every database; exclusions prevent scanning and table recommendations. |
 | Standbys | Automation waits for a writable primary. Keep binaries and settings consistent through HA tooling. |
 | Config managers | Coordinate with Patroni/operators; setup rejects detected managed environments. |
@@ -367,10 +366,12 @@ Upgrade the package/files for your PostgreSQL major, restart when replacing the 
 ALTER EXTENSION adaptive_autovacuum UPDATE;
 ```
 
+PostgreSQL major upgrades (`pg_upgrade`): install the package for the new major first and keep `adaptive_autovacuum` in the new cluster's `shared_preload_libraries`; from 1.4.0 the workers stay idle while the server runs in binary-upgrade mode (earlier versions' controller held the control database and made `pg_upgrade` fail at schema restore). After the upgrade, run `ALTER EXTENSION adaptive_autovacuum UPDATE` in the control database; policy and table settings carry over.
+
 
 ## 🧪 Testing and documentation
 
-CI runs PostgreSQL 17/18 regression suites, Linux installer tests and Windows setup-helper checks. Use a dedicated test cluster with the launcher disabled for deterministic regression tests:
+CI runs PostgreSQL 17/18/19 regression suites, Linux installer tests and Windows setup-helper checks. Use a dedicated test cluster with the launcher disabled for deterministic regression tests:
 
 ```bash
 make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config

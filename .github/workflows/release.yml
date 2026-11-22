@@ -72,18 +72,19 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ needs.verify-version.outputs.version }} (beta)
+          name: ${{ needs.verify-version.outputs.version }}
           files: dist/*
           fail_on_unmatched_files: true
           # A normal release (not the GitHub prerelease flag) so that releases/latest resolves and the
-          # documented quick install works; the beta status is stated here and in the README.
+          # documented quick install works.
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           body: |
-            **Beta.** Functionally validated on PostgreSQL 17 and 18 (Linux and Windows), regression suites,
-            live drills and short soaks; not yet run for months in production. Please report `doctor` output with issues.
+            Validated on PostgreSQL 17, 18 and 19 (Linux and Windows): regression suites, package installers,
+            live drills, emergency-takeover drills and a PostgreSQL 18 -> 19 pg_upgrade; details in VALIDATION.md.
+            Please report `doctor` output with issues.
 
-            Install (PostgreSQL 17 or 18):
+            Install (PostgreSQL 17, 18 or 19):
 
             Install once per cluster; the extension lives in the control database (`postgres` by default) and manages every database.
             Linux: download `install.sh`, read it, then `sudo bash install.sh`
@@ -94,6 +95,10 @@ jobs:
             `autovacuum = off` is repaired before the sweep; every table is scored (`min_table_bytes` 0);
             `autovacuum_naptime` is ramped down while the worker pool is under-filled and worker raises are easier.
             1.3.1: Windows `install.ps1` interactive confirmation fixed (use `-Yes` on 1.3.0); no extension changes.
+            1.4.0: PostgreSQL 19 support and packages; emergency takeover terminates the stalled anti-wraparound
+            autovacuum worker (instead of cancelling its current operation) and queues the emergency VACUUM without waiting;
+            the workers stay idle during pg_upgrade (binary-upgrade mode); Windows PostgreSQL 17 emergency VACUUMs no longer fail
+            on the 2 GB maintenance_work_mem ceiling; a running emergency VACUUM is no longer marked failed at the next sweep.
             No upgrade path from 1.1.0: the installer re-creates the extension (policy and history of the old copy are deleted).
 
             Verify downloads against `SHA256SUMS`; the installers verify `release-manifest.json` checksums automatically.

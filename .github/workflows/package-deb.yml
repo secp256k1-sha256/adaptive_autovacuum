@@ -1,7 +1,7 @@
 name: package-deb
 
-# Ubuntu (24.04, 26.04) and Debian (12, 13) DEBs for PostgreSQL 17 and 18, amd64 and arm64, each installed and
-# exercised in a clean container of the same release. The PGDG apt repository provides postgresql-17 and -18.
+# Ubuntu (24.04, 26.04) and Debian (12, 13) DEBs for PostgreSQL 17, 18 and 19, amd64 and arm64, each installed and
+# exercised in a clean container of the same release. The PGDG apt repository provides postgresql-17, -18 and -19.
 on:
   workflow_dispatch:
   workflow_call:
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgmajor: [17, 18]
+        pgmajor: [17, 18, 19]
         dist: [ubuntu24.04, ubuntu26.04, debian12, debian13]
         arch: [amd64, arm64]
         include:
@@ -61,7 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgmajor: [17, 18]
+        pgmajor: [17, 18, 19]
         dist: [ubuntu24.04, ubuntu26.04, debian12, debian13]
         arch: [amd64, arm64]
         include:

@@ -10,12 +10,12 @@
 set -Eeuo pipefail
 umask 077
 
-readonly INSTALLER_VERSION="1.3.1"
+readonly INSTALLER_VERSION="1.4.0"
 readonly REPO="${AAV_REPO:-secp256k1-sha256/adaptive_autovacuum}"
 readonly RELEASE_BASE="https://github.com/$REPO/releases"
 # Hosts a GitHub release download may legitimately redirect to.
 readonly ALLOWED_HOSTS="github.com objects.githubusercontent.com release-assets.githubusercontent.com githubusercontent.com"
-readonly SUPPORTED_MAJORS="${AAV_SUPPORTED_MAJORS:-17 18}"
+readonly SUPPORTED_MAJORS="${AAV_SUPPORTED_MAJORS:-17 18 19}"
 # shellcheck disable=SC2034  # EX_OK documents the shared contract
 readonly EX_OK=0 EX_ARGS=2 EX_NO_PG=3 EX_AMBIGUOUS=4 EX_UNSUPPORTED=5 EX_DOWNLOAD=6 EX_PRIVILEGE=7 EX_CONFIG_FAILED=8
 

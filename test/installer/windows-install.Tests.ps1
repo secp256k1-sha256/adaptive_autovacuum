@@ -13,7 +13,7 @@ Describe 'Windows installer (live)' -Skip:(-not $script:live) {
         $script:db = if ($env:AAV_TEST_DATABASE) { $env:AAV_TEST_DATABASE } else { 'aav_installer_test' }
         $script:svc = if ($env:AAV_TEST_SERVICE) { $env:AAV_TEST_SERVICE } else { 'postgresql-x64-18' }
         $script:pass = $env:AAV_TEST_PGPASSFILE
-        $major = [int]($script:svc -replace '^.*-(\d+)$', '$1')
+        $script:major = $major = [int]($script:svc -replace '^.*-(\d+)$', '$1')
         $zip = Get-ChildItem $script:dist -Filter "adaptive_autovacuum-*-pg$major-windows-x64.zip" | Select-Object -First 1
         if (-not $zip) { $zip = Get-ChildItem $script:dist -Filter 'adaptive_autovacuum-*-windows-x64.zip' | Select-Object -First 1 }
         $zip | Should -Not -BeNullOrEmpty
@@ -33,12 +33,12 @@ Describe 'Windows installer (live)' -Skip:(-not $script:live) {
     It 'rejects a checksum mismatch with exit 6 and installs nothing' {
         $bad = Join-Path $TestDrive 'bad.json'
         (Get-Content -Raw $script:manifest) -replace '"sha256":\s*"[0-9a-f]+"', '"sha256": "0000000000000000000000000000000000000000000000000000000000000000"' | Set-Content $bad
-        $r = Invoke-Script $script:install @('-Yes', '-Manifest', $bad, '-ArtifactDir', $script:dist, '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-ControlDatabase', $script:db)
+        $r = Invoke-Script $script:install @('-Yes', '-Manifest', $bad, '-ArtifactDir', $script:dist, '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-PgMajor', $script:major, '-ControlDatabase', $script:db)
         $r.ExitCode | Should -Be 6 -Because $r.Output
         $r.Output | Should -Match 'checksum mismatch'
     }
     It 'installs, restarts, activates and passes doctor' {
-        $r = Invoke-Script $script:install @('-Yes', '-Manifest', $script:manifest, '-ArtifactDir', $script:dist, '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-ControlDatabase', $script:db)
+        $r = Invoke-Script $script:install @('-Yes', '-Manifest', $script:manifest, '-ArtifactDir', $script:dist, '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-PgMajor', $script:major, '-ControlDatabase', $script:db)
         $r.ExitCode | Should -Be 0 -Because $r.Output
         $r.Output | Should -Match 'Installation complete'
         $d = Invoke-Script $script:setup @('doctor', '-Format', 'json', '-PgPassFile', $script:pass, '-ServiceName', $script:svc)
@@ -50,7 +50,7 @@ Describe 'Windows installer (live)' -Skip:(-not $script:live) {
         $j.last_run.final_state | Should -Be 'completed'
     }
     It 'is idempotent on rerun (no restart)' {
-        $r = Invoke-Script $script:setup @('install', '-Yes', '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-ControlDatabase', $script:db)
+        $r = Invoke-Script $script:setup @('install', '-Yes', '-PgPassFile', $script:pass, '-ServiceName', $script:svc, '-PgMajor', $script:major, '-ControlDatabase', $script:db)
         $r.ExitCode | Should -Be 0 -Because $r.Output
         $r.Output | Should -Match 'Restart:\s+not needed'
     }

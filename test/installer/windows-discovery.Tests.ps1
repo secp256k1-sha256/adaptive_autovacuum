@@ -66,7 +66,7 @@ Describe 'Select-AavCandidate' {
     BeforeAll {
         function NewCand([string]$id, [int]$major, [string]$state, [int]$port, [string]$svc) {
             [ordered]@{ candidate_id = $id; postgres_major = $major; postgres_full_version = "$major.6"; running_state = $state; port = $port; service_name = $svc
-                        data_directory = "C:\pg\$id"; install_root = "C:\pg\$id"; supported = ($major -in @(17, 18)); inconsistent = $null; discovery_sources = @('test') }
+                        data_directory = "C:\pg\$id"; install_root = "C:\pg\$id"; supported = ($major -in @(17, 18, 19)); inconsistent = $null; discovery_sources = @('test') }
         }
     }
     It 'selects the single supported candidate' {

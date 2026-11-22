@@ -2,7 +2,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  adaptive_autovacuum bootstrap installer for Windows (PostgreSQL 17 or 18 x64, EDB-style installation).
+  adaptive_autovacuum bootstrap installer for Windows (PostgreSQL 17, 18 or 19 x64, EDB-style installation).
 .DESCRIPTION
   Downloads the release manifest, selects the Windows ZIP for this host, verifies its SHA-256,
   expands it to a unique temporary directory, verifies every file against artifact-manifest.json,
@@ -53,11 +53,11 @@ $ErrorActionPreference = 'Stop'
 # Any unexpected error is an installation failure with a defined exit code, never a silent exit 0.
 trap { Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red; exit 8 }
 
-$InstallerVersion = '1.3.1'
+$InstallerVersion = '1.4.0'
 $Repo = if ($env:AAV_REPO) { $env:AAV_REPO } else { 'secp256k1-sha256/adaptive_autovacuum' }
 $ReleaseBase = "https://github.com/$Repo/releases"
 $AllowedHosts = @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
-$SupportedMajors = @(17, 18)
+$SupportedMajors = @(17, 18, 19)
 $Ex = @{ Ok = 0; Args = 2; NoPg = 3; Ambiguous = 4; Unsupported = 5; Download = 6; Privilege = 7; ConfigFailed = 8 }
 
 function Fail([int]$Code, [string]$Message) { Write-Host "ERROR: $Message" -ForegroundColor Red; exit $Code }

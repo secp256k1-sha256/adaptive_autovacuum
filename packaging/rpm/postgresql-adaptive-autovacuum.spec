@@ -8,7 +8,7 @@
 %global __brp_check_rpaths %{nil}
 
 Name:           postgresql%{pgmajor}-adaptive-autovacuum
-Version:        1.3.1
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        Adaptive autovacuum controller extension for PostgreSQL %{pgmajor}
 License:        PostgreSQL
@@ -86,6 +86,15 @@ if [ "$1" -eq 0 ]; then
 fi
 
 %changelog
+* Sun Nov 22 2026 adaptive_autovacuum maintainers - 1.4.0-1
+- PostgreSQL 19 support (1.3.2 SQL: PG19 vacuum initiator/mode, interruptible workers, split log_*_min_duration)
+- Emergency takeover terminates the stalled anti-wraparound autovacuum worker instead of cancelling it;
+  a refused signal is logged and recorded on the decision; upgrade scripts 1.3.1 -> 1.3.2 -> 1.4.0
+- Workers stay idle in binary-upgrade mode (pg_upgrade with the library preloaded no longer fails);
+  emergency maintenance_work_mem clamped to the server ceiling (Windows PostgreSQL 17)
+- Stale emergency-request recovery no longer marks a still-running emergency VACUUM as failed
+- Packages for PostgreSQL 19
+
 * Sat Sep 26 2026 adaptive_autovacuum maintainers - 1.3.1-1
 - Windows install.ps1: interactive confirmation prompt failed under strict mode; no extension changes.
 

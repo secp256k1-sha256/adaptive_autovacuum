@@ -1,6 +1,6 @@
 name: package-rpm
 
-# EL9 and EL10 RPMs (AlmaLinux containers; one package serves every clone of that major) for PostgreSQL 17 and 18,
+# EL9 and EL10 RPMs (AlmaLinux containers; one package serves every clone of that major) for PostgreSQL 17, 18 and 19,
 # x86_64 and aarch64, each installed and exercised in a clean container of the same release.
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgmajor: [17, 18]
+        pgmajor: [17, 18, 19]
         dist: [el9, el10]
         arch: [x86_64, aarch64]
         include:
@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgmajor: [17, 18]
+        pgmajor: [17, 18, 19]
         dist: [el9, el10]
         arch: [x86_64, aarch64]
         include:

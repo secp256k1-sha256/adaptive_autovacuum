@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pgversion: [17, 18]
+        pgversion: [17, 18, 19]
     runs-on: ubuntu-latest
     container: postgres:${{ matrix.pgversion }}
     steps:

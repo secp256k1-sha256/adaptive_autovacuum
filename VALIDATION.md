@@ -6,7 +6,7 @@
 - The C API use was checked against PostgreSQL 17, 18 and 19 declarations for background workers, shared-memory hooks, `VacuumParams`, `makeVacuumRelation()`, and `vacuum()`.
 - SQL policy and C orchestration were reviewed for transaction boundaries, reversible reloption ownership, admission limits, stale request recovery, and emergency-worker cleanup.
 - The architecture DOCX was rendered to 14 page images and every page was visually inspected for clipping, overlap, table breakage, and missing text.
-- GitHub Actions runs a `postgres:[17, 18]` container matrix: compile, install, initdb, and `make installcheck` twice per major (once loaded on demand, once preloaded).
+- GitHub Actions runs a `postgres:[17, 18, 19]` container matrix: compile, install, initdb, and `make installcheck` twice per major (once loaded on demand, once preloaded).
 
 ## CI status, stated plainly
 
@@ -1513,3 +1513,118 @@ autovacuum shows `autovacuum worker | autovacuum | normal | f | t`; the controll
 from the expected dry-run warnings; no server-log errors. Not exercised on 19: a failsafe-mode or wraparound-started
 vacuum (needs a near-wraparound cluster), a `DROP DATABASE` racing a database worker, and Windows (no EDB 19 RC
 installer exists).
+
+## Validation performed 2026-11-22 (1.4.0: PostgreSQL 19 release, emergency takeover terminates)
+
+Scope (release plan v3): one behaviour change - the emergency takeover terminates the stalled anti-wraparound
+autovacuum worker (`pg_terminate_backend`, no timeout argument = no wait) instead of cancelling its current operation,
+and queues the emergency VACUUM in the same sweep; a refused or failed signal is caught, logged as a WARNING and stored
+in the decision's `error` (the request is still queued). Stall criteria, retry gates, cost/freeze profile, the
+one-emergency-worker limit and all policy defaults are unchanged. Version 1.4.0: `--1.4.0.sql` and
+`--1.3.2--1.4.0.sql` (head + parts 02-04 with CREATE OR REPLACE, no schema change); 1.3.2 and earlier scripts frozen.
+CI and package matrices extended to PostgreSQL 19; installers list 17, 18 and 19.
+
+Four defects found by this round's tests and fixed:
+
+1. **Windows build for PostgreSQL 19 impossible.** PG19 headers require C11 (`alignas`, `_Noreturn`); MSVC compiled
+   in its default mode and failed with >100 errors in `c.h`. `windows\build_windows.bat` now passes `/std:c11`
+   (also used for 17 and 18; all three build with zero warnings from `src/adaptive_autovacuum.c`).
+2. **Every emergency VACUUM failed on Windows PostgreSQL 17** (pre-existing): the 2048 MB `emergency_work_mem_max_mb`
+   default becomes `maintenance_work_mem = 2097152 kB`, one kB above the Windows PG17 ceiling (`MAX_KILOBYTES` =
+   `INT_MAX/1024` with a 32-bit `long`): `2097152 kB is outside the valid range for parameter "maintenance_work_mem"`,
+   12 of 12 requests failed in the drill. The emergency worker now clamps to `MAX_KILOBYTES / 1024` MB; afterwards
+   23 of 23 completed.
+3. **`pg_upgrade` failed with the library preloaded in the new cluster** (pre-existing): pg_upgrade starts the
+   server in binary-upgrade mode, the launcher/controller connected to the control database and pg_restore's
+   `DROP DATABASE "postgres"` failed ("being accessed by other users"). `_PG_init` no longer registers the launcher
+   when `IsBinaryUpgrade` (core autovacuum is off there too); shared-memory hooks stay. Reproduced before the fix,
+   passed after it.
+4. **A running emergency VACUUM was marked failed at the next sweep** (pre-existing since 1.2.0, found on Ubuntu PG19):
+   `_recover_stale_emergencies()` kept a request only if its worker had `backend_start <= started_at`, but
+   `started_at` is stamped at claim time, before the worker process exists, so every emergency VACUUM still running
+   when the next sweep began (`naptime_seconds`, default 60 s) became `failed: Recovered stale running request` while
+   it kept working - a false failure that feeds the retry backoff and the 8-per-24 h cap, and lets the program queue
+   a duplicate. Windows had passed only because no sweep began during its 6 s emergency VACUUMs. Recovery now
+   requires a claim older than one minute and no `adaptive autovacuum emergency worker` backend started after the
+   claim (matching the recorded PID when there is one). Regression check added; drills hold the pin 75 s
+   (`AAV_HOLD`): the request stays `running` across ~15 sweeps and completes on Ubuntu 18/19, Rocky 19 and Windows 19;
+   on Rocky 18 with a 5 s launcher interval an emergency VACUUM stuck for 4 min (~48 sweeps) stayed `running`.
+
+Environment: Windows 11, EDB PostgreSQL 17.6, 18.6 and 19.0 (MSVC 19.44), scratch clusters on ports 543xx/544xx/545xx
+plus the operator's PostgreSQL 19 service (port 5433). All runs sequential.
+
+| check | 17.6 | 18.6 | 19.0 |
+|---|---|---|---|
+| build (`/W3 /std:c11`), warnings from our source | 0 | 0 | 0 |
+| `adaptive_autovacuum` + `upgrade` regression, on-demand / preloaded (final DLLs) | ok / ok | ok / ok | ok / ok |
+| new checks: program calls `pg_terminate_backend(r.vacuum_pid)` and no `pg_cancel_backend`; 1.3.2 -> 1.4.0 keeps policy values and `table_policy` | ok | ok | ok |
+| emergency-takeover drill (final DLLs) | pass | pass | pass |
+
+Emergency-takeover drill (`aav_takeover_drill140.sh`, disposable cluster per major): `autovacuum_freeze_max_age =
+100000`, policy `emergency_xid_age = 100000`, `emergency_takeover_min_runtime_seconds = 60`, `stall_samples = 2`,
+`autovacuum_naptime = 1`. Table `t` (20,000 rows) is locked during a 170,000-XID burn, then an open cursor pins heap
+page 0 (young snapshot, so the horizon is not blocked) and the lock is released: the anti-wraparound autovacuum waits
+for the cleanup lock at `scanning heap 0/589` indefinitely. Result per major, final binaries:
+
+| | 17.6 | 18.6 | 19.0 |
+|---|---|---|---|
+| takeover decided after | 61 s runtime, 9 frozen samples | same | same |
+| server log of the stuck worker | `FATAL: terminating autovacuum process due to administrator command` | same | same |
+| decision -> emergency request started | 0.5 ms | 0.2 ms | 0.2 ms |
+| relation lock after takeover | emergency VACUUM holds it; a new native anti-wraparound worker waits behind it | same | same |
+| decision `error` | none | none | none |
+| after the cursor is released | emergency VACUUM completed, `age(relfrozenxid)` 170k -> 1 | same | same |
+
+Eight drill runs in this round (PG19 x2, PG18 x2, PG17 x4). Apart from the first PG17 run (memory defect above), the
+replacement won the lock every time but once (PG17): a native anti-wraparound worker relaunched by the 1 s launcher interval took the
+lock first, the emergency attempt ended at its 5 s `lock_timeout` (`failed`), and the native worker finished the table
+once the pin was released. This is the documented SIGTERM race; it is not prevented and not claimed to be.
+
+Refused-signal handling (the program's exact block, on PostgreSQL 19): a PID that is not a backend returns false with
+`WARNING: PID 999999 is not a PostgreSQL backend process` and is recorded as `pg_terminate_backend(999999) returned
+false ...`; an unprivileged caller targeting a superuser background worker gets `permission denied to terminate
+process`, caught and recorded, the sweep continues and the target is untouched. The real database worker runs as the
+bootstrap superuser, so the permission path is defensive.
+
+Windows package on the operator's PostgreSQL 19 service (`postgresql-x64-19`, 5433): ZIP built by `build-zip.ps1
+-PgMajor 19`, `install.ps1` with an offline manifest - checksum mismatch rejected with exit 6, `-DryRun` plan, real
+install (files, preload, service restart, `CREATE EXTENSION` 1.4.0 in `postgres`, enable), doctor 19/19 OK, idempotent
+rerun without restart, reinstall of a changed DLL (hash differs -> restart), live Pester 4/4, discovery Pester 17/17.
+With 17, 18 and 19 installed and two running, the installer refuses to guess and asks for `-PgMajor` (the live Pester
+suite now passes it; `-ServiceName` alone does not select the major).
+
+Live controller smoke on that instance (autonomous defaults, `naptime_seconds` 10 for the test, reset after): 200
+tables x 5,000 rows updated 3x (2.98M dead tuples) plus a 200k-row table without statistics. `autovacuum = off` was
+repaired immediately (`set_autovacuum off -> on`); within 25 s workers 3 -> 6 -> 12 -> 16, naptime 60 -> 30 -> 15 ->
+7 s, cost pair -1/2 -> 409/1 ms, `autovacuum_work_mem` and `vacuum_buffer_usage_limit` raised; all dead tuples gone by
+the first 45 s sample; the table without statistics was ANALYZEd in the first sweep; naptime and the cost pair began
+decaying at +2 min; doctor reported no non-OK check.
+
+PostgreSQL 18 -> 19 `pg_upgrade` (`aav_pgupgrade_18to19_140.sh`): PG18 scratch with the extension at the released 1.3.1
+SQL, customised policy (`emergency_takeover_stall_samples` 7, `naptime_min_seconds` 10, `target_dead_tuple_min` 2500),
+a `table_policy` row and sweep history, upgraded to a PG19 cluster with the installed 1.4.0 files and the library
+preloaded. `--check` and the upgrade pass; the new cluster comes up at 1.3.1 with doctor `extension_version` WARN
+(available 1.4.0); `ALTER EXTENSION adaptive_autovacuum UPDATE` -> 1.4.0; the policy row and `table_policy` are
+byte-identical to the old cluster's; history rows kept; the controller sweeps the upgraded cluster.
+
+Linux (WSL2, after WSL was reinstalled; scope set by the operator: PostgreSQL 18 and 19 only): Ubuntu 26.04.1 with PGDG
+18.7 / 19.0 (gcc 15.2) and Rocky Linux 10.3 (official Rocky WSL image, SHA-256 verified) with PGDG 18.7 / 19.0 (gcc 14.4).
+
+| check | Ubuntu 18.7 | Ubuntu 19.0 | Rocky 18.7 | Rocky 19.0 |
+|---|---|---|---|---|
+| build warnings from our source | 0 | 0 | 0 | 0 |
+| regression on-demand / preloaded (final SQL) | ok / ok | ok / ok | ok / ok | ok / ok |
+| takeover drill, 75 s hold: SIGTERM, dispatch, request stays `running`, result | lost lock race in first run; long-hold run completed, age 1 | completed, age 1 | lost lock race (`lock_timeout`) | completed, age 1 |
+| package build + `install.sh` offline install + doctor | - | DEB: ok, no FAIL | - | RPM: ok, no FAIL, `rpm -V` clean |
+| bats discovery / live install suite | - | 11+1 skip / 7 of 7 | - | 11+1 skip / 7 of 7 |
+| package removal keeps database objects | - | ok | - | ok |
+
+Lock race summary over all drill runs that reached a takeover (15): the replacement lost the relation lock to a
+freshly launched native anti-wraparound worker 3 times (Windows PG17, Ubuntu PG18, Rocky PG18), always with the
+drill's `autovacuum_naptime = 1 s`; never on PostgreSQL 19. The lost attempt ends at its `lock_timeout`, is retried
+under the normal gates, and the native worker that won finishes the table once the stall clears. A rerun with a
+5 s launcher interval did not reach a takeover (the extension's own emergency VACUUM reached the table before any
+native worker), so the race rate at realistic launcher intervals is not measured. Not covered locally: PostgreSQL 17 on
+Linux (out of scope for this round; covered by CI and the 1.3.x rounds), aarch64, Debian 12/13, Ubuntu 24.04, EL9.
+The operator's PostgreSQL 19 service was refreshed to the final 1.4.0 SQL (files copied, extension re-created;
+policy defaults intact, doctor clean).

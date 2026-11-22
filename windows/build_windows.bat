@@ -28,7 +28,8 @@ if errorlevel 1 (
 )
 
 rem All build outputs stay inside the windows folder.
-cl /nologo /LD /MD /O2 /W3 ^
+rem /std:c11: PostgreSQL 19 headers require C11 (alignas, _Noreturn); harmless for 17 and 18.
+cl /nologo /LD /MD /O2 /W3 /std:c11 ^
    /D WIN32 /D _WINDOWS /D _CRT_SECURE_NO_WARNINGS ^
    /I"%PGROOT%\include\server\port\win32_msvc" ^
    /I"%PGROOT%\include\server\port\win32" ^

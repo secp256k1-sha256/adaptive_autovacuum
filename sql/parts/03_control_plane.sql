@@ -447,11 +447,15 @@ AS $$
             finished_at = clock_timestamp(),
             next_retry_at = clock_timestamp() + interval '5 minutes',
             last_error = 'Recovered stale running request: worker PID is no longer active.'
+        /* started_at is stamped at claim time, before the worker process exists, so a live worker always has
+           backend_start >= started_at (1.4.0; the old "<=" test failed every emergency VACUUM still running at
+           the next sweep). One minute of grace covers a worker that is still starting or not yet recorded. */
         WHERE q.status = 'running'
-          AND (q.worker_pid IS NULL
-               OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
-                              WHERE a.pid = q.worker_pid
-                                AND a.backend_start <= q.started_at))
+          AND q.started_at < clock_timestamp() - interval '1 minute'
+          AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity a
+                          WHERE a.backend_type = 'adaptive autovacuum emergency worker'
+                            AND a.backend_start >= q.started_at
+                            AND (q.worker_pid IS NULL OR a.pid = q.worker_pid))
         RETURNING 1)
     SELECT count(*)::integer FROM recovered
 $$;
