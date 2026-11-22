@@ -37,6 +37,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'unpacking the EDB binaries ZIP failed' }
             New-Item -ItemType Directory -Force (Split-Path $root) | Out-Null
             Move-Item (Join-Path $x 'pgsql') $root
+            # initdb drops administrator rights (restricted token), so it cannot create a directory under Program Files:
+            # pre-create the data directory and grant the runner user on it explicitly.
+            New-Item -ItemType Directory -Force "$root\data" | Out-Null
+            & icacls.exe "$root\data" /grant "$($env:USERNAME):(OI)(CI)F" /Q | Out-Null
             $pw = Join-Path $env:RUNNER_TEMP 'pgpw.txt'; [IO.File]::WriteAllText($pw, "aavtest`n")
             & "$root\bin\initdb.exe" -D "$root\data" -U postgres -E UTF8 -A scram-sha-256 --pwfile=$pw
             if ($LASTEXITCODE -ne 0) { throw 'initdb failed' }
