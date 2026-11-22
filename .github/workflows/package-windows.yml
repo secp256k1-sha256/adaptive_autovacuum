@@ -16,7 +16,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey or EDB installer)
+      - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey or EDB binaries ZIP)
         shell: pwsh
         run: |
           $major = ${{ matrix.pgmajor }}
@@ -25,15 +25,25 @@ jobs:
           Get-Service postgresql* | ForEach-Object { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue; Set-Service $_.Name -StartupType Disabled }
           $root = "C:\Program Files\PostgreSQL\$major"
           if (-not (Test-Path "$root\bin\pg_config.exe")) { choco install postgresql$major --params '/Password:aavtest /Port:5432' -y --no-progress }
-          # Chocolatey has no package for a new major yet (postgresql19): fall back to EDB's own installer, unattended.
+          # Chocolatey has no package for a new major yet (postgresql19), and the EDB installer exits 1 unattended on the
+          # runner: unpack EDB's binaries ZIP (same build, includes server headers), initdb, and register the service
+          # the way the EDB installer does (postgresql-x64-N, NetworkService, port 5432, password aavtest).
           $edb = @{ 19 = '19.0-1' }
           if (-not (Test-Path "$root\bin\pg_config.exe") -and $edb.ContainsKey($major)) {
-            $exe = Join-Path $env:RUNNER_TEMP "postgresql-$($edb[$major])-windows-x64.exe"
-            Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-$($edb[$major])-windows-x64.exe" -OutFile $exe
-            $p = Start-Process $exe -Wait -PassThru -ArgumentList @('--mode', 'unattended', '--unattendedmodeui', 'none',
-              '--superpassword', 'aavtest', '--serverport', '5432', '--servicename', "postgresql-x64-$major",
-              '--prefix', "`"$root`"", '--datadir', "`"$root\data`"", '--disable-components', 'pgAdmin,stackbuilder')
-            if ($p.ExitCode -ne 0) { throw "EDB installer exited with $($p.ExitCode)" }
+            $zip = Join-Path $env:RUNNER_TEMP "postgresql-$($edb[$major])-windows-x64-binaries.zip"
+            Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-$($edb[$major])-windows-x64-binaries.zip" -OutFile $zip
+            $x = Join-Path $env:RUNNER_TEMP "pg$major"; New-Item -ItemType Directory -Force $x | Out-Null
+            tar.exe -xf $zip -C $x
+            if ($LASTEXITCODE -ne 0) { throw 'unpacking the EDB binaries ZIP failed' }
+            New-Item -ItemType Directory -Force (Split-Path $root) | Out-Null
+            Move-Item (Join-Path $x 'pgsql') $root
+            $pw = Join-Path $env:RUNNER_TEMP 'pgpw.txt'; [IO.File]::WriteAllText($pw, "aavtest`n")
+            & "$root\bin\initdb.exe" -D "$root\data" -U postgres -E UTF8 -A scram-sha-256 --pwfile=$pw
+            if ($LASTEXITCODE -ne 0) { throw 'initdb failed' }
+            Remove-Item $pw
+            & icacls.exe "$root\data" /grant '*S-1-5-20:(OI)(CI)F' /T /Q | Out-Null
+            & "$root\bin\pg_ctl.exe" register -N "postgresql-x64-$major" -U 'NT AUTHORITY\NetworkService' -D "$root\data" -S demand -w
+            if ($LASTEXITCODE -ne 0) { throw 'pg_ctl register failed' }
           }
           if (-not (Test-Path "$root\include\server\postgres.h")) { throw 'server headers missing: the EDB package did not install the development files' }
           $svc = Get-CimInstance Win32_Service | Where-Object { $_.Name -eq "postgresql-x64-$major" }
