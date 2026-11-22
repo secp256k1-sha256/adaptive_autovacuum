@@ -16,7 +16,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey)
+      - name: Install PostgreSQL ${{ matrix.pgmajor }} (EDB build via Chocolatey or EDB installer)
         shell: pwsh
         run: |
           $major = ${{ matrix.pgmajor }}
@@ -25,6 +25,16 @@ jobs:
           Get-Service postgresql* | ForEach-Object { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue; Set-Service $_.Name -StartupType Disabled }
           $root = "C:\Program Files\PostgreSQL\$major"
           if (-not (Test-Path "$root\bin\pg_config.exe")) { choco install postgresql$major --params '/Password:aavtest /Port:5432' -y --no-progress }
+          # Chocolatey has no package for a new major yet (postgresql19): fall back to EDB's own installer, unattended.
+          $edb = @{ 19 = '19.0-1' }
+          if (-not (Test-Path "$root\bin\pg_config.exe") -and $edb.ContainsKey($major)) {
+            $exe = Join-Path $env:RUNNER_TEMP "postgresql-$($edb[$major])-windows-x64.exe"
+            Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-$($edb[$major])-windows-x64.exe" -OutFile $exe
+            $p = Start-Process $exe -Wait -PassThru -ArgumentList @('--mode', 'unattended', '--unattendedmodeui', 'none',
+              '--superpassword', 'aavtest', '--serverport', '5432', '--servicename', "postgresql-x64-$major",
+              '--prefix', "`"$root`"", '--datadir', "`"$root\data`"", '--disable-components', 'pgAdmin,stackbuilder')
+            if ($p.ExitCode -ne 0) { throw "EDB installer exited with $($p.ExitCode)" }
+          }
           if (-not (Test-Path "$root\include\server\postgres.h")) { throw 'server headers missing: the EDB package did not install the development files' }
           $svc = Get-CimInstance Win32_Service | Where-Object { $_.Name -eq "postgresql-x64-$major" }
           if (-not $svc) { throw "service postgresql-x64-$major not found" }
